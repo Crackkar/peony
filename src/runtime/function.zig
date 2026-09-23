@@ -6,7 +6,13 @@ const bytecode = @import("frontend_bytecode");
 
 const Value = value_module.Value;
 
-pub const Native = enum { print, range };
+pub const Native = enum {
+    print, range,
+    len, list, tuple, iter, next, enumerate, zip, reversed, slice,
+    list_append, list_extend, list_insert, list_pop, list_remove, list_clear, list_index, list_count, list_reverse, list_copy, list_sort,
+    str_find, str_index, str_split, str_join, str_strip, str_upper, str_lower, str_replace, str_count, str_startswith, str_endswith, str_encode,
+    bytes_split, bytes_find, bytes_decode,
+};
 
 pub const Cell = struct {
     header: gc.Header align(8),
@@ -22,6 +28,7 @@ pub const Function = struct {
     defaults: []Value = &.{},
     annotations: []Value = &.{},
     native: ?Native = null,
+    bound_self: Value = Value.noneValue(),
 };
 
 pub const Result = union(enum) {
@@ -52,6 +59,16 @@ pub fn createNative(heap: *gc.Heap, native: Native) Result {
     const function = heap.createObject(Function, &function_kind) catch return .{ .python_exception = memoryError() };
     function.* = .{ .header = function.header, .allocator = heap.allocator, .native = native };
     return .{ .value = function };
+}
+
+pub fn createBoundNative(heap: *gc.Heap, native: Native, bound_self: Value) Result {
+    return switch (createNative(heap, native)) {
+        .value => |function| blk: {
+            function.bound_self = bound_self;
+            break :blk .{ .value = function };
+        },
+        .python_exception => |exception| .{ .python_exception = exception },
+    };
 }
 
 pub fn createPython(
@@ -101,6 +118,7 @@ fn traceFunction(header: *gc.Header, tracer: *gc.Tracer) void {
     for (function.cells) |cell| tracer.visit(&cell.header);
     for (function.defaults) |value| tracer.visit(value.asObject());
     for (function.annotations) |value| tracer.visit(value.asObject());
+    tracer.visit(function.bound_self.asObject());
 }
 
 fn destroyFunction(header: *gc.Header, allocator: std.mem.Allocator) void {

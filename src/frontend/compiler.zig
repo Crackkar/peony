@@ -7,6 +7,7 @@ const gc = @import("runtime_gc");
 const value_module = @import("runtime_value");
 const number = @import("runtime_number");
 const string = @import("runtime_string");
+const bytes = @import("runtime_bytes");
 const exceptions = @import("runtime_exception");
 
 const Ast = ast_module.Ast;
@@ -144,6 +145,9 @@ const Compiler = struct {
     call_arguments: std.ArrayList(bytecode.CallArgument) = .empty,
     call_sites: std.ArrayList(bytecode.CallSite) = .empty,
     function_sites: std.ArrayList(bytecode.FunctionSite) = .empty,
+    unpack_sites: std.ArrayList(bytecode.UnpackSite) = .empty,
+    sequence_sites: std.ArrayList(bytecode.SequenceSite) = .empty,
+    slice_sites: std.ArrayList(bytecode.SliceSite) = .empty,
     nested_codes: std.ArrayList(*Code) = .empty,
     local_names: std.ArrayList([]const u8) = .empty,
     cell_names: std.ArrayList([]const u8) = .empty,
@@ -239,12 +243,12 @@ const Compiler = struct {
         var positional_count: u32 = 0;
         var positional_only_count: u32 = 0;
         var keyword_only_count: u32 = 0;
+        var has_var_positional = false;
         for (parameters) |parameter_id| {
             const parameter = self.ast.node(parameter_id);
             if (parameter.kind != .parameter) return self.failUnsupported(parameter.span, "function parameter shape is unsupported");
-            if (parameter.flags & (ast_module.parameter_flags.var_positional | ast_module.parameter_flags.var_keyword) != 0) {
-                return self.failUnsupported(parameter.span, "variadic function binding requires tuple and dictionary support");
-            }
+            if (parameter.flags & ast_module.parameter_flags.var_keyword != 0) return self.failUnsupported(parameter.span, "**kwargs requires dictionary support");
+            if (parameter.flags & ast_module.parameter_flags.var_positional != 0) has_var_positional = true;
             const parameter_name = self.allocator.dupe(u8, parameter.text) catch return error.OutOfMemory;
             self.parameter_names.append(self.allocator, parameter_name) catch {
                 self.allocator.free(parameter_name);
@@ -253,7 +257,7 @@ const Compiler = struct {
             try self.parameter_flags.append(self.allocator, parameter.flags);
             if (parameter.flags & ast_module.parameter_flags.keyword_only != 0) {
                 keyword_only_count += 1;
-            } else {
+            } else if (parameter.flags & ast_module.parameter_flags.var_positional == 0) {
                 positional_count += 1;
                 if (parameter.flags & ast_module.parameter_flags.positional_only != 0) positional_only_count += 1;
             }
@@ -262,6 +266,7 @@ const Compiler = struct {
             .positional_count = std.math.cast(u16, positional_count) orelse return self.failUnsupported(if (parameters.len != 0) self.ast.node(parameters[0]).span else self.ast.node(self.ast.root).span, "too many function parameters"),
             .positional_only_count = std.math.cast(u16, positional_only_count) orelse return error.Unsupported,
             .keyword_only_count = std.math.cast(u16, keyword_only_count) orelse return error.Unsupported,
+            .var_positional = has_var_positional,
         };
     }
 
@@ -299,6 +304,9 @@ const Compiler = struct {
         self.code.call_arguments = try self.call_arguments.toOwnedSlice(self.allocator);
         self.code.call_sites = try self.call_sites.toOwnedSlice(self.allocator);
         self.code.function_sites = try self.function_sites.toOwnedSlice(self.allocator);
+        self.code.unpack_sites = try self.unpack_sites.toOwnedSlice(self.allocator);
+        self.code.sequence_sites = try self.sequence_sites.toOwnedSlice(self.allocator);
+        self.code.slice_sites = try self.slice_sites.toOwnedSlice(self.allocator);
         self.code.nested_codes = try self.nested_codes.toOwnedSlice(self.allocator);
         self.code.positions = try self.positions.toOwnedSlice(self.allocator);
         return self.code;
@@ -323,6 +331,9 @@ const Compiler = struct {
         self.call_arguments.deinit(self.allocator);
         self.call_sites.deinit(self.allocator);
         self.function_sites.deinit(self.allocator);
+        self.unpack_sites.deinit(self.allocator);
+        self.sequence_sites.deinit(self.allocator);
+        self.slice_sites.deinit(self.allocator);
         self.nested_codes.deinit(self.allocator);
         self.positions.deinit(self.allocator);
         if (@intFromPtr(self.code) != 0) self.code.deinit(self.heap);
@@ -343,6 +354,7 @@ const Compiler = struct {
             .pass_statement => {},
             .block => try self.compileBlock(node_id),
             .function_definition => try self.compileFunctionDefinition(node_id),
+            .delete_statement => try self.compileDelete(node_id),
             .return_statement => try self.compileReturn(node_id),
             .global_statement, .nonlocal_statement => {},
             .expression_statement => {
@@ -522,11 +534,7 @@ const Compiler = struct {
         const children = self.ast.children(node_id);
         if (children.len < 3 or children.len > 4) return self.failUnsupported(node.span, "for statement shape is unsupported");
         const target_node = self.ast.node(children[0]);
-        if (target_node.kind != .name) return self.failUnsupported(target_node.span, "tuple and unpacking loop targets are not implemented yet");
         const iterable_node = self.ast.node(children[1]);
-        if (iterable_node.kind == .tuple_display or iterable_node.kind == .list_display or iterable_node.kind == .set_display or iterable_node.kind == .dict_display) {
-            return self.failUnsupported(iterable_node.span, "container iteration is not implemented yet");
-        }
 
         const source = try self.compileExpression(children[1]);
         const iterator_register = source;
@@ -536,8 +544,7 @@ const Compiler = struct {
         const loop_start = try self.currentTarget(node.span);
         try self.emit(.for_next, item_register, iterator_register, has_item_register, 0, node.span);
         const exhausted = try self.emitJump(.jump_if_false, has_item_register, 0, node.span);
-        const target_binding = self.analysis.bindingOf(children[0]) orelse .global_implicit;
-        try self.compileStoreName(item_register, target_node.text, target_binding, target_node.span);
+        try self.compileStoreTarget(children[0], item_register);
 
         try self.loop_stack.append(self.scratch_allocator, .{ .continue_target = loop_start });
         try self.compileStatement(children[2]);
@@ -591,16 +598,98 @@ const Compiler = struct {
         const children = self.ast.children(node_id);
         if (children.len < 2) return self.failUnsupported(self.ast.node(node_id).span, "assignment shape is unsupported");
         const value = try self.compileExpression(children[children.len - 1]);
-        for (children[0 .. children.len - 1]) |target_id| {
-            const target = self.ast.node(target_id);
-            if (target.kind != .name) {
-                self.temps.release(value);
-                return self.failUnsupported(target.span, "attribute, subscript, and unpacking assignment are not implemented yet");
-            }
-            const binding = self.analysis.bindingOf(target_id) orelse .global_implicit;
-            try self.compileStoreName(value, target.text, binding, target.span);
-        }
+        for (children[0 .. children.len - 1]) |target_id| try self.compileStoreTarget(target_id, value);
         self.temps.release(value);
+    }
+
+    fn compileStoreTarget(self: *Compiler, target_id: NodeId, value_register: u16) CompileError!void {
+        const target = self.ast.node(target_id);
+        if (target.kind == .name) {
+            const binding = self.analysis.bindingOf(target_id) orelse .global_implicit;
+            return self.compileStoreName(value_register, target.text, binding, target.span);
+        }
+        if (target.kind == .subscript) {
+            const children = self.ast.children(target_id);
+            if (children.len != 2) return self.failUnsupported(target.span, "subscript assignment shape is unsupported");
+            const container = try self.compileExpression(children[0]);
+            const index_register = self.compileExpression(children[1]) catch |err| {
+                self.temps.release(container);
+                return err;
+            };
+            try self.emit(.set_item, value_register, container, index_register, 0, target.span);
+            self.temps.release(index_register);
+            self.temps.release(container);
+            return;
+        }
+        if (target.kind == .tuple_display or target.kind == .list_display) {
+            const elements = self.ast.children(target_id);
+            if (elements.len > std.math.maxInt(u16)) return self.failUnsupported(target.span, "unpacking target has too many values");
+            const destinations = self.scratch_allocator.alloc(u16, elements.len) catch return error.OutOfMemory;
+            for (destinations, 0..) |*destination, index| {
+                destination.* = try self.acquire(target.span);
+                _ = index;
+            }
+            const destination_start = std.math.cast(u32, self.argument_registers.items.len) orelse return self.failUnsupported(target.span, "too many unpacking destinations");
+            try self.argument_registers.appendSlice(self.allocator, destinations);
+            const site_index = std.math.cast(u32, self.unpack_sites.items.len) orelse return self.failUnsupported(target.span, "too many unpacking sites");
+            var star_index: u16 = std.math.maxInt(u16);
+            for (elements, 0..) |element_id, index| if (self.ast.node(element_id).kind == .starred) {
+                if (star_index != std.math.maxInt(u16)) return self.failUnsupported(self.ast.node(element_id).span, "multiple starred targets are unsupported");
+                star_index = @intCast(index);
+            };
+            try self.unpack_sites.append(self.allocator, .{ .destination_start = destination_start, .destination_count = @intCast(elements.len), .star_index = star_index });
+            try self.emitIndex(.unpack, value_register, site_index, 0, target.span);
+            for (elements, 0..) |element_id, index| {
+                const child = self.ast.node(element_id);
+                const actual_target = if (child.kind == .starred) self.ast.children(element_id)[0] else element_id;
+                try self.compileStoreTarget(actual_target, destinations[index]);
+            }
+            var remaining = destinations.len;
+            while (remaining > 0) {
+                remaining -= 1;
+                self.temps.release(destinations[remaining]);
+            }
+            return;
+        }
+        return self.failUnsupported(target.span, "this assignment target is not implemented yet");
+    }
+
+    fn compileDelete(self: *Compiler, node_id: NodeId) CompileError!void {
+        const children = self.ast.children(node_id);
+        if (children.len != 1) return self.failUnsupported(self.ast.node(node_id).span, "delete statement shape is unsupported");
+        try self.compileDeleteTarget(children[0]);
+    }
+
+    fn compileDeleteTarget(self: *Compiler, target_id: NodeId) CompileError!void {
+        const target = self.ast.node(target_id);
+        if (target.kind == .name) {
+            const name_index = try self.internName(target.text);
+            const binding = self.analysis.bindingOf(target_id) orelse .global_implicit;
+            switch (binding) {
+                .local, .cell, .free => try self.emitIndex(.delete_local, 0, name_index, localBindingFlag(binding), target.span),
+                .global_explicit, .global_implicit => try self.emitIndex(.delete_global, 0, name_index, 0, target.span),
+                .class_local => return self.failUnsupported(target.span, "class namespace execution is not implemented yet"),
+            }
+            return;
+        }
+        if (target.kind == .subscript) {
+            const children = self.ast.children(target_id);
+            if (children.len != 2) return self.failUnsupported(target.span, "subscript delete shape is unsupported");
+            const container = try self.compileExpression(children[0]);
+            const index_register = self.compileExpression(children[1]) catch |err| {
+                self.temps.release(container);
+                return err;
+            };
+            try self.emit(.delete_item, 0, container, index_register, 0, target.span);
+            self.temps.release(index_register);
+            self.temps.release(container);
+            return;
+        }
+        if (target.kind == .tuple_display or target.kind == .list_display) {
+            for (self.ast.children(target_id)) |child| try self.compileDeleteTarget(child);
+            return;
+        }
+        return self.failUnsupported(target.span, "this delete target is not implemented yet");
     }
 
     fn compileLoadName(self: *Compiler, destination: u16, name: []const u8, binding: Binding, span: Span) CompileError!void {
@@ -658,6 +747,14 @@ const Compiler = struct {
             .comparison_chain => return self.compileComparisonChain(node_id),
             .conditional_expression => return self.compileConditional(node_id),
             .call => return self.compileCall(node_id),
+            .list_display => return self.compileSequence(node_id, false),
+            .tuple_display => return self.compileSequence(node_id, true),
+            .attribute => return self.compileAttribute(node_id),
+            .subscript => return self.compileSubscript(node_id),
+            .bytes_literal => {
+                const value = try self.parseString(node.text, node.span);
+                return self.loadConstant(value, node.span);
+            },
             else => return self.failUnsupported(node.span, expressionUnsupportedMessage(node.kind)),
         }
     }
@@ -761,6 +858,82 @@ const Compiler = struct {
         return result;
     }
 
+    fn compileSequence(self: *Compiler, node_id: NodeId, is_tuple: bool) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len > std.math.maxInt(u16)) return self.failUnsupported(node.span, "sequence display has too many values");
+        const result = try self.acquire(node.span);
+        const held = self.scratch_allocator.alloc(u16, children.len) catch return error.OutOfMemory;
+        var held_count: usize = 0;
+        for (children) |child| {
+            held[held_count] = try self.compileExpression(child);
+            held_count += 1;
+        }
+        const start = std.math.cast(u32, self.argument_registers.items.len) orelse return self.failUnsupported(node.span, "too many sequence operands");
+        try self.argument_registers.appendSlice(self.allocator, held);
+        const site_index = std.math.cast(u32, self.sequence_sites.items.len) orelse return self.failUnsupported(node.span, "too many sequence displays");
+        try self.sequence_sites.append(self.allocator, .{ .argument_start = start, .argument_count = @intCast(children.len), .is_tuple = is_tuple });
+        try self.emitIndex(.make_sequence, result, site_index, 0, node.span);
+        while (held_count > 0) {
+            held_count -= 1;
+            self.temps.release(held[held_count]);
+        }
+        return result;
+    }
+
+    fn compileAttribute(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len != 1) return self.failUnsupported(node.span, "attribute access shape is unsupported");
+        const receiver = try self.compileExpression(children[0]);
+        const name_index = try self.internName(node.text);
+        if (name_index > std.math.maxInt(u16)) return self.failUnsupported(node.span, "too many attribute names in code object");
+        try self.emit(.get_attribute, receiver, receiver, name_index, 0, node.span);
+        return receiver;
+    }
+
+    fn compileSubscript(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len != 2) return self.failUnsupported(node.span, "subscript expression shape is unsupported");
+        const container = try self.compileExpression(children[0]);
+        const index_node = self.ast.node(children[1]);
+        const index_register = if (index_node.kind == .slice)
+            try self.compileSlice(children[1])
+        else
+            self.compileExpression(children[1]) catch |err| {
+                self.temps.release(container);
+                return err;
+            };
+        try self.emit(.get_item, container, container, index_register, 0, node.span);
+        self.temps.release(index_register);
+        return container;
+    }
+
+    fn compileSlice(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len != 3) return self.failUnsupported(node.span, "slice expression shape is unsupported");
+        const result = try self.acquire(node.span);
+        const start = try self.compileExpression(children[0]);
+        const stop = self.compileExpression(children[1]) catch |err| {
+            self.temps.release(start);
+            return err;
+        };
+        const step = self.compileExpression(children[2]) catch |err| {
+            self.temps.release(stop);
+            self.temps.release(start);
+            return err;
+        };
+        const site_index = std.math.cast(u32, self.slice_sites.items.len) orelse return self.failUnsupported(node.span, "too many slice expressions");
+        try self.slice_sites.append(self.allocator, .{ .start = start, .stop = stop, .step = step });
+        try self.emitIndex(.make_slice, result, site_index, 0, node.span);
+        self.temps.release(step);
+        self.temps.release(stop);
+        self.temps.release(start);
+        return result;
+    }
+
     fn compileCall(self: *Compiler, node_id: NodeId) CompileError!u16 {
         const node = self.ast.node(node_id);
         const children = self.ast.children(node_id);
@@ -777,9 +950,10 @@ const Compiler = struct {
 
         for (children[1..]) |argument_id| {
             const argument = self.ast.node(argument_id);
-            if (argument.kind == .starred) return self.failUnsupported(argument.span, "call unpacking requires tuple and mapping support");
-            const value_node = if (argument.kind == .keyword_argument) self.ast.children(argument_id)[0] else argument_id;
+            if (argument.kind == .starred and std.mem.eql(u8, argument.text, "**")) return self.failUnsupported(argument.span, "** call unpacking requires mapping support");
+            const value_node = if (argument.kind == .keyword_argument or argument.kind == .starred) self.ast.children(argument_id)[0] else argument_id;
             const register = try self.compileExpression(value_node);
+            if (argument.kind == .starred) try self.emit(.materialize_star, register, 0, 0, 0, argument.span);
             held[held_count] = register;
             held_count += 1;
         }
@@ -788,7 +962,7 @@ const Compiler = struct {
         for (children[1..], 0..) |argument_id, index| {
             const argument = self.ast.node(argument_id);
             const keyword_name = if (argument.kind == .keyword_argument) try self.internName(argument.text) else std.math.maxInt(u32);
-            try self.call_arguments.append(self.allocator, .{ .register = held[index], .keyword_name = keyword_name });
+            try self.call_arguments.append(self.allocator, .{ .register = held[index], .keyword_name = keyword_name, .starred = argument.kind == .starred });
         }
         const site_index = std.math.cast(u32, self.call_sites.items.len) orelse return self.failUnsupported(node.span, "too many call sites");
         try self.call_sites.append(self.allocator, .{ .argument_start = argument_start, .argument_count = @intCast(count) });
@@ -816,20 +990,37 @@ const Compiler = struct {
         while (quote_index < spelling.len and spelling[quote_index] != '\'' and spelling[quote_index] != '"') : (quote_index += 1) {}
         if (quote_index == spelling.len) return self.failSyntax(span, "invalid string literal");
         const prefix = spelling[0..quote_index];
+        const is_bytes = std.mem.indexOfAny(u8, prefix, "bB") != null;
         for (prefix) |character| {
-            if (character == 'b' or character == 'B') return self.failUnsupported(span, "bytes literals are not implemented in this commit");
             if (character == 'f' or character == 'F') return self.failUnsupported(span, "f-string execution is not implemented in this commit");
         }
         const raw = std.mem.indexOfAny(u8, prefix, "rR") != null;
         const delimiter_len: usize = if (quote_index + 2 < spelling.len and spelling[quote_index + 1] == spelling[quote_index] and spelling[quote_index + 2] == spelling[quote_index]) 3 else 1;
         if (spelling.len < quote_index + delimiter_len * 2) return self.failSyntax(span, "unterminated string literal");
         const content = spelling[quote_index + delimiter_len .. spelling.len - delimiter_len];
+        if (is_bytes) {
+            for (content) |character| if (character >= 0x80) return self.failSyntax(span, "bytes can only contain ASCII literal characters");
+            if (!raw and (std.mem.indexOf(u8, content, "\\u") != null or std.mem.indexOf(u8, content, "\\U") != null or std.mem.indexOf(u8, content, "\\N") != null)) {
+                return self.failSyntax(span, "Unicode escapes are not allowed in bytes literals");
+            }
+        }
         const allocator = self.scratch_allocator;
         var decoded: std.ArrayList(u8) = .empty;
         if (raw) {
             decoded.appendSlice(allocator, content) catch return error.OutOfMemory;
         } else {
             try decodeEscapes(allocator, &decoded, content, self, span);
+        }
+        if (is_bytes) {
+            const created_bytes = bytes.create(self.heap, decoded.items);
+            return switch (created_bytes) {
+                .value => |object| Value.object(&object.header),
+                .python_exception => |exception| blk: {
+                    self.pending_exception = exception;
+                    break :blk error.PythonFault;
+                },
+                .engine_error => error.PythonFault,
+            };
         }
         const created = string.create(self.heap, decoded.items);
         return switch (created) {

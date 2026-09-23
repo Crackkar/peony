@@ -1,5 +1,6 @@
 const std = @import("std");
 const runtime_vm = @import("runtime_vm");
+const bytecode = @import("frontend_bytecode");
 
 pub fn testBasicFunctionsReturnsAndCallableValues() !void {
     try expectOutput(
@@ -30,6 +31,30 @@ pub fn testCallsEvaluateCalleeAndArgumentsOnceLeftToRight() !void {
         \\print(choose()(mark("left"), mark("right")))
         \\print(1, print(2), 3)
     , "callee\nleft\nright\nleftright\n2\n1 None 3\n");
+}
+
+pub fn testStarredArgumentsExpandBeforeLaterArguments() !void {
+    try expectOutput(
+        \\def collect(*items):
+        \\    print(items)
+        \\values = [1]
+    \\collect(*values, values.append(2))
+    , "(1, None)\n");
+
+    var runtime: runtime_vm.Runtime = undefined;
+    try runtime.init(std.testing.allocator, 4 * 1024 * 1024);
+    defer runtime.deinit();
+    try expectReady(runtime.compileAndStart(
+        \\def mark():
+        \\    print("late argument ran")
+        \\    return 1
+        \\def collect(*items):
+        \\    return items
+        \\collect(*1, mark())
+    , "star-error-order.py"));
+    try std.testing.expectEqual(runtime_vm.RunStatus.python_exception, runtime.run(100));
+    try std.testing.expectEqual(runtime_vm.PythonExceptionKind.type_error, runtime.pythonException().?.kind);
+    try std.testing.expectEqualStrings("", runtime.stdout());
 }
 
 pub fn testDefinitionTimeDefaultsAndAnnotations() !void {
@@ -108,6 +133,51 @@ pub fn testClosuresCaptureMutableCellsAndTransitiveFreeNames() !void {
     , "1 2\n42\n");
 }
 
+pub fn testVariadicClosureRootsSurviveCellConstructionCollection() !void {
+    const allocator = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+    try source.appendSlice(allocator, "def f(*items):\n");
+    for (0..4096) |index| {
+        const statement = try std.fmt.allocPrint(allocator, "    captured{d} = {d}\n", .{ index, @as(u8, if (index == 0) 1 else 0) });
+        defer allocator.free(statement);
+        try source.appendSlice(allocator, statement);
+    }
+    try source.appendSlice(allocator, "    def g():\n        return items, captured0");
+    for (1..4096) |index| {
+        const term = try std.fmt.allocPrint(allocator, " + captured{d}", .{index});
+        defer allocator.free(term);
+        try source.appendSlice(allocator, term);
+    }
+    try source.appendSlice(allocator, "\n    return g()\nprint(f(\"kept\"))\n");
+
+    var runtime: runtime_vm.Runtime = undefined;
+    try runtime.init(std.testing.allocator, 32 * 1024 * 1024);
+    defer runtime.deinit();
+    try expectReady(runtime.compileAndStart(source.items, "variadic-closure-roots.py"));
+    const module = runtime.code.?;
+    const function_code = module.nested_codes[0];
+    try std.testing.expect(function_code.cell_names.len > 2);
+    var items_cell: ?usize = null;
+    for (function_code.cell_names, 0..) |name, index| {
+        if (std.mem.eql(u8, name, "items")) items_cell = index;
+    }
+    try std.testing.expectEqual(@as(?usize, 0), items_cell);
+    const first_call = for (module.instructions, 0..) |instruction, index| {
+        if (instruction.opcode() == .call) break index;
+    } else return error.MissingVariadicCall;
+    while (runtime.instruction_pointer < first_call) {
+        try std.testing.expectEqual(runtime_vm.RunStatus.timeslice, runtime.run(1));
+    }
+    runtime.heap.collection_threshold = runtime.session_allocator.live_bytes + 128 * 1024;
+    runtime.heap.threshold_growth_floor = 1;
+    const collections_before_call = runtime.heap.collection_count;
+    try std.testing.expectEqual(runtime_vm.RunStatus.timeslice, runtime.run(1));
+    try std.testing.expect(runtime.heap.collection_count > collections_before_call);
+    try runToCompletion(&runtime, 2);
+    try std.testing.expectEqualStrings("(('kept',), 1)\n", runtime.stdout());
+}
+
 pub fn testRecursiveFramesSurviveCollectionAndTimeslices() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 16 * 1024 * 1024);
@@ -145,7 +215,7 @@ pub fn testBuiltinCallableCollectionAndReset() !void {
 }
 
 pub fn testUnsupportedFunctionDefaultCleansNestedCodeOnce() !void {
-    try expectUnsupported("def unsupported(value=[]):\n    pass\n");
+    try expectUnsupported("def unsupported(value={}):\n    pass\n");
 }
 
 pub fn testFunctionConstructionMemoryErrorAndRecovery() !void {
@@ -164,18 +234,8 @@ pub fn testFunctionConstructionMemoryErrorAndRecovery() !void {
     try std.testing.expectEqualStrings("recovered\n", runtime.stdout());
 }
 
-pub fn testVariadicDefinitionsAndCallUnpackingAreExplicitlyUnsupported() !void {
-    try expectUnsupported(
-        \\print("must not execute")
-        \\def collect(*items):
-        \\    return items
-    );
-    try expectUnsupported(
-        \\print("must not execute")
-        \\def one(value):
-        \\    return value
-        \\one(*(1, 2))
-    );
+pub fn testDictionaryUnpackingRemainsExplicitlyUnsupported() !void {
+    try expectUnsupported("print(\"must not execute\")\nprint(1, **{})\n");
 }
 
 fn expectOutput(source: []const u8, expected: []const u8) !void {

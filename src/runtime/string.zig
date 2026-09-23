@@ -2,6 +2,7 @@ const std = @import("std");
 const gc = @import("runtime_gc");
 const unicode = @import("runtime_unicode");
 const exceptions = @import("runtime_exception");
+const slice_utils = @import("runtime_slice");
 
 pub const StringResult = exceptions.Result(*Str);
 pub const SplitResult = exceptions.Result(SplitIterator);
@@ -19,8 +20,20 @@ pub const SplitIterator = struct {
     separator: []const u8,
     position: usize = 0,
     finished: bool = false,
+    whitespace: bool = false,
 
     pub fn next(self: *SplitIterator) ?[]const u8 {
+        if (self.whitespace) {
+            while (self.position < self.source.len and unicode.hasProperty(codepointAt(self.source, self.position), .whitespace)) {
+                self.position = nextOffset(self.source, self.position);
+            }
+            if (self.position >= self.source.len) return null;
+            const start = self.position;
+            while (self.position < self.source.len and !unicode.hasProperty(codepointAt(self.source, self.position), .whitespace)) {
+                self.position = nextOffset(self.source, self.position);
+            }
+            return self.source[start..self.position];
+        }
         if (self.finished) return null;
         if (std.mem.indexOf(u8, self.source[self.position..], self.separator)) |relative| {
             const found = self.position + relative;
@@ -81,7 +94,10 @@ pub fn slice(
 ) StringResult {
     if (step == 0) return pythonError(*Str, .value_error, "slice step cannot be zero");
     const codepoint_count = std.math.cast(i64, length(value)) orelse return pythonError(*Str, .overflow_error, "string is too large to slice");
-    const indices = normalizeSlice(codepoint_count, start, stop, step);
+    return sliceNormalized(heap, value, slice_utils.normalizeI64(codepoint_count, start, stop, step));
+}
+
+pub fn sliceNormalized(heap: *gc.Heap, value: *Str, indices: slice_utils.BoundedIndices) StringResult {
     var roots = RootScope{};
     roots.push(heap, value, null);
     defer roots.pop();
@@ -89,11 +105,11 @@ pub fn slice(
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(heap.allocator);
     var index_value = indices.start;
-    while (if (step > 0) index_value < indices.stop else index_value > indices.stop) {
+    while (if (indices.step > 0) index_value < indices.stop else index_value > indices.stop) {
         const byte_start = byteOffset(value.data, @intCast(index_value));
         const byte_end = byteOffset(value.data, @intCast(index_value + 1));
         output.appendSlice(heap.allocator, value.data[byte_start..byte_end]) catch return memoryError();
-        index_value = std.math.add(i64, index_value, step) catch break;
+        index_value = std.math.add(i128, index_value, indices.step) catch break;
     }
     return finishBuffer(heap, &output);
 }
@@ -137,6 +153,10 @@ pub fn endsWith(value: *const Str, suffix: []const u8) bool {
 pub fn split(value: *Str, separator: []const u8) SplitResult {
     if (separator.len == 0) return pythonError(SplitIterator, .value_error, "empty separator");
     return .{ .value = .{ .source = value.data, .separator = separator } };
+}
+
+pub fn splitWhitespace(value: *Str) SplitIterator {
+    return .{ .source = value.data, .separator = "", .whitespace = true };
 }
 
 pub fn join(heap: *gc.Heap, separator: []const u8, parts: []const []const u8) StringResult {
@@ -459,27 +479,6 @@ fn previousOffset(value: []const u8, offset: usize) usize {
     var previous = offset - 1;
     while (previous > 0 and value[previous] & 0xc0 == 0x80) previous -= 1;
     return previous;
-}
-
-fn normalizeSlice(length_value: i64, start: ?i64, stop: ?i64, step: i64) SliceIndices {
-    if (step > 0) {
-        return .{
-            .start = normalizeBound(start orelse 0, length_value, 0, length_value),
-            .stop = normalizeBound(stop orelse length_value, length_value, 0, length_value),
-        };
-    }
-    return .{
-        .start = normalizeBound(start orelse length_value - 1, length_value, -1, length_value - 1),
-        .stop = if (stop == null) -1 else normalizeBound(stop.?, length_value, -1, length_value - 1),
-    };
-}
-
-const SliceIndices = struct { start: i64, stop: i64 };
-
-fn normalizeBound(index_value: i64, length_value: i64, minimum: i64, maximum: i64) i64 {
-    var normalized = index_value;
-    if (normalized < 0) normalized += length_value;
-    return @min(@max(normalized, minimum), maximum);
 }
 
 fn hashBytes(data: []const u8) u64 {

@@ -24,6 +24,16 @@ pub const Opcode = enum(u8) {
     store_local,
     call,
     make_function,
+    make_sequence,
+    make_slice,
+    get_attribute,
+    get_item,
+    set_item,
+    delete_item,
+    delete_local,
+    delete_global,
+    unpack,
+    materialize_star,
 };
 
 /// Fixed 64-bit register instruction. The least-significant byte is the opcode;
@@ -77,6 +87,16 @@ pub const Instruction = struct {
             19 => .store_local,
             20 => .call,
             21 => .make_function,
+            22 => .make_sequence,
+            23 => .make_slice,
+            24 => .get_attribute,
+            25 => .get_item,
+            26 => .set_item,
+            27 => .delete_item,
+            28 => .delete_local,
+            29 => .delete_global,
+            30 => .unpack,
+            31 => .materialize_star,
             else => null,
         };
     }
@@ -130,6 +150,7 @@ pub const LocalBinding = enum(u8) { local, cell, free };
 pub const CallArgument = struct {
     register: u16,
     keyword_name: u32 = std.math.maxInt(u32),
+    starred: bool = false,
 };
 
 pub const CallSite = struct {
@@ -143,6 +164,24 @@ pub const FunctionSite = struct {
     default_count: u16,
     annotation_count: u16,
     has_return_annotation: bool,
+};
+
+pub const UnpackSite = struct {
+    destination_start: u32,
+    destination_count: u16,
+    star_index: u16 = std.math.maxInt(u16),
+};
+
+pub const SequenceSite = struct {
+    argument_start: u32,
+    argument_count: u16,
+    is_tuple: bool,
+};
+
+pub const SliceSite = struct {
+    start: u16,
+    stop: u16,
+    step: u16,
 };
 
 pub const code_flags = struct {
@@ -163,6 +202,9 @@ pub const Code = struct {
     call_arguments: []CallArgument = &.{},
     call_sites: []CallSite = &.{},
     function_sites: []FunctionSite = &.{},
+    unpack_sites: []UnpackSite = &.{},
+    sequence_sites: []SequenceSite = &.{},
+    slice_sites: []SliceSite = &.{},
     nested_codes: []*Code = &.{},
     positions: []SourcePosition = &.{},
     filename: []const u8 = "",
@@ -193,6 +235,9 @@ pub const Code = struct {
         self.allocator.free(self.call_arguments);
         self.allocator.free(self.call_sites);
         self.allocator.free(self.function_sites);
+        self.allocator.free(self.unpack_sites);
+        self.allocator.free(self.sequence_sites);
+        self.allocator.free(self.slice_sites);
         self.allocator.free(self.nested_codes);
         self.allocator.free(self.positions);
         self.allocator.free(self.filename);

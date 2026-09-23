@@ -87,6 +87,59 @@ test('WASM executes recursive functions, mutable closures and builtin aliases', 
   }
 });
 
+test('WASM retains variadic arguments captured by a nested closure', async () => {
+  const api = await newApi();
+  const handle = api.peony_session_new(0, 0);
+  assert.ok(handle > 0);
+  try {
+    const source = [
+      'def f(*items):',
+      '    x = 1',
+      '    def g():',
+      '        return items, x',
+      '    return g()',
+      'print(f("kept"))',
+    ].join('\n');
+    assert.equal(compile(api, handle, source), status.ok);
+    assert.equal(api.peony_run(handle, 0), status.completed);
+    assert.equal(stdout(api, handle), "(('kept',), 1)\n");
+  } finally {
+    api.peony_session_destroy(handle);
+  }
+});
+
+test('WASM expands each starred argument before evaluating later arguments', async () => {
+  const api = await newApi();
+  const handle = api.peony_session_new(0, 0);
+  assert.ok(handle > 0);
+  try {
+    const source = [
+      'def collect(*items):',
+      '    print(items)',
+      'values = [1]',
+      'collect(*values, values.append(2))',
+    ].join('\n');
+    assert.equal(compile(api, handle, source), status.ok);
+    assert.equal(api.peony_run(handle, 0), status.completed);
+    assert.equal(stdout(api, handle), '(1, None)\n');
+
+    const badStar = [
+      'def mark():',
+      '    print("late argument ran")',
+      '    return 1',
+      'def collect(*items):',
+      '    return items',
+      'collect(*1, mark())',
+    ].join('\n');
+    assert.equal(compile(api, handle, badStar), status.ok);
+    assert.equal(api.peony_run(handle, 0), status.pythonException);
+    assert.match(errorText(api, handle), /TypeError.*functions\.py:6:/);
+    assert.equal(stdout(api, handle), '');
+  } finally {
+    api.peony_session_destroy(handle);
+  }
+});
+
 test('WASM evaluates definition-time defaults and annotations and reports binder errors', async () => {
   const api = await newApi();
   const handle = api.peony_session_new(0, 0);
@@ -111,8 +164,9 @@ test('WASM evaluates definition-time defaults and annotations and reports binder
     assert.equal(api.peony_run(handle, 0), status.pythonException);
     assert.match(errorText(api, handle), /TypeError.*too-many\.py:3:/);
 
-    assert.equal(compile(api, handle, 'print("must not execute")\ndef collect(*items):\n    return items\n'), status.unsupported);
-    assert.equal(stdout(api, handle), '');
+    assert.equal(compile(api, handle, 'print("varargs enabled")\ndef collect(*items):\n    return items\nprint(collect(1, 2))\n'), status.ok);
+    assert.equal(api.peony_run(handle, 0), status.completed);
+    assert.equal(stdout(api, handle), 'varargs enabled\n(1, 2)\n');
   } finally {
     api.peony_session_destroy(handle);
   }

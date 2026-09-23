@@ -2,18 +2,24 @@ const std = @import("std");
 const gc = @import("runtime_gc");
 const string = @import("runtime_string");
 const exceptions = @import("runtime_exception");
+const slice_utils = @import("runtime_slice");
 
 pub const BytesResult = exceptions.Result(*Bytes);
 pub const ByteResult = exceptions.Result(u8);
 pub const PythonExceptionKind = exceptions.PythonExceptionKind;
 
 pub const Bytes = struct {
-    header: gc.Header,
+    header: gc.Header align(8),
     data: []u8,
     cached_hash: ?u64 = null,
 };
 
 const bytes_kind = gc.Kind{ .destroy = destroyBytes };
+
+pub fn fromHeader(header: *gc.Header) ?*Bytes {
+    if (header.kind != &bytes_kind) return null;
+    return @ptrCast(@alignCast(header));
+}
 
 pub fn create(heap: *gc.Heap, input: []const u8) BytesResult {
     const data = heap.allocator.dupe(u8, input) catch return memoryError();
@@ -47,7 +53,11 @@ pub fn index(value: *const Bytes, index_value: i64) ByteResult {
 pub fn slice(heap: *gc.Heap, value: *Bytes, start: ?i64, stop: ?i64, step: i64) BytesResult {
     if (step == 0) return pythonError(*Bytes, .value_error, "slice step cannot be zero");
     const count = std.math.cast(i64, value.data.len) orelse return pythonError(*Bytes, .overflow_error, "bytes object is too large to slice");
-    const indices = normalizeSlice(count, start, stop, step);
+    const indices = slice_utils.normalizeI64(count, start, stop, step);
+    return sliceNormalized(heap, value, indices);
+}
+
+pub fn sliceNormalized(heap: *gc.Heap, value: *Bytes, indices: slice_utils.BoundedIndices) BytesResult {
     var roots = RootScope{};
     roots.push(heap, value);
     defer roots.pop();
@@ -55,9 +65,9 @@ pub fn slice(heap: *gc.Heap, value: *Bytes, start: ?i64, stop: ?i64, step: i64) 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(heap.allocator);
     var index_value = indices.start;
-    while (if (step > 0) index_value < indices.stop else index_value > indices.stop) {
+    while (if (indices.step > 0) index_value < indices.stop else index_value > indices.stop) {
         output.append(heap.allocator, value.data[@intCast(index_value)]) catch return memoryError();
-        index_value = std.math.add(i64, index_value, step) catch break;
+        index_value = std.math.add(i128, index_value, indices.step) catch break;
     }
     const data = output.toOwnedSlice(heap.allocator) catch return memoryError();
     return createOwned(heap, data);
@@ -106,27 +116,6 @@ fn destroyBytes(header: *gc.Header, allocator: std.mem.Allocator) void {
     const value: *Bytes = @ptrCast(@alignCast(header));
     allocator.free(value.data);
     value.data = &.{};
-}
-
-const SliceIndices = struct { start: i64, stop: i64 };
-
-fn normalizeSlice(length_value: i64, start: ?i64, stop: ?i64, step: i64) SliceIndices {
-    if (step > 0) {
-        return .{
-            .start = normalizeBound(start orelse 0, length_value, 0, length_value),
-            .stop = normalizeBound(stop orelse length_value, length_value, 0, length_value),
-        };
-    }
-    return .{
-        .start = normalizeBound(start orelse length_value - 1, length_value, -1, length_value - 1),
-        .stop = if (stop == null) -1 else normalizeBound(stop.?, length_value, -1, length_value - 1),
-    };
-}
-
-fn normalizeBound(index_value: i64, length_value: i64, minimum: i64, maximum: i64) i64 {
-    var normalized = index_value;
-    if (normalized < 0) normalized += length_value;
-    return @min(@max(normalized, minimum), maximum);
 }
 
 const RootScope = struct {

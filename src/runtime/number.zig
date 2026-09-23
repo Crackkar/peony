@@ -41,6 +41,22 @@ pub fn fromInt(heap: *Heap, integer: i128) ValueResult {
     return managedToValue(heap, managed);
 }
 
+pub fn fromIntegralFloat(heap: *Heap, float_value: f64) ValueResult {
+    const parts = floatIntegerComponents(float_value) orelse return pythonError(Value, .value_error, "float does not represent an integer");
+    if (parts.mantissa == 0) return .{ .value = Value.fromSmallInt(0).? };
+    var integer = BigIntStorage.init(heap.allocator) catch return memoryError(Value);
+    integer.set(parts.mantissa) catch {
+        integer.deinit();
+        return memoryError(Value);
+    };
+    if (parts.shift != 0) integer.shiftLeft(&integer, parts.shift) catch {
+        integer.deinit();
+        return memoryError(Value);
+    };
+    integer.setSign(!parts.is_negative);
+    return managedToValue(heap, integer);
+}
+
 /// Parses a lexer-validated Python integer token, including base prefixes and
 /// digit separators, without narrowing through a machine integer.
 pub fn parseIntegerLiteral(heap: *Heap, token: []const u8) ValueResult {

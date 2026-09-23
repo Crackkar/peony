@@ -82,6 +82,7 @@ pub fn build(b: *std.Build) void {
     compiler_module.addImport("runtime_value", native_runtime.value);
     compiler_module.addImport("runtime_number", native_runtime.number);
     compiler_module.addImport("runtime_string", native_runtime.string);
+    compiler_module.addImport("runtime_bytes", native_runtime.bytes);
     compiler_module.addImport("runtime_exception", native_runtime.exception);
     const native_iterator_module = createRuntimeIteratorModule(b, target, optimize, native_runtime);
     const runtime_vm_module = b.createModule(.{
@@ -96,6 +97,9 @@ pub fn build(b: *std.Build) void {
     runtime_vm_module.addImport("runtime_value", native_runtime.value);
     runtime_vm_module.addImport("runtime_number", native_runtime.number);
     runtime_vm_module.addImport("runtime_string", native_runtime.string);
+    runtime_vm_module.addImport("runtime_bytes", native_runtime.bytes);
+    runtime_vm_module.addImport("runtime_sequence", native_runtime.sequence);
+    runtime_vm_module.addImport("runtime_slice", native_runtime.slice);
     runtime_vm_module.addImport("runtime_exception", native_runtime.exception);
     runtime_vm_module.addImport("runtime_iterator", native_iterator_module);
     runtime_vm_module.addImport("runtime_function", native_function_module);
@@ -122,6 +126,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     functions_test_module.addImport("runtime_vm", runtime_vm_module);
+    const sequence_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/sequences.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sequence_test_module.addImport("runtime_vm", runtime_vm_module);
+    sequence_test_module.addImport("frontend_bytecode", bytecode_module);
+    sequence_test_module.addImport("runtime_exception", native_runtime.exception);
+    sequence_test_module.addImport("runtime_gc", native_runtime.gc);
+    sequence_test_module.addImport("runtime_value", native_runtime.value);
+    sequence_test_module.addImport("runtime_number", native_runtime.number);
+    sequence_test_module.addImport("runtime_iterator", native_iterator_module);
+    sequence_test_module.addImport("runtime_slice", native_runtime.slice);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -154,6 +171,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("compiler_vm_tests", compiler_vm_test_module);
     unit_test_root.addImport("control_flow_tests", control_flow_test_module);
     unit_test_root.addImport("functions_tests", functions_test_module);
+    unit_test_root.addImport("sequence_tests", sequence_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -302,6 +320,7 @@ fn createExecutionVmModule(
     compiler_module.addImport("runtime_value", runtime.value);
     compiler_module.addImport("runtime_number", runtime.number);
     compiler_module.addImport("runtime_string", runtime.string);
+    compiler_module.addImport("runtime_bytes", runtime.bytes);
     compiler_module.addImport("runtime_exception", runtime.exception);
     const vm_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/vm.zig"),
@@ -316,6 +335,9 @@ fn createExecutionVmModule(
     vm_module.addImport("runtime_value", runtime.value);
     vm_module.addImport("runtime_number", runtime.number);
     vm_module.addImport("runtime_string", runtime.string);
+    vm_module.addImport("runtime_bytes", runtime.bytes);
+    vm_module.addImport("runtime_sequence", runtime.sequence);
+    vm_module.addImport("runtime_slice", runtime.slice);
     vm_module.addImport("runtime_exception", runtime.exception);
     vm_module.addImport("runtime_iterator", iterator_module);
     vm_module.addImport("runtime_function", function_module);
@@ -354,6 +376,9 @@ fn createRuntimeBinderModule(
         .optimize = optimize,
     });
     module.addImport("runtime_value", runtime.value);
+    module.addImport("runtime_gc", runtime.gc);
+    module.addImport("runtime_sequence", runtime.sequence);
+    module.addImport("runtime_exception", runtime.exception);
     return module;
 }
 
@@ -373,6 +398,9 @@ fn createRuntimeIteratorModule(
     module.addImport("runtime_value", runtime.value);
     module.addImport("runtime_number", runtime.number);
     module.addImport("runtime_string", runtime.string);
+    module.addImport("runtime_bytes", runtime.bytes);
+    module.addImport("runtime_sequence", runtime.sequence);
+    module.addImport("runtime_slice", runtime.slice);
     module.addImport("runtime_exception", runtime.exception);
     return module;
 }
@@ -385,6 +413,8 @@ const RuntimeModules = struct {
     unicode: *std.Build.Module,
     string: *std.Build.Module,
     bytes: *std.Build.Module,
+    sequence: *std.Build.Module,
+    slice: *std.Build.Module,
 };
 
 fn createRuntimeModules(
@@ -417,6 +447,16 @@ fn createRuntimeModules(
     });
     number_module.addImport("runtime_exception", exception_module);
 
+    const slice_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/slice.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    slice_module.addImport("runtime_gc", gc_module);
+    slice_module.addImport("runtime_value", value_module);
+    slice_module.addImport("runtime_number", number_module);
+    slice_module.addImport("runtime_exception", exception_module);
+
     const unicode_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/unicode.zig"),
         .target = target,
@@ -436,6 +476,7 @@ fn createRuntimeModules(
     string_module.addImport("runtime_gc", gc_module);
     string_module.addImport("runtime_unicode", unicode_module);
     string_module.addImport("runtime_exception", exception_module);
+    string_module.addImport("runtime_slice", slice_module);
     const bytes_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/bytes.zig"),
         .target = target,
@@ -444,6 +485,16 @@ fn createRuntimeModules(
     bytes_module.addImport("runtime_gc", gc_module);
     bytes_module.addImport("runtime_string", string_module);
     bytes_module.addImport("runtime_exception", exception_module);
+    bytes_module.addImport("runtime_slice", slice_module);
+    const sequence_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/sequence.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sequence_module.addImport("runtime_gc", gc_module);
+    sequence_module.addImport("runtime_value", value_module);
+    sequence_module.addImport("runtime_number", number_module);
+    sequence_module.addImport("runtime_exception", exception_module);
     return .{
         .gc = gc_module,
         .value = value_module,
@@ -452,6 +503,8 @@ fn createRuntimeModules(
         .unicode = unicode_module,
         .string = string_module,
         .bytes = bytes_module,
+        .sequence = sequence_module,
+        .slice = slice_module,
     };
 }
 
@@ -463,4 +516,6 @@ fn addRuntimeImports(module: *std.Build.Module, runtime: RuntimeModules) void {
     module.addImport("runtime_unicode", runtime.unicode);
     module.addImport("runtime_string", runtime.string);
     module.addImport("runtime_bytes", runtime.bytes);
+    module.addImport("runtime_sequence", runtime.sequence);
+    module.addImport("runtime_slice", runtime.slice);
 }

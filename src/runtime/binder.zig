@@ -1,5 +1,7 @@
 const std = @import("std");
 const value_module = @import("runtime_value");
+const gc = @import("runtime_gc");
+const sequence = @import("runtime_sequence");
 
 const Value = value_module.Value;
 
@@ -23,6 +25,7 @@ pub const PrintArguments = struct {
 };
 
 pub fn bindFunction(
+    heap: *gc.Heap,
     allocator: std.mem.Allocator,
     parameter_names: []const []const u8,
     parameter_flags: []const u32,
@@ -36,17 +39,33 @@ pub fn bindFunction(
     errdefer allocator.free(bound);
 
     var positional_capacity: usize = 0;
-    for (parameter_flags) |flags| {
+    var var_positional_index: ?usize = null;
+    for (parameter_flags, 0..) |flags, index| {
         if (flags & parameter_flags_module.keyword_only != 0) continue;
-        if (flags & (parameter_flags_module.var_positional | parameter_flags_module.var_keyword) != 0) continue;
+        if (flags & parameter_flags_module.var_positional != 0) {
+            var_positional_index = index;
+            continue;
+        }
+        if (flags & parameter_flags_module.var_keyword != 0) continue;
         positional_capacity += 1;
     }
-    if (positional.len > positional_capacity) return error.TooManyPositional;
-    for (positional, 0..) |value, index| bound[positionalParameter(parameter_flags, index) orelse return error.TooManyPositional] = value;
+    if (positional.len > positional_capacity and var_positional_index == null) return error.TooManyPositional;
+    const fixed_positional_count = @min(positional.len, positional_capacity);
+    for (positional[0..fixed_positional_count], 0..) |value, index| bound[positionalParameter(parameter_flags, index) orelse return error.TooManyPositional] = value;
+
+    if (var_positional_index) |index| {
+        const extra = positional[fixed_positional_count..];
+        const tuple = switch (sequence.createTuple(heap, extra)) {
+            .value => |value| value,
+            .python_exception, .engine_error => return error.OutOfMemory,
+        };
+        bound[index] = Value.object(&tuple.header);
+    }
 
     for (keywords) |keyword| {
         var match: ?usize = null;
         for (parameter_names, 0..) |name, index| {
+            if (parameter_flags[index] & (parameter_flags_module.var_positional | parameter_flags_module.var_keyword) != 0) continue;
             if (std.mem.eql(u8, name, keyword.name)) {
                 match = index;
                 break;

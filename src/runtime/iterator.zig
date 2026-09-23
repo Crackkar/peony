@@ -3,10 +3,27 @@ const gc = @import("runtime_gc");
 const value_module = @import("runtime_value");
 const number = @import("runtime_number");
 const string = @import("runtime_string");
+const bytes = @import("runtime_bytes");
+const sequence = @import("runtime_sequence");
+const slice_utils = @import("runtime_slice");
 const exceptions = @import("runtime_exception");
 
 const Heap = gc.Heap;
 const Value = value_module.Value;
+const IteratorMode = enum { basic, enumerate, zip, reversed };
+
+const IteratorInitial = struct {
+    mode: IteratorMode = .basic,
+    range: ?*Range = null,
+    current: Value = Value.noneValue(),
+    text: ?*string.Str = null,
+    sequence_value: Value = Value.noneValue(),
+    byte_string: ?*bytes.Bytes = null,
+    inner: ?*Iterator = null,
+    enumerate_index: Value = Value.noneValue(),
+    reverse_source: Value = Value.noneValue(),
+    reverse_index: usize = 0,
+};
 
 pub const Range = struct {
     header: gc.Header align(8),
@@ -17,10 +34,21 @@ pub const Range = struct {
 
 pub const Iterator = struct {
     header: gc.Header align(8),
+    mode: IteratorMode = .basic,
     range: ?*Range = null,
     current: Value = Value.noneValue(),
     text: ?*string.Str = null,
+    sequence_value: Value = Value.noneValue(),
+    byte_string: ?*bytes.Bytes = null,
+    sequence_index: usize = 0,
     byte_offset: usize = 0,
+    inner: ?*Iterator = null,
+    children: []?*Iterator = &.{},
+    values: []Value = &.{},
+    enumerate_index: Value = Value.noneValue(),
+    enumerate_values: [2]Value = .{ Value.noneValue(), Value.noneValue() },
+    reverse_source: Value = Value.noneValue(),
+    reverse_index: usize = 0,
 };
 
 pub const NextResult = union(enum) {
@@ -46,10 +74,24 @@ fn traceIterator(header: *gc.Header, tracer: *gc.Tracer) void {
     const iterator: *Iterator = @ptrCast(@alignCast(header));
     if (iterator.range) |range| tracer.visit(&range.header);
     if (iterator.text) |text| tracer.visit(&text.header);
+    tracer.visit(iterator.sequence_value.asObject());
+    if (iterator.byte_string) |byte_string| tracer.visit(&byte_string.header);
     tracer.visit(iterator.current.asObject());
+    if (iterator.inner) |inner| tracer.visit(&inner.header);
+    for (iterator.children) |child| if (child) |selected| tracer.visit(&selected.header);
+    for (iterator.values) |value| tracer.visit(value.asObject());
+    tracer.visit(iterator.enumerate_index.asObject());
+    for (iterator.enumerate_values) |value| tracer.visit(value.asObject());
+    tracer.visit(iterator.reverse_source.asObject());
 }
 
-fn destroyIterator(_: *gc.Header, _: @import("std").mem.Allocator) void {}
+fn destroyIterator(header: *gc.Header, allocator: std.mem.Allocator) void {
+    const iterator: *Iterator = @ptrCast(@alignCast(header));
+    if (iterator.children.len != 0) allocator.free(iterator.children);
+    if (iterator.values.len != 0) allocator.free(iterator.values);
+    iterator.children = &.{};
+    iterator.values = &.{};
+}
 
 pub fn rangeFromHeader(header: *gc.Header) ?*Range {
     if (header.kind != &range_kind) return null;
@@ -93,6 +135,225 @@ pub fn truthyRange(range: *const Range) exceptions.Result(bool) {
     };
 }
 
+/// Return the exact Python integer length, without imposing Py_ssize_t limits.
+pub fn rangeLength(heap: *Heap, range: *Range) exceptions.Result(Value) {
+    var roots = RangeMathRoots{};
+    roots.push(heap, range);
+    defer roots.pop();
+    const ordering = number.compare(range.start, range.stop);
+    const order = switch (ordering) {
+        .value => |value| value,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    const positive_step = numberIsPositive(range.step);
+    if ((positive_step and order != .less) or (!positive_step and order != .greater)) return smallInteger(0);
+    const distance_result = if (positive_step) number.subtract(heap, range.stop, range.start) else number.subtract(heap, range.start, range.stop);
+    const distance = resultValue(distance_result) orelse return numericFailure(Value, distance_result);
+    roots.set(1, distance);
+    const stride_result = if (positive_step) identityValue(range.step) else number.negative(heap, range.step);
+    const stride = switch (stride_result) {
+        .value => |value| value,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    roots.set(2, stride);
+    const distance_minus_one_result = number.subtract(heap, distance, smallValue(1));
+    const distance_minus_one = resultValue(distance_minus_one_result) orelse return numericFailure(Value, distance_minus_one_result);
+    roots.set(3, distance_minus_one);
+    const quotient_result = number.floorDiv(heap, distance_minus_one, stride);
+    const quotient = resultValue(quotient_result) orelse return numericFailure(Value, quotient_result);
+    roots.set(4, quotient);
+    const count_result = number.add(heap, quotient, smallValue(1));
+    const count = resultValue(count_result) orelse return numericFailure(Value, count_result);
+    roots.set(5, count);
+    return .{ .value = count };
+}
+
+pub fn rangeIndex(heap: *Heap, range: *Range, index_value: Value) exceptions.Result(Value) {
+    if (!number.isIntegerValue(index_value)) return pythonError(Value, .type_error, "range indices must be integers or slices");
+    var roots = RangeMathRoots{};
+    roots.push(heap, range);
+    defer roots.pop();
+    var index = normalizeIntegerArgument(index_value);
+    roots.set(1, index);
+    if (compareToZero(index) == .less) {
+        const length_result = rangeLength(heap, range);
+        const length = switch (length_result) {
+            .value => |value| value,
+            .python_exception => |exception| return .{ .python_exception = exception },
+            .engine_error => |failure| return .{ .engine_error = failure },
+        };
+        roots.set(2, length);
+        const adjusted_result = number.add(heap, index, length);
+        index = switch (adjusted_result) {
+            .value => |value| value,
+            .python_exception => |exception| return .{ .python_exception = exception },
+            .engine_error => |failure| return .{ .engine_error = failure },
+        };
+        roots.set(1, index);
+    }
+    if (compareToZero(index) == .less) return pythonError(Value, .index_error, "range object index out of range");
+    const length_result = rangeLength(heap, range);
+    const length = switch (length_result) {
+        .value => |value| value,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    roots.set(2, length);
+    if (compareOrderResult(number.compare(index, length)) != .less) return pythonError(Value, .index_error, "range object index out of range");
+    const offset_result = number.multiply(heap, index, range.step);
+    const offset = resultValue(offset_result) orelse return numericFailure(Value, offset_result);
+    roots.set(3, offset);
+    const result = number.add(heap, range.start, offset);
+    return switch (result) {
+        .value => |value| .{ .value = value },
+        .python_exception => |exception| .{ .python_exception = exception },
+        .engine_error => |failure| .{ .engine_error = failure },
+    };
+}
+
+pub fn rangeSlice(heap: *Heap, range: *Range, slice_object: *slice_utils.Slice) exceptions.Result(*Range) {
+    var roots = RangeMathRoots{};
+    roots.push(heap, range);
+    defer roots.pop();
+    const length_result = rangeLength(heap, range);
+    const length = switch (length_result) {
+        .value => |value| value,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    roots.set(1, length);
+    const step = if (slice_object.step.tag() == .none) smallValue(1) else normalizeIntegerArgument(slice_object.step);
+    if (!number.isIntegerValue(step)) return pythonError(*Range, .type_error, "slice indices must be integers or None");
+    if (number.isZeroValue(step)) return pythonError(*Range, .value_error, "slice step cannot be zero");
+    roots.set(2, step);
+    const positive_slice_step = numberIsPositive(step);
+    const start_default_result = if (positive_slice_step) smallInteger(0) else subtractOne(heap, length);
+    const start_default = switch (start_default_result) {
+        .value => |value| value,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    const stop_default = if (positive_slice_step) length else minusOne();
+    roots.set(3, start_default);
+    roots.set(4, stop_default);
+    const start_result = normalizeRangeBound(heap, slice_object.start, start_default, length, positive_slice_step);
+    const start = switch (start_result) {
+        .value => |value| value,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    roots.set(5, start);
+    const stop_result = normalizeRangeBound(heap, slice_object.stop, stop_default, length, positive_slice_step);
+    const stop = switch (stop_result) {
+        .value => |value| value,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    roots.set(6, stop);
+    const start_offset_result = number.multiply(heap, start, range.step);
+    const start_offset = resultValue(start_offset_result) orelse return numericFailure(*Range, start_offset_result);
+    roots.set(7, start_offset);
+    const new_start_result = number.add(heap, range.start, start_offset);
+    const new_start = resultValue(new_start_result) orelse return numericFailure(*Range, new_start_result);
+    roots.set(8, new_start);
+    const stop_offset_result = number.multiply(heap, stop, range.step);
+    const stop_offset = resultValue(stop_offset_result) orelse return numericFailure(*Range, stop_offset_result);
+    roots.set(9, stop_offset);
+    const new_stop_result = number.add(heap, range.start, stop_offset);
+    const new_stop = resultValue(new_stop_result) orelse return numericFailure(*Range, new_stop_result);
+    roots.set(10, new_stop);
+    const new_step_result = number.multiply(heap, range.step, step);
+    const new_step = resultValue(new_step_result) orelse return numericFailure(*Range, new_step_result);
+    roots.set(11, new_step);
+    return createRange(heap, &.{ new_start, new_stop, new_step });
+}
+
+fn normalizeRangeBound(heap: *Heap, bound: Value, default: Value, length: Value, positive_step: bool) exceptions.Result(Value) {
+    if (bound.tag() == .none) return .{ .value = default };
+    if (!number.isIntegerValue(bound)) return pythonError(Value, .type_error, "slice indices must be integers or None");
+    var value = normalizeIntegerArgument(bound);
+    var value_root = gc.Root{ .object = value.asObject() };
+    var value_roots = gc.RootFrame{};
+    value_roots.push(&heap.roots);
+    value_roots.add(&value_root);
+    defer value_roots.pop();
+    if (compareToZero(value) == .less) {
+        const add_result = number.add(heap, value, length);
+        value = switch (add_result) {
+            .value => |adjusted| adjusted,
+            .python_exception => |exception| return .{ .python_exception = exception },
+            .engine_error => |failure| return .{ .engine_error = failure },
+        };
+        value_root.object = value.asObject();
+    }
+    const min_value = if (positive_step) smallValue(0) else minusOne();
+    const max_result = if (positive_step) identityValue(length) else subtractOne(heap, length);
+    const max_value = switch (max_result) {
+        .value => |selected| selected,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    if (compareToZero(value) == .less and positive_step) return .{ .value = min_value };
+    if (compareOrderResult(number.compare(value, min_value)) == .less) return .{ .value = min_value };
+    if (compareOrderResult(number.compare(value, max_value)) == .greater) return .{ .value = max_value };
+    return .{ .value = value };
+}
+
+fn subtractOne(heap: *Heap, value: Value) exceptions.Result(Value) {
+    return number.subtract(heap, value, smallValue(1));
+}
+
+fn identityValue(value: Value) exceptions.Result(Value) {
+    return .{ .value = value };
+}
+
+fn smallInteger(value: i64) exceptions.Result(Value) {
+    return .{ .value = smallValue(value) };
+}
+
+fn smallValue(value: i64) Value {
+    return Value.fromSmallInt(value).?;
+}
+
+fn minusOne() Value {
+    return smallValue(-1);
+}
+
+fn compareToZero(value: Value) number.Comparison {
+    return switch (number.compare(value, smallValue(0))) {
+        .value => |order| order,
+        else => .equal,
+    };
+}
+
+fn compareOrderResult(result: number.ComparisonResult) number.Comparison {
+    return switch (result) {
+        .value => |order| order,
+        else => .unordered,
+    };
+}
+
+const RangeMathRoots = struct {
+    frame: gc.RootFrame = .{},
+    roots: [12]gc.Root = [_]gc.Root{.{ .object = null }} ** 12,
+
+    fn push(self: *RangeMathRoots, heap: *Heap, range: *Range) void {
+        self.roots[0].object = &range.header;
+        self.frame.push(&heap.roots);
+        for (&self.roots) |*root| self.frame.add(root);
+    }
+
+    fn set(self: *RangeMathRoots, index: usize, value: Value) void {
+        self.roots[index].object = value.asObject();
+    }
+
+    fn pop(self: *RangeMathRoots) void {
+        self.frame.pop();
+    }
+};
+
 pub fn rangeContains(heap: *Heap, range: *Range, item: Value) exceptions.Result(bool) {
     var range_root = gc.Root{ .object = &range.header };
     var range_roots = gc.RootFrame{};
@@ -101,9 +362,7 @@ pub fn rangeContains(heap: *Heap, range: *Range, item: Value) exceptions.Result(
     defer range_roots.pop();
     if (item.asFloat()) |float_value| {
         if (!std.math.isFinite(float_value) or @trunc(float_value) != float_value) return .{ .value = false };
-        if (@abs(float_value) >= 1.0e37) return .{ .value = false };
-        const integer: i128 = @intFromFloat(float_value);
-        return switch (number.fromInt(heap, integer)) {
+        return switch (number.fromIntegralFloat(heap, float_value)) {
             .value => |converted| blk: {
                 var converted_root = gc.Root{ .object = converted.asObject() };
                 var converted_roots = gc.RootFrame{};
@@ -139,22 +398,141 @@ pub fn rangeContains(heap: *Heap, range: *Range, item: Value) exceptions.Result(
 pub fn createIterator(heap: *Heap, value: Value) exceptions.Result(*Iterator) {
     var range: ?*Range = null;
     var text: ?*string.Str = null;
+    var byte_string: ?*bytes.Bytes = null;
+    var has_sequence = false;
     if (value.asObject()) |header| {
+        if (iteratorFromHeader(header)) |existing| return .{ .value = existing };
         range = rangeFromHeader(header);
         text = string.fromHeader(header);
+        byte_string = bytes.fromHeader(header);
+        has_sequence = sequence.length(value) != null;
     }
-    if (range == null and text == null) return pythonError(*Iterator, .type_error, "object is not iterable");
+    if (range == null and text == null and byte_string == null and !has_sequence) return pythonError(*Iterator, .type_error, "object is not iterable");
 
+    return createInitialized(heap, .{
+        .range = range,
+        .current = if (range) |selected| selected.start else Value.noneValue(),
+        .text = text,
+        .sequence_value = if (has_sequence) value else Value.noneValue(),
+        .byte_string = byte_string,
+    });
+}
+
+pub fn createEnumerate(heap: *Heap, value: Value, start: Value) exceptions.Result(*Iterator) {
+    if (!number.isIntegerValue(start)) return pythonError(*Iterator, .type_error, "enumerate() start must be an integer");
+    const inner_result = createIterator(heap, value);
+    const inner = switch (inner_result) {
+        .value => |selected| selected,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    var root = gc.Root{ .object = &inner.header };
+    var roots = gc.RootFrame{};
+    roots.push(&heap.roots);
+    roots.add(&root);
+    defer roots.pop();
+    return createInitialized(heap, .{ .mode = .enumerate, .inner = inner, .enumerate_index = normalizeIntegerArgument(start) });
+}
+
+pub fn createZip(heap: *Heap, inputs: []const Value) exceptions.Result(*Iterator) {
+    const wrapper_result = createInitialized(heap, .{ .mode = .zip });
+    const wrapper = switch (wrapper_result) {
+        .value => |selected| selected,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    var wrapper_root = gc.Root{ .object = &wrapper.header };
+    var roots = gc.RootFrame{};
+    roots.push(&heap.roots);
+    roots.add(&wrapper_root);
+    defer roots.pop();
+
+    if (inputs.len == 0) return .{ .value = wrapper };
+    wrapper.children = heap.allocator.alloc(?*Iterator, inputs.len) catch return pythonError(*Iterator, .memory_error, "session memory limit exceeded");
+    @memset(wrapper.children, null);
+    wrapper.values = heap.allocator.alloc(Value, inputs.len) catch return pythonError(*Iterator, .memory_error, "session memory limit exceeded");
+    @memcpy(wrapper.values, inputs);
+    for (wrapper.values, 0..) |input, index_value| {
+        const child_result = createIterator(heap, input);
+        switch (child_result) {
+            .value => |child| wrapper.children[index_value] = child,
+            .python_exception => |exception| return .{ .python_exception = exception },
+            .engine_error => |failure| return .{ .engine_error = failure },
+        }
+    }
+    @memset(wrapper.values, Value.noneValue());
+    return .{ .value = wrapper };
+}
+
+pub fn createReversed(heap: *Heap, value: Value) exceptions.Result(*Iterator) {
+    if (value.asObject()) |header| {
+        if (rangeFromHeader(header)) |range| {
+            var reversed_slice = slice_utils.Slice{
+                .header = undefined,
+                .step = Value.fromSmallInt(-1).?,
+            };
+            const reversed_result = rangeSlice(heap, range, &reversed_slice);
+            const reversed_range = switch (reversed_result) {
+                .value => |selected| selected,
+                .python_exception => |exception| return .{ .python_exception = exception },
+                .engine_error => |failure| return .{ .engine_error = failure },
+            };
+            var range_root = gc.Root{ .object = &reversed_range.header };
+            var roots = gc.RootFrame{};
+            roots.push(&heap.roots);
+            roots.add(&range_root);
+            defer roots.pop();
+            return createIterator(heap, Value.object(&reversed_range.header));
+        }
+    }
+    const length = if (sequence.length(value)) |count| count else if (value.asObject()) |header| blk: {
+        if (string.fromHeader(header)) |text| break :blk string.length(text);
+        if (bytes.fromHeader(header)) |data| break :blk bytes.length(data);
+        return pythonError(*Iterator, .type_error, "object is not reversible");
+    } else return pythonError(*Iterator, .type_error, "object is not reversible");
+    return createInitialized(heap, .{ .mode = .reversed, .reverse_source = value, .reverse_index = length });
+}
+
+fn createInitialized(heap: *Heap, initial: IteratorInitial) exceptions.Result(*Iterator) {
     const iterator = heap.createObject(Iterator, &iterator_kind) catch return pythonError(*Iterator, .memory_error, "session memory limit exceeded");
-    iterator.range = range;
-    iterator.current = if (range) |selected| selected.start else Value.noneValue();
-    iterator.text = text;
-    iterator.byte_offset = 0;
+    const header = iterator.header;
+    iterator.* = .{
+        .header = header,
+        .mode = initial.mode,
+        .range = initial.range,
+        .current = initial.current,
+        .text = initial.text,
+        .sequence_value = initial.sequence_value,
+        .byte_string = initial.byte_string,
+        .inner = initial.inner,
+        .enumerate_index = initial.enumerate_index,
+        .reverse_source = initial.reverse_source,
+        .reverse_index = initial.reverse_index,
+    };
     return .{ .value = iterator };
 }
 
 pub fn next(heap: *Heap, iterator: *Iterator) NextResult {
+    switch (iterator.mode) {
+        .enumerate => return nextEnumerate(heap, iterator),
+        .zip => return nextZip(heap, iterator),
+        .reversed => return nextReversed(heap, iterator),
+        .basic => {},
+    }
     if (iterator.range) |range| return nextRange(heap, iterator, range);
+    if (iterator.sequence_value.asObject() != null) {
+        const length_value = sequence.length(iterator.sequence_value) orelse return .{ .engine_error = .internal_invariant };
+        if (iterator.sequence_index >= length_value) return .done;
+        const value = sequence.itemAt(iterator.sequence_value, iterator.sequence_index) orelse return .{ .engine_error = .internal_invariant };
+        iterator.sequence_index += 1;
+        return .{ .item = value };
+    }
+    if (iterator.byte_string) |byte_string| {
+        if (iterator.sequence_index >= byte_string.data.len) return .done;
+        const value = value_module.Value.fromSmallInt(byte_string.data[iterator.sequence_index]).?;
+        iterator.sequence_index += 1;
+        return .{ .item = value };
+    }
     const text = iterator.text orelse return .{ .engine_error = .internal_invariant };
     if (iterator.byte_offset >= text.data.len) return .done;
     const start = iterator.byte_offset;
@@ -166,6 +544,80 @@ pub fn next(heap: *Heap, iterator: *Iterator) NextResult {
         .python_exception => |exception| .{ .python_exception = exception },
         .engine_error => |failure| .{ .engine_error = failure },
     };
+}
+
+fn nextEnumerate(heap: *Heap, iterator: *Iterator) NextResult {
+    const inner = iterator.inner orelse return .{ .engine_error = .internal_invariant };
+    switch (next(heap, inner)) {
+        .item => |item| {
+            iterator.enumerate_values[0] = iterator.enumerate_index;
+            iterator.enumerate_values[1] = item;
+            const advanced = number.add(heap, iterator.enumerate_index, smallValue(1));
+            iterator.enumerate_index = switch (advanced) {
+                .value => |value| value,
+                .python_exception => |exception| return .{ .python_exception = exception },
+                .engine_error => |failure| return .{ .engine_error = failure },
+            };
+            const tuple = sequence.createTuple(heap, &iterator.enumerate_values);
+            return switch (tuple) {
+                .value => |value| .{ .item = Value.object(&value.header) },
+                .python_exception => |exception| .{ .python_exception = exception },
+                .engine_error => |failure| .{ .engine_error = failure },
+            };
+        },
+        .done => return .done,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    }
+}
+
+fn nextZip(heap: *Heap, iterator: *Iterator) NextResult {
+    if (iterator.children.len == 0) return .done;
+    for (iterator.children, 0..) |maybe_child, index_value| {
+        const child = maybe_child orelse return .{ .engine_error = .internal_invariant };
+        switch (next(heap, child)) {
+            .item => |item| iterator.values[index_value] = item,
+            .done => return .done,
+            .python_exception => |exception| return .{ .python_exception = exception },
+            .engine_error => |failure| return .{ .engine_error = failure },
+        }
+    }
+    const tuple = sequence.createTuple(heap, iterator.values);
+    return switch (tuple) {
+        .value => |value| .{ .item = Value.object(&value.header) },
+        .python_exception => |exception| .{ .python_exception = exception },
+        .engine_error => |failure| .{ .engine_error = failure },
+    };
+}
+
+fn nextReversed(heap: *Heap, iterator: *Iterator) NextResult {
+    if (iterator.reverse_index == 0) return .done;
+    const object = iterator.reverse_source.asObject() orelse return .{ .engine_error = .internal_invariant };
+    const index_value = iterator.reverse_index - 1;
+    if (sequence.length(iterator.reverse_source)) |length| {
+        if (index_value >= length) return .done;
+        const item = sequence.itemAt(iterator.reverse_source, index_value) orelse return .{ .engine_error = .internal_invariant };
+        iterator.reverse_index = index_value;
+        return .{ .item = item };
+    }
+    if (string.fromHeader(object)) |text| {
+        if (index_value >= string.length(text)) return .done;
+        const machine_index = std.math.cast(i64, index_value) orelse return .{ .python_exception = .{ .kind = .overflow_error, .message = "reversed sequence is too large" } };
+        return switch (string.index(heap, text, machine_index)) {
+            .value => |item| blk: {
+                iterator.reverse_index = index_value;
+                break :blk .{ .item = Value.object(&item.header) };
+            },
+            .python_exception => |exception| .{ .python_exception = exception },
+            .engine_error => |failure| .{ .engine_error = failure },
+        };
+    }
+    if (bytes.fromHeader(object)) |data| {
+        if (index_value >= data.data.len) return .done;
+        iterator.reverse_index = index_value;
+        return .{ .item = Value.fromSmallInt(data.data[index_value]).? };
+    }
+    return .{ .engine_error = .internal_invariant };
 }
 
 fn nextRange(heap: *Heap, iterator: *Iterator, range: *Range) NextResult {

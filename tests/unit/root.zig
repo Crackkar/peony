@@ -7,6 +7,7 @@ const scope_tests = @import("scope_tests");
 const compiler_vm_tests = @import("compiler_vm_tests");
 const control_flow_tests = @import("control_flow_tests");
 const functions_tests = @import("functions_tests");
+const sequence_tests = @import("sequence_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -247,6 +248,78 @@ test "UnboundLocalError follows NameError hierarchy" {
     try compiler_vm_tests.testUnboundLocalErrorHierarchy();
 }
 
+test "lists alias and mutate through methods, repr, cycles and equality" {
+    try sequence_tests.testListAliasMutationMethodsCyclesAndEquality();
+    try sequence_tests.testSequenceRepresentationQuotesEscapesAndBoundsDepth();
+}
+
+test "list extend accepts arbitrary iterables" {
+    try sequence_tests.testListExtendAcceptsRangesStringsAndExistingIterators();
+    try sequence_tests.testListExtendKeepsIteratorItemsRootedDuringGrowth();
+    try sequence_tests.testListExtendSelfIteratorStopsAtSessionCap();
+}
+
+test "str.split without a separator uses Unicode whitespace" {
+    try sequence_tests.testNoArgumentSplitUsesUnicodeWhitespace();
+}
+
+test "bytes truthiness follows its length" {
+    try sequence_tests.testBytesTruthinessUsesLength();
+}
+
+test "bytes membership validates integer and bytes probes" {
+    try sequence_tests.testBytesMembershipMatchesPythonProbes();
+}
+
+test "list pop and sort keyword bounds match Python behavior" {
+    try sequence_tests.testListMethodBoundParity();
+}
+
+test "tuples are immutable values and list iteration observes mutation" {
+    try sequence_tests.testTupleValuesAndMutableIteration();
+}
+
+test "sequences and Unicode strings and bytes support indexing and slicing" {
+    try sequence_tests.testIndexingSlicingAndUnicodeStringBytesBridge();
+}
+
+test "list insert indices use the Python ssize range" {
+    try sequence_tests.testInsertUsesPythonSsizeRange();
+}
+
+test "sequence repetition uses ssize range even for empty input" {
+    try sequence_tests.testRepeatUsesPythonSsizeRangeEvenForEmptyInput();
+}
+
+test "Python sequence bounds do not vary with WASM pointer width" {
+    try sequence_tests.testPythonSsizeValuesBeyondWasmIndexRange();
+}
+
+test "sequence repetition accepts integer left operands" {
+    try sequence_tests.testRepeatSupportsIntegerLeftOperand();
+}
+
+test "lazy range indexing and sequence builtins retain big integers" {
+    try sequence_tests.testLazyRangeIndexingSlicingAndSequenceBuiltins();
+}
+
+test "negative BigInt range slices survive collection" {
+    try sequence_tests.testNegativeBigintRangeSliceSurvivesCollection();
+    try sequence_tests.testRangeSliceReportsCappedNegativeStepMemoryError();
+}
+
+test "sequence unpacking, variadic calls and deletion preserve Python errors" {
+    try sequence_tests.testUnpackingVariadicCallsAndNameDeletion();
+}
+
+test "unpacking sizes known iterables and preserves shape errors under cap" {
+    try sequence_tests.testUnpackCapacityAndKnownRangeSizing();
+}
+
+test "sequence growth survives collection and reports memory exhaustion" {
+    try sequence_tests.testSequenceGrowthSurvivesCollectionAndReportsMemoryError();
+}
+
 test "corrupt bytecode faults stay outside Python exception flow" {
     try compiler_vm_tests.testInternalBytecodeFaultIsNotAPythonException();
 }
@@ -289,6 +362,7 @@ test "VM calls functions and retains callable builtins" {
 
 test "VM evaluates function callees and arguments once in order" {
     try functions_tests.testCallsEvaluateCalleeAndArgumentsOnceLeftToRight();
+    try functions_tests.testStarredArgumentsExpandBeforeLaterArguments();
 }
 
 test "function defaults and annotations run at definition time" {
@@ -311,6 +385,10 @@ test "closures capture shared mutable and transitive cells" {
     try functions_tests.testClosuresCaptureMutableCellsAndTransitiveFreeNames();
 }
 
+test "variadic closure roots survive cell construction collection" {
+    try functions_tests.testVariadicClosureRootsSurviveCellConstructionCollection();
+}
+
 test "recursive frames and closures survive GC and timeslices" {
     try functions_tests.testRecursiveFramesSurviveCollectionAndTimeslices();
 }
@@ -327,8 +405,8 @@ test "function construction cap failure reports MemoryError and recovers" {
     try functions_tests.testFunctionConstructionMemoryErrorAndRecovery();
 }
 
-test "variadic and call-unpacking function syntax stays explicit" {
-    try functions_tests.testVariadicDefinitionsAndCallUnpackingAreExplicitlyUnsupported();
+test "dictionary unpacking stays explicitly unsupported" {
+    try functions_tests.testDictionaryUnpackingRemainsExplicitlyUnsupported();
 }
 
 test "lexer recognizes literal prefixes and triple quotes" {

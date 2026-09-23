@@ -156,15 +156,18 @@ pub fn testRangeErrorsShadowingAndUnsupportedInputs() !void {
         .type_error,
         "range-type.py:1:",
     );
-    try expectUnsupported(
+    try expectRuntimeException(
         \\for left, right in range(2):
         \\    print("must not partially execute")
+    ,
+        .type_error,
+        "range-target.py:1:",
     );
-    try expectUnsupported(
+    try expectOutput(
         \\for item in [1, 2]:
-        \\    print("must not partially execute")
-    );
-    try expectUnsupported("print(1 in [1])\n");
+        \\    print("body")
+    , "body\nbody\n");
+    try expectOutput("print(1 in [1])\n", "True\n");
 }
 
 pub fn testRangeAndIteratorStayRootedDuringCollection() !void {
