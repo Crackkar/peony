@@ -47,6 +47,11 @@ pub fn content(value: *const Str) []const u8 {
     return value.data;
 }
 
+pub fn fromHeader(header: *gc.Header) ?*Str {
+    if (header.kind != &str_kind) return null;
+    return @ptrCast(@alignCast(header));
+}
+
 pub fn length(value: *Str) usize {
     if (value.cached_codepoints) |cached| return cached;
     const computed = std.unicode.utf8CountCodepoints(value.data) catch unreachable;

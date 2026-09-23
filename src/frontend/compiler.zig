@@ -112,8 +112,13 @@ const BinaryOperation = enum(u8) {
     shift_right,
 };
 
-const UnaryOperation = enum(u8) { positive, negative, bit_not };
+const UnaryOperation = enum(u8) { positive, negative, bit_not, logical_not };
 const CompileError = std.mem.Allocator.Error || error{Unsupported, PythonFault};
+
+const LoopContext = struct {
+    continue_target: u32,
+    break_jumps: std.ArrayList(u32) = .empty,
+};
 
 const Compiler = struct {
     heap: *gc.Heap,
@@ -130,6 +135,7 @@ const Compiler = struct {
     positions: std.ArrayList(bytecode.SourcePosition) = .empty,
     diagnostic: ?Diagnostic = null,
     pending_exception: ?exceptions.PythonException = null,
+    loop_stack: std.ArrayList(LoopContext) = .empty,
 
     fn init(heap: *gc.Heap, ast: *const Ast, analysis: *const scope_module.Analysis, filename: []const u8, scratch_allocator: std.mem.Allocator) Compiler {
         const allocator = heap.allocator;
@@ -222,14 +228,134 @@ const Compiler = struct {
         const node = self.ast.node(node_id);
         switch (node.kind) {
             .pass_statement => {},
+            .block => try self.compileBlock(node_id),
             .expression_statement => {
                 if (self.ast.children(node_id).len != 1) return self.failUnsupported(node.span, "expression statement shape is unsupported");
                 const result = try self.compileExpression(self.ast.children(node_id)[0]);
                 self.temps.release(result);
             },
             .assignment => try self.compileAssignment(node_id),
+            .augmented_assignment => try self.compileAugmentedAssignment(node_id),
+            .if_statement => try self.compileIf(node_id),
+            .while_statement => try self.compileWhile(node_id),
+            .for_statement => try self.compileFor(node_id),
+            .break_statement => try self.compileBreak(node_id),
+            .continue_statement => try self.compileContinue(node_id),
             else => return self.failUnsupported(node.span, statementUnsupportedMessage(node.kind)),
         }
+    }
+
+    fn compileBlock(self: *Compiler, node_id: NodeId) CompileError!void {
+        for (self.ast.children(node_id)) |statement| try self.compileStatement(statement);
+    }
+
+    fn compileIf(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len < 2 or children.len > 3) return self.failUnsupported(node.span, "if statement shape is unsupported");
+        const condition = try self.compileExpression(children[0]);
+        const false_jump = try self.emitJump(.jump_if_false, condition, 0, self.ast.node(children[0]).span);
+        self.temps.release(condition);
+        try self.compileStatement(children[1]);
+        if (children.len == 3) {
+            const end_jump = try self.emitJump(.jump, 0, 0, node.span);
+            try self.patchJump(false_jump, try self.currentTarget(node.span));
+            try self.compileStatement(children[2]);
+            try self.patchJump(end_jump, try self.currentTarget(node.span));
+        } else {
+            try self.patchJump(false_jump, try self.currentTarget(node.span));
+        }
+    }
+
+    fn compileWhile(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len < 2 or children.len > 3) return self.failUnsupported(node.span, "while statement shape is unsupported");
+        const test_target = try self.currentTarget(node.span);
+        const condition = try self.compileExpression(children[0]);
+        const exhausted = try self.emitJump(.jump_if_false, condition, 0, self.ast.node(children[0]).span);
+        self.temps.release(condition);
+
+        try self.loop_stack.append(self.scratch_allocator, .{ .continue_target = test_target });
+        try self.compileStatement(children[1]);
+        const context = self.loop_stack.pop().?;
+        _ = try self.emitJump(.jump, 0, test_target, node.span);
+
+        const else_target = try self.currentTarget(node.span);
+        try self.patchJump(exhausted, else_target);
+        if (children.len == 3) try self.compileStatement(children[2]);
+        const end_target = try self.currentTarget(node.span);
+        for (context.break_jumps.items) |jump_index| try self.patchJump(jump_index, end_target);
+    }
+
+    fn compileFor(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len < 3 or children.len > 4) return self.failUnsupported(node.span, "for statement shape is unsupported");
+        const target_node = self.ast.node(children[0]);
+        if (target_node.kind != .name) return self.failUnsupported(target_node.span, "tuple and unpacking loop targets are not implemented yet");
+        const iterable_node = self.ast.node(children[1]);
+        if (iterable_node.kind == .tuple_display or iterable_node.kind == .list_display or iterable_node.kind == .set_display or iterable_node.kind == .dict_display) {
+            return self.failUnsupported(iterable_node.span, "container iteration is not implemented yet");
+        }
+
+        const source = try self.compileExpression(children[1]);
+        const iterator_register = source;
+        try self.emit(.get_iterator, iterator_register, source, 0, 0, iterable_node.span);
+        const item_register = try self.acquire(target_node.span);
+        const has_item_register = try self.acquire(target_node.span);
+        const name_index = try self.internName(target_node.text);
+        const loop_start = try self.currentTarget(node.span);
+        try self.emit(.for_next, item_register, iterator_register, has_item_register, 0, node.span);
+        const exhausted = try self.emitJump(.jump_if_false, has_item_register, 0, node.span);
+        try self.emitIndex(.store_global, item_register, name_index, 0, target_node.span);
+
+        try self.loop_stack.append(self.scratch_allocator, .{ .continue_target = loop_start });
+        try self.compileStatement(children[2]);
+        const context = self.loop_stack.pop().?;
+        _ = try self.emitJump(.jump, 0, loop_start, node.span);
+
+        const else_target = try self.currentTarget(node.span);
+        try self.patchJump(exhausted, else_target);
+        if (children.len == 4) try self.compileStatement(children[3]);
+        const end_target = try self.currentTarget(node.span);
+        for (context.break_jumps.items) |jump_index| try self.patchJump(jump_index, end_target);
+        self.temps.release(has_item_register);
+        self.temps.release(item_register);
+        self.temps.release(iterator_register);
+    }
+
+    fn compileBreak(self: *Compiler, node_id: NodeId) CompileError!void {
+        if (self.loop_stack.items.len == 0) return self.failUnsupported(self.ast.node(node_id).span, "break outside loop");
+        const jump_index = try self.emitJump(.jump, 0, 0, self.ast.node(node_id).span);
+        try self.loop_stack.items[self.loop_stack.items.len - 1].break_jumps.append(self.scratch_allocator, jump_index);
+    }
+
+    fn compileContinue(self: *Compiler, node_id: NodeId) CompileError!void {
+        if (self.loop_stack.items.len == 0) return self.failUnsupported(self.ast.node(node_id).span, "continue outside loop");
+        const target = self.loop_stack.items[self.loop_stack.items.len - 1].continue_target;
+        _ = try self.emitJump(.jump, 0, target, self.ast.node(node_id).span);
+    }
+
+    fn compileAugmentedAssignment(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len != 2) return self.failUnsupported(node.span, "augmented assignment shape is unsupported");
+        const target = self.ast.node(children[0]);
+        if (target.kind != .name) return self.failUnsupported(target.span, "attribute and subscript augmented assignment are not implemented yet");
+        if (node.text.len < 2 or node.text[node.text.len - 1] != '=') return self.failUnsupported(node.span, "augmented operator is unsupported");
+        const operation = binaryOperation(node.text[0 .. node.text.len - 1]) orelse return self.failUnsupported(node.span, "this augmented operator is not implemented yet");
+        const name_index = try self.internName(target.text);
+        const left = try self.acquire(target.span);
+        try self.emitIndex(.load_global, left, name_index, 0, target.span);
+        const right = self.compileExpression(children[1]) catch |err| {
+            self.temps.release(left);
+            return err;
+        };
+        try self.emit(.binary, left, right, 0, @intFromEnum(operation), node.span);
+        self.temps.release(right);
+        try self.emitIndex(.store_global, left, name_index, 0, node.span);
+        self.temps.release(left);
     }
 
     fn compileAssignment(self: *Compiler, node_id: NodeId) CompileError!void {
@@ -281,6 +407,9 @@ const Compiler = struct {
             },
             .unary_expression => return self.compileUnary(node_id),
             .binary_expression => return self.compileBinary(node_id),
+            .boolean_expression => return self.compileBoolean(node_id),
+            .comparison_chain => return self.compileComparisonChain(node_id),
+            .conditional_expression => return self.compileConditional(node_id),
             .call => return self.compileCall(node_id),
             else => return self.failUnsupported(node.span, expressionUnsupportedMessage(node.kind)),
         }
@@ -288,7 +417,7 @@ const Compiler = struct {
 
     fn compileUnary(self: *Compiler, node_id: NodeId) CompileError!u16 {
         const node = self.ast.node(node_id);
-        const operation: UnaryOperation = if (std.mem.eql(u8, node.text, "+")) .positive else if (std.mem.eql(u8, node.text, "-")) .negative else if (std.mem.eql(u8, node.text, "~")) .bit_not else return self.failUnsupported(node.span, "this unary operator is not implemented yet");
+        const operation: UnaryOperation = if (std.mem.eql(u8, node.text, "+")) .positive else if (std.mem.eql(u8, node.text, "-")) .negative else if (std.mem.eql(u8, node.text, "~")) .bit_not else if (std.mem.eql(u8, node.text, "not")) .logical_not else return self.failUnsupported(node.span, "this unary operator is not implemented yet");
         const children = self.ast.children(node_id);
         if (children.len != 1) return self.failUnsupported(node.span, "unary expression shape is unsupported");
         const operand = try self.compileExpression(children[0]);
@@ -311,11 +440,86 @@ const Compiler = struct {
         return left;
     }
 
+    fn compileBoolean(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len != 2) return self.failUnsupported(node.span, "boolean expression shape is unsupported");
+        const left = try self.compileExpression(children[0]);
+        const is_and = std.mem.eql(u8, node.text, "and");
+        if (!is_and and !std.mem.eql(u8, node.text, "or")) return self.failUnsupported(node.span, "boolean operator is unsupported");
+        const short = try self.emitJump(if (is_and) .jump_if_false else .jump_if_true, left, 0, self.ast.node(children[0]).span);
+        const right = self.compileExpression(children[1]) catch |err| {
+            self.temps.release(left);
+            return err;
+        };
+        try self.emit(.move, left, right, 0, 0, node.span);
+        self.temps.release(right);
+        try self.patchJump(short, try self.currentTarget(node.span));
+        return left;
+    }
+
+    fn compileConditional(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len != 3) return self.failUnsupported(node.span, "conditional expression shape is unsupported");
+        const result = try self.acquire(node.span);
+        const condition = try self.compileExpression(children[0]);
+        const alternative_jump = try self.emitJump(.jump_if_false, condition, 0, self.ast.node(children[0]).span);
+        self.temps.release(condition);
+
+        const positive = try self.compileExpression(children[1]);
+        try self.emit(.move, result, positive, 0, 0, node.span);
+        self.temps.release(positive);
+        const end_jump = try self.emitJump(.jump, 0, 0, node.span);
+        try self.patchJump(alternative_jump, try self.currentTarget(node.span));
+
+        const negative = try self.compileExpression(children[2]);
+        try self.emit(.move, result, negative, 0, 0, node.span);
+        self.temps.release(negative);
+        try self.patchJump(end_jump, try self.currentTarget(node.span));
+        return result;
+    }
+
+    fn compileComparisonChain(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len < 3 or children.len % 2 == 0) return self.failUnsupported(node.span, "comparison chain shape is unsupported");
+        const result = try self.acquire(node.span);
+        const operand_count = (children.len + 1) / 2;
+        const operands = self.scratch_allocator.alloc(u16, operand_count) catch return error.OutOfMemory;
+        var held: usize = 0;
+        errdefer while (held > 0) {
+            held -= 1;
+            self.temps.release(operands[held]);
+        };
+
+        operands[held] = try self.compileExpression(children[0]);
+        held += 1;
+        var jumps: std.ArrayList(u32) = .empty;
+        var pair: usize = 0;
+        while (pair < operand_count - 1) : (pair += 1) {
+            const op_node = self.ast.node(children[pair * 2 + 1]);
+            const op = comparisonOperation(op_node.text) orelse return self.failUnsupported(op_node.span, "comparison operator is not implemented yet");
+            operands[held] = try self.compileExpression(children[pair * 2 + 2]);
+            held += 1;
+            try self.emit(.compare, result, operands[held - 2], operands[held - 1], op, op_node.span);
+            if (pair + 1 < operand_count - 1) try jumps.append(self.scratch_allocator, try self.emitJump(.jump_if_false, result, 0, op_node.span));
+        }
+        const end_target = try self.currentTarget(node.span);
+        for (jumps.items) |jump_index| try self.patchJump(jump_index, end_target);
+        while (held > 0) {
+            held -= 1;
+            self.temps.release(operands[held]);
+        }
+        return result;
+    }
+
     fn compileCall(self: *Compiler, node_id: NodeId) CompileError!u16 {
         const node = self.ast.node(node_id);
         const children = self.ast.children(node_id);
         if (children.len == 0) return self.failUnsupported(node.span, "call shape is unsupported");
         const callee = self.ast.node(children[0]);
+        if (callee.kind == .name and std.mem.eql(u8, callee.text, "range")) return self.compileRangeCall(node_id);
         if (callee.kind != .name or !std.mem.eql(u8, callee.text, "print")) {
             return self.failUnsupported(callee.span, "only direct calls to the builtin print are implemented in this commit");
         }
@@ -345,6 +549,34 @@ const Compiler = struct {
             self.temps.release(held[held_count]);
         }
         return self.loadConstant(Value.noneValue(), node.span);
+    }
+
+    fn compileRangeCall(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const count = children.len - 1;
+        if (count > std.math.maxInt(u8)) return self.failUnsupported(node.span, "range has too many positional arguments");
+        const result = try self.acquire(node.span);
+        const held = self.scratch_allocator.alloc(u16, count) catch return error.OutOfMemory;
+        var held_count: usize = 0;
+        errdefer while (held_count > 0) {
+            held_count -= 1;
+            self.temps.release(held[held_count]);
+        };
+        for (children[1..]) |argument_id| {
+            const argument = self.ast.node(argument_id);
+            if (argument.kind == .keyword_argument) return self.failUnsupported(argument.span, "range keyword arguments are not implemented yet");
+            held[held_count] = try self.compileExpression(argument_id);
+            held_count += 1;
+        }
+        const start = std.math.cast(u32, self.argument_registers.items.len) orelse return self.failUnsupported(node.span, "code object has too many range operands");
+        try self.argument_registers.appendSlice(self.allocator, held[0..held_count]);
+        try self.emitIndex(.make_range, result, start, @intCast(count), node.span);
+        while (held_count > 0) {
+            held_count -= 1;
+            self.temps.release(held[held_count]);
+        }
+        return result;
     }
 
     fn parseFloat(self: *Compiler, spelling: []const u8, span: Span) CompileError!f64 {
@@ -421,6 +653,25 @@ const Compiler = struct {
     fn emit(self: *Compiler, op: bytecode.Opcode, a: u32, b: u32, c: u32, flags: u8, span: Span) CompileError!void {
         const instruction = bytecode.Instruction.init(op, a, b, c, flags) catch return self.failUnsupported(span, "code object register operand is out of range");
         try self.appendInstruction(instruction, span);
+    }
+
+    fn emitJump(self: *Compiler, op: bytecode.Opcode, register: u32, target: u32, span: Span) CompileError!u32 {
+        const index = std.math.cast(u32, self.instructions.items.len) orelse return self.failUnsupported(span, "code object has too many instructions");
+        try self.emitIndex(op, register, target, 0, span);
+        return index;
+    }
+
+    fn patchJump(self: *Compiler, instruction_index: u32, target: u32) CompileError!void {
+        const index: usize = instruction_index;
+        if (index >= self.instructions.items.len) return error.Unsupported;
+        const previous = self.instructions.items[index];
+        const op = previous.opcodeTag() orelse return error.Unsupported;
+        const replacement = bytecode.Instruction.withIndex32(op, previous.a(), target, previous.flags()) catch return error.Unsupported;
+        self.instructions.items[index] = replacement;
+    }
+
+    fn currentTarget(self: *Compiler, span: Span) CompileError!u32 {
+        return std.math.cast(u32, self.instructions.items.len) orelse self.failUnsupported(span, "code object has too many instructions");
     }
 
     fn appendInstruction(self: *Compiler, instruction: bytecode.Instruction, span: Span) std.mem.Allocator.Error!void {
@@ -517,6 +768,20 @@ fn binaryOperation(spelling: []const u8) ?BinaryOperation {
     if (std.mem.eql(u8, spelling, "^")) return .bit_xor;
     if (std.mem.eql(u8, spelling, "<<")) return .shift_left;
     if (std.mem.eql(u8, spelling, ">>")) return .shift_right;
+    return null;
+}
+
+fn comparisonOperation(spelling: []const u8) ?u8 {
+    if (std.mem.eql(u8, spelling, "==")) return 0;
+    if (std.mem.eql(u8, spelling, "!=")) return 1;
+    if (std.mem.eql(u8, spelling, "<")) return 2;
+    if (std.mem.eql(u8, spelling, "<=")) return 3;
+    if (std.mem.eql(u8, spelling, ">")) return 4;
+    if (std.mem.eql(u8, spelling, ">=")) return 5;
+    if (std.mem.eql(u8, spelling, "is")) return 6;
+    if (std.mem.eql(u8, spelling, "is not")) return 7;
+    if (std.mem.eql(u8, spelling, "in")) return 8;
+    if (std.mem.eql(u8, spelling, "not in")) return 9;
     return null;
 }
 

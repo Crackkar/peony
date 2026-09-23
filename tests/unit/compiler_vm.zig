@@ -125,12 +125,11 @@ pub fn testUnsupportedSyntaxAndMemoryLimitTransport() !void {
         try runtime.init(std.testing.allocator, 2 * 1024 * 1024);
         defer runtime.deinit();
         switch (runtime.compileAndStart("if True:\n    print(1)\n", "later.py")) {
-            .unsupported => |diagnostic| {
-                try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "not implemented") != null);
-                try std.testing.expectEqual(@as(usize, 1), diagnostic.line);
-            },
+            .ready => {},
             else => return error.TestUnexpectedResult,
         }
+        try std.testing.expectEqual(runtime_vm.RunStatus.completed, runtime.run(100));
+        try std.testing.expectEqualStrings("1\n", runtime.stdout());
     }
     {
         var runtime: runtime_vm.Runtime = undefined;

@@ -12,6 +12,14 @@ pub const Opcode = enum(u8) {
     binary,
     print,
     return_value,
+    jump,
+    jump_if_false,
+    jump_if_true,
+    truth,
+    compare,
+    make_range,
+    get_iterator,
+    for_next,
 };
 
 /// Fixed 64-bit register instruction. The least-significant byte is the opcode;
@@ -53,6 +61,14 @@ pub const Instruction = struct {
             7 => .binary,
             8 => .print,
             9 => .return_value,
+            10 => .jump,
+            11 => .jump_if_false,
+            12 => .jump_if_true,
+            13 => .truth,
+            14 => .compare,
+            15 => .make_range,
+            16 => .get_iterator,
+            17 => .for_next,
             else => null,
         };
     }

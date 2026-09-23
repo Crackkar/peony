@@ -5,6 +5,7 @@ const lexer_tests = @import("lexer_tests");
 const parser_tests = @import("parser_tests");
 const scope_tests = @import("scope_tests");
 const compiler_vm_tests = @import("compiler_vm_tests");
+const control_flow_tests = @import("control_flow_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -243,6 +244,34 @@ test "corrupt bytecode faults stay outside Python exception flow" {
 
 test "compiler rejects later syntax explicitly and reports MemoryError" {
     try compiler_vm_tests.testUnsupportedSyntaxAndMemoryLimitTransport();
+}
+
+test "VM runs truthiness, short circuit and conditional expressions" {
+    try control_flow_tests.testTruthinessShortCircuitAndConditionalExpressions();
+}
+
+test "VM compares and short circuits chained comparisons" {
+    try control_flow_tests.testComparisonsIdentityMembershipAndChaining();
+}
+
+test "VM executes nested loops, break, continue and loop else" {
+    try control_flow_tests.testIfWhileForBreakContinueAndLoopElse();
+}
+
+test "VM lazily iterates bigint ranges and Unicode strings" {
+    try control_flow_tests.testLazyBigIntRangesAndUnicodeStringIteration();
+}
+
+test "VM reports range errors and rejects unsupported loops before execution" {
+    try control_flow_tests.testRangeErrorsShadowingAndUnsupportedInputs();
+}
+
+test "range and iterator values remain rooted across garbage collection" {
+    try control_flow_tests.testRangeAndIteratorStayRootedDuringCollection();
+}
+
+test "range membership accepts float probes and roots bigint intermediates" {
+    try control_flow_tests.testRangeFloatMembershipAndMembershipRooting();
 }
 
 test "lexer recognizes literal prefixes and triple quotes" {

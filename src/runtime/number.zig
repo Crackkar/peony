@@ -75,6 +75,10 @@ pub fn isIntegerValue(value: Value) bool {
     return isInteger(value);
 }
 
+pub fn isZeroValue(value: Value) bool {
+    return isZero(value);
+}
+
 pub fn formatInteger(heap: *Heap, value: Value) ?exceptions.Result([]u8) {
     if (smallInteger(value)) |integer| {
         return .{ .value = std.fmt.allocPrint(heap.allocator, "{d}", .{integer}) catch return .{ .python_exception = .{ .kind = .memory_error, .message = "session memory limit exceeded" } } };

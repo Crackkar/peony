@@ -116,7 +116,7 @@ test('WASM timeslices resume without replaying output, and cancellation is disti
   }
 });
 
-test('WASM session output is isolated and parsed future syntax is explicit', async () => {
+test('WASM session output is isolated and branches execute between runs', async () => {
   const api = await newApi();
   const first = api.peony_session_new(0, 0);
   const second = api.peony_session_new(0, 0);
@@ -130,8 +130,9 @@ test('WASM session output is isolated and parsed future syntax is explicit', asy
     assert.equal(api.peony_run(second, 100), status.completed);
     assert.equal(stdout(api, second), 'right\n');
 
-    assert.equal(compile(api, first, 'if True:\n    print(1)\n'), status.unsupported);
-    assert.match(errorText(api, first), /not implemented|unsupported/i);
+    assert.equal(compile(api, first, 'if True:\n    print(1)\n'), status.ok);
+    assert.equal(api.peony_run(first, 100), status.completed);
+    assert.equal(stdout(api, first), '1\n');
     assert.equal(compile(api, first, 'print("works again")\n'), status.ok);
     assert.equal(api.peony_run(first, 100), status.completed);
     assert.equal(stdout(api, first), 'works again\n');

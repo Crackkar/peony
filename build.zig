@@ -81,6 +81,7 @@ pub fn build(b: *std.Build) void {
     compiler_module.addImport("runtime_number", native_runtime.number);
     compiler_module.addImport("runtime_string", native_runtime.string);
     compiler_module.addImport("runtime_exception", native_runtime.exception);
+    const native_iterator_module = createRuntimeIteratorModule(b, target, optimize, native_runtime);
     const runtime_vm_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/vm.zig"),
         .target = target,
@@ -93,6 +94,7 @@ pub fn build(b: *std.Build) void {
     runtime_vm_module.addImport("runtime_number", native_runtime.number);
     runtime_vm_module.addImport("runtime_string", native_runtime.string);
     runtime_vm_module.addImport("runtime_exception", native_runtime.exception);
+    runtime_vm_module.addImport("runtime_iterator", native_iterator_module);
     const compiler_vm_test_module = b.createModule(.{
         .root_source_file = b.path("tests/unit/compiler_vm.zig"),
         .target = target,
@@ -102,6 +104,13 @@ pub fn build(b: *std.Build) void {
     compiler_vm_test_module.addImport("frontend_compiler", compiler_module);
     compiler_vm_test_module.addImport("runtime_vm", runtime_vm_module);
     compiler_vm_test_module.addImport("runtime_exception", native_runtime.exception);
+    const control_flow_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/control_flow.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    control_flow_test_module.addImport("runtime_vm", runtime_vm_module);
+    control_flow_test_module.addImport("runtime_exception", native_runtime.exception);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -132,6 +141,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("parser_tests", parser_test_module);
     unit_test_root.addImport("scope_tests", scope_test_module);
     unit_test_root.addImport("compiler_vm_tests", compiler_vm_test_module);
+    unit_test_root.addImport("control_flow_tests", control_flow_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -257,6 +267,7 @@ fn createExecutionVmModule(
     runtime: RuntimeModules,
     frontend: FrontendModules,
 ) *std.Build.Module {
+    const iterator_module = createRuntimeIteratorModule(b, target, optimize, runtime);
     const bytecode_module = b.createModule(.{
         .root_source_file = b.path("src/frontend/bytecode.zig"),
         .target = target,
@@ -291,7 +302,28 @@ fn createExecutionVmModule(
     vm_module.addImport("runtime_number", runtime.number);
     vm_module.addImport("runtime_string", runtime.string);
     vm_module.addImport("runtime_exception", runtime.exception);
+    vm_module.addImport("runtime_iterator", iterator_module);
     return vm_module;
+}
+
+fn createRuntimeIteratorModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    runtime: RuntimeModules,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/iterator.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = target.result.cpu.arch == .wasm32,
+    });
+    module.addImport("runtime_gc", runtime.gc);
+    module.addImport("runtime_value", runtime.value);
+    module.addImport("runtime_number", runtime.number);
+    module.addImport("runtime_string", runtime.string);
+    module.addImport("runtime_exception", runtime.exception);
+    return module;
 }
 
 const RuntimeModules = struct {

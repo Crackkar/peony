@@ -22,7 +22,7 @@ The ABI targets `wasm32-freestanding`. All pointers and lengths are unsigned 32-
 | `peony_stderr_consume` | `(handle, len: u32) -> status: u32` | Accepts only `len == 0`. |
 | `peony_error_ptr`, `peony_error_len` | `(handle: u32) -> ptr/len: u32` | Return a borrowed UTF-8 diagnostic or exception message, or zero when empty/invalid. |
 
-The current compiler executes straight-line scalar expressions, assignments and direct `print(...)` calls. Parsed syntax outside that subset returns `UNSUPPORTED` with a diagnostic instead of being executed. Full functions, branches, loops, callable objects, events and host resume packets are later work.
+The current compiler executes scalar expressions and assignments, direct `print(...)` calls, conditional expressions, comparisons, and `if`/`elif`/`else`, `while`/`else`, and `for`/`else` control flow. `for` supports lazy integer `range(...)` values and Unicode code-point iteration over strings; range values are not materialized. Boolean operators short circuit and return an operand. Tuple/unpacking loop targets, container iteration, user-defined iterators, callable objects, events and host resume packets remain outside this subset and return `UNSUPPORTED` with a diagnostic when recognized during compilation.
 
 ## Status values
 
