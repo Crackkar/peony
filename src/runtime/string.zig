@@ -8,7 +8,7 @@ pub const SplitResult = exceptions.Result(SplitIterator);
 pub const PythonExceptionKind = exceptions.PythonExceptionKind;
 
 pub const Str = struct {
-    header: gc.Header,
+    header: gc.Header align(8),
     data: []u8,
     cached_codepoints: ?usize = null,
     cached_hash: ?u64 = null,

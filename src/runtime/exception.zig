@@ -2,6 +2,7 @@ pub const PythonExceptionKind = enum {
     base_exception,
     exception,
     memory_error,
+    name_error,
     zero_division_error,
     value_error,
     overflow_error,
@@ -34,6 +35,6 @@ pub fn isSubclass(kind: PythonExceptionKind, base: PythonExceptionKind) bool {
     return switch (kind) {
         .base_exception => false,
         .exception => base == .base_exception,
-        .memory_error, .zero_division_error, .value_error, .overflow_error, .type_error, .index_error, .unicode_decode_error => base == .exception,
+        .memory_error, .name_error, .zero_division_error, .value_error, .overflow_error, .type_error, .index_error, .unicode_decode_error => base == .exception,
     };
 }

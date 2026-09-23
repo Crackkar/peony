@@ -8,6 +8,11 @@ pub const Status = enum(u32) {
     invalid_handle = 2,
     invalid_argument = 3,
     out_of_memory = 4,
+    completed = 5,
+    python_exception = 6,
+    timeslice = 7,
+    cancelled = 8,
+    internal_error = 9,
 };
 
 pub const SessionHandle = struct {

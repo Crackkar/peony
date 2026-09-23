@@ -41,10 +41,46 @@ pub fn fromInt(heap: *Heap, integer: i128) ValueResult {
     return managedToValue(heap, managed);
 }
 
+/// Parses a lexer-validated Python integer token, including base prefixes and
+/// digit separators, without narrowing through a machine integer.
+pub fn parseIntegerLiteral(heap: *Heap, token: []const u8) ValueResult {
+    var base: u8 = 10;
+    var digits = token;
+    if (token.len > 2 and token[0] == '0') {
+        base = switch (token[1]) {
+            'x', 'X' => 16,
+            'o', 'O' => 8,
+            'b', 'B' => 2,
+            else => 10,
+        };
+        if (base != 10) digits = token[2..];
+    }
+
+    var integer = BigIntStorage.init(heap.allocator) catch return memoryError(Value);
+    integer.setString(base, digits) catch |err| {
+        integer.deinit();
+        if (err == error.OutOfMemory) return memoryError(Value);
+        return pythonError(Value, .value_error, "invalid integer literal");
+    };
+    return managedToValue(heap, integer);
+}
+
 pub fn toInt(comptime Int: type, value: Value) ?Int {
     if (smallInteger(value)) |integer| return std.math.cast(Int, integer);
     const big = bigInteger(value) orelse return null;
     return big.integer.toInt(Int) catch null;
+}
+
+pub fn isIntegerValue(value: Value) bool {
+    return isInteger(value);
+}
+
+pub fn formatInteger(heap: *Heap, value: Value) ?exceptions.Result([]u8) {
+    if (smallInteger(value)) |integer| {
+        return .{ .value = std.fmt.allocPrint(heap.allocator, "{d}", .{integer}) catch return .{ .python_exception = .{ .kind = .memory_error, .message = "session memory limit exceeded" } } };
+    }
+    const big = bigInteger(value) orelse return null;
+    return .{ .value = big.integer.toString(heap.allocator, 10, .lower) catch return .{ .python_exception = .{ .kind = .memory_error, .message = "session memory limit exceeded" } } };
 }
 
 pub fn toFloat(heap: *Heap, value: Value) FloatResult {
@@ -700,7 +736,7 @@ fn integerBit(value: Value, bit_index: usize) bool {
     const limb_index = bit_index / limb_bits;
     if (limb_index >= managed.len()) return false;
     const bit_in_limb: u6 = @intCast(bit_index % limb_bits);
-    return managed.limbs[limb_index] & (@as(std.math.big.Limb, 1) << bit_in_limb) != 0;
+    return managed.limbs[limb_index] & (@as(std.math.big.Limb, 1) << @truncate(bit_in_limb)) != 0;
 }
 
 fn compareFloats(left: f64, right: f64) Comparison {

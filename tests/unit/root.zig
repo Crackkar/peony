@@ -4,9 +4,21 @@ const string_tests = @import("string_bytes_tests");
 const lexer_tests = @import("lexer_tests");
 const parser_tests = @import("parser_tests");
 const scope_tests = @import("scope_tests");
+const compiler_vm_tests = @import("compiler_vm_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
+}
+
+test "ABI v1 appends execution statuses without renumbering existing values" {
+    const status = @import("abi").Status;
+    try @import("std").testing.expectEqual(@as(u32, 0), @intFromEnum(status.ok));
+    try @import("std").testing.expectEqual(@as(u32, 4), @intFromEnum(status.out_of_memory));
+    try @import("std").testing.expectEqual(@as(u32, 5), @intFromEnum(status.completed));
+    try @import("std").testing.expectEqual(@as(u32, 6), @intFromEnum(status.python_exception));
+    try @import("std").testing.expectEqual(@as(u32, 7), @intFromEnum(status.timeslice));
+    try @import("std").testing.expectEqual(@as(u32, 8), @intFromEnum(status.cancelled));
+    try @import("std").testing.expectEqual(@as(u32, 9), @intFromEnum(status.internal_error));
 }
 
 test "session allocator accounting" {
@@ -203,6 +215,34 @@ test "scope analysis handles synthetic class and comprehension scopes" {
 
 test "scope analysis preserves import flags and owns names" {
     try scope_tests.testImportFlagsAndOwnedNames();
+}
+
+test "64-bit bytecode packs operands and rejects register overflow" {
+    try compiler_vm_tests.testInstructionPackingAndOperandLimits();
+}
+
+test "compiler temporaries are reused and register bounded" {
+    try compiler_vm_tests.testTemporaryRegistersAreReusedAndBounded();
+}
+
+test "straight-line compiler and VM own source metadata" {
+    try compiler_vm_tests.testStraightLineCompilationAndOwnership();
+}
+
+test "VM executes bigint and string literals with correct output" {
+    try compiler_vm_tests.testBigIntegersStringsAndTemporaryReuse();
+}
+
+test "VM resolves builtin print and transports Python exceptions" {
+    try compiler_vm_tests.testBuiltinFallbackShadowingAndPythonExceptions();
+}
+
+test "corrupt bytecode faults stay outside Python exception flow" {
+    try compiler_vm_tests.testInternalBytecodeFaultIsNotAPythonException();
+}
+
+test "compiler rejects later syntax explicitly and reports MemoryError" {
+    try compiler_vm_tests.testUnsupportedSyntaxAndMemoryLimitTransport();
 }
 
 test "lexer recognizes literal prefixes and triple quotes" {

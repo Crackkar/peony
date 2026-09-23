@@ -53,7 +53,7 @@ test('transfer allocator returns writable memory and accepts the matching free',
   free(ptr, bytes.length);
 });
 
-test('session handles are distinct, stale handles fail, and skeleton calls are explicit', async () => {
+test('session handles are distinct, stale handles fail, and execution statuses are explicit', async () => {
   const { instance } = await instantiateBytes();
   const api = instance.exports;
   const ok = 0;
@@ -73,18 +73,15 @@ test('session handles are distinct, stale handles fail, and skeleton calls are e
   assert.ok(filenamePtr > 0);
   new Uint8Array(api.memory.buffer, sourcePtr, 8).set(new TextEncoder().encode('print(1)'));
   new Uint8Array(api.memory.buffer, filenamePtr, 7).set(new TextEncoder().encode('main.py'));
-  assert.equal(api.peony_compile_and_start(first, sourcePtr, 8, filenamePtr, 7), unsupported);
-  const error = new TextDecoder().decode(new Uint8Array(
-    api.memory.buffer,
-    api.peony_error_ptr(first),
-    api.peony_error_len(first),
-  ));
-  assert.match(error, /not implemented yet/);
+  assert.equal(api.peony_compile_and_start(first, sourcePtr, 8, filenamePtr, 7), ok);
+  assert.equal(api.peony_run(first, 0), 5);
+  const outputPtr = api.peony_stdout_ptr(first);
+  assert.equal(new TextDecoder().decode(new Uint8Array(api.memory.buffer, outputPtr, api.peony_stdout_len(first))), '1\n');
   assert.equal(api.peony_compile_and_start(first, 1, 8, 0, 0), invalidArgument);
   assert.equal(api.peony_error_len(first), 0);
-  assert.equal(api.peony_run(first, 100), unsupported);
   assert.equal(api.peony_resume(first, 0, 0), unsupported);
   assert.equal(api.peony_cancel(first), ok);
+  assert.equal(api.peony_run(first, 1), 8);
   api.peony_transfer_free(sourcePtr, 8);
   api.peony_transfer_free(filenamePtr, 7);
   assert.equal(api.peony_compile_and_start(first, sourcePtr, 8, 0, 0), invalidArgument);
@@ -92,13 +89,13 @@ test('session handles are distinct, stale handles fail, and skeleton calls are e
   assert.equal(api.peony_session_destroy(first), ok);
   assert.equal(api.peony_run(first, 1), invalidHandle);
   assert.equal(api.peony_session_destroy(first), invalidHandle);
-  assert.equal(api.peony_run(second, 1), unsupported);
+  assert.equal(api.peony_run(second, 1), 5);
   assert.equal(api.peony_session_destroy(second), ok);
   const reusedSlot = api.peony_session_new(0, 0);
   assert.notEqual(reusedSlot, 0);
   assert.notEqual(reusedSlot, first);
   assert.equal(api.peony_run(first, 1), invalidHandle);
-  assert.equal(api.peony_run(reusedSlot, 1), unsupported);
+  assert.equal(api.peony_run(reusedSlot, 1), 5);
   assert.equal(api.peony_session_destroy(reusedSlot), ok);
 });
 

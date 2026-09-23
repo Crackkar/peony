@@ -60,6 +60,48 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const frontend_modules = createFrontendModules(b, target, optimize);
+    const bytecode_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/bytecode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bytecode_module.addImport("runtime_gc", native_runtime.gc);
+    bytecode_module.addImport("runtime_value", native_runtime.value);
+    const compiler_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/compiler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_module.addImport("frontend_bytecode", bytecode_module);
+    compiler_module.addImport("frontend_parser", frontend_modules.parser);
+    compiler_module.addImport("frontend_ast", frontend_modules.ast);
+    compiler_module.addImport("frontend_scope", frontend_modules.scope);
+    compiler_module.addImport("runtime_gc", native_runtime.gc);
+    compiler_module.addImport("runtime_value", native_runtime.value);
+    compiler_module.addImport("runtime_number", native_runtime.number);
+    compiler_module.addImport("runtime_string", native_runtime.string);
+    compiler_module.addImport("runtime_exception", native_runtime.exception);
+    const runtime_vm_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/vm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    runtime_vm_module.addImport("frontend_bytecode", bytecode_module);
+    runtime_vm_module.addImport("frontend_compiler", compiler_module);
+    runtime_vm_module.addImport("runtime_gc", native_runtime.gc);
+    runtime_vm_module.addImport("runtime_value", native_runtime.value);
+    runtime_vm_module.addImport("runtime_number", native_runtime.number);
+    runtime_vm_module.addImport("runtime_string", native_runtime.string);
+    runtime_vm_module.addImport("runtime_exception", native_runtime.exception);
+    const compiler_vm_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/compiler_vm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_vm_test_module.addImport("frontend_bytecode", bytecode_module);
+    compiler_vm_test_module.addImport("frontend_compiler", compiler_module);
+    compiler_vm_test_module.addImport("runtime_vm", runtime_vm_module);
+    compiler_vm_test_module.addImport("runtime_exception", native_runtime.exception);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -89,6 +131,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("lexer_tests", lexer_test_module);
     unit_test_root.addImport("parser_tests", parser_test_module);
     unit_test_root.addImport("scope_tests", scope_test_module);
+    unit_test_root.addImport("compiler_vm_tests", compiler_vm_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -105,7 +148,11 @@ pub fn build(b: *std.Build) void {
         .single_threaded = true,
         .strip = true,
     });
-    addRuntimeImports(wasm_module, createRuntimeModules(b, wasm_target, .ReleaseSmall));
+    const wasm_runtime = createRuntimeModules(b, wasm_target, .ReleaseSmall);
+    const wasm_frontend = createFrontendModules(b, wasm_target, .ReleaseSmall);
+    const wasm_vm = createExecutionVmModule(b, wasm_target, .ReleaseSmall, wasm_runtime, wasm_frontend);
+    wasm_module.addImport("runtime_vm", wasm_vm);
+    addRuntimeImports(wasm_module, wasm_runtime);
     wasm_module.export_symbol_names = abi_exports[0..];
 
     const wasm = b.addExecutable(.{
@@ -184,7 +231,10 @@ fn addProbe(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, p
         .single_threaded = true,
         .strip = true,
     });
-    addRuntimeImports(module, createRuntimeModules(b, target, .ReleaseSmall));
+    const runtime = createRuntimeModules(b, target, .ReleaseSmall);
+    const frontend = createFrontendModules(b, target, .ReleaseSmall);
+    module.addImport("runtime_vm", createExecutionVmModule(b, target, .ReleaseSmall, runtime, frontend));
+    addRuntimeImports(module, runtime);
     module.export_symbol_names = exports;
 
     const exe = b.addExecutable(.{
@@ -198,6 +248,50 @@ fn addProbe(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, p
     const install = b.addInstallArtifact(exe, .{});
     const step = b.step(b.fmt("probe-{s}", .{name}), b.fmt("Build the {s} feature-size probe", .{name}));
     step.dependOn(&install.step);
+}
+
+fn createExecutionVmModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    runtime: RuntimeModules,
+    frontend: FrontendModules,
+) *std.Build.Module {
+    const bytecode_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/bytecode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bytecode_module.addImport("runtime_gc", runtime.gc);
+    bytecode_module.addImport("runtime_value", runtime.value);
+    const compiler_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/compiler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_module.addImport("frontend_bytecode", bytecode_module);
+    compiler_module.addImport("frontend_parser", frontend.parser);
+    compiler_module.addImport("frontend_ast", frontend.ast);
+    compiler_module.addImport("frontend_scope", frontend.scope);
+    compiler_module.addImport("runtime_gc", runtime.gc);
+    compiler_module.addImport("runtime_value", runtime.value);
+    compiler_module.addImport("runtime_number", runtime.number);
+    compiler_module.addImport("runtime_string", runtime.string);
+    compiler_module.addImport("runtime_exception", runtime.exception);
+    const vm_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/vm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = target.result.cpu.arch == .wasm32,
+    });
+    vm_module.addImport("frontend_bytecode", bytecode_module);
+    vm_module.addImport("frontend_compiler", compiler_module);
+    vm_module.addImport("runtime_gc", runtime.gc);
+    vm_module.addImport("runtime_value", runtime.value);
+    vm_module.addImport("runtime_number", runtime.number);
+    vm_module.addImport("runtime_string", runtime.string);
+    vm_module.addImport("runtime_exception", runtime.exception);
+    return vm_module;
 }
 
 const RuntimeModules = struct {
