@@ -27,7 +27,10 @@ pub const Kind = enum {
     while_statement,
     for_statement,
     function_definition,
+    class_definition,
     parameter,
+    import_statement,
+    import_alias,
     name,
     integer_literal,
     float_literal,
@@ -54,6 +57,8 @@ pub const Kind = enum {
     conditional_expression,
     lambda_expression,
     named_expression,
+    comprehension_expression,
+    comprehension_clause,
 };
 
 pub const parameter_flags = struct {
@@ -73,6 +78,10 @@ pub const function_flags = struct {
 /// and operator spellings borrow bytes from the compilation source. Function
 /// nodes store parameters first, an optional return annotation next when marked
 /// by `function_flags.has_return_annotation`, and the body as the final child.
+/// Class nodes store base expressions followed by a block. Future comprehension
+/// nodes store clause nodes followed by their result expression; each clause
+/// stores target, iterable, then zero or more filters. Import alias text is the
+/// bound local name.
 pub const Node = struct {
     kind: Kind,
     span: Span,

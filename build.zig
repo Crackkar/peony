@@ -69,6 +69,14 @@ pub fn build(b: *std.Build) void {
     });
     parser_test_module.addImport("frontend_parser", frontend_modules.parser);
     parser_test_module.addImport("frontend_ast", frontend_modules.ast);
+    const scope_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/scope.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scope_test_module.addImport("frontend_parser", frontend_modules.parser);
+    scope_test_module.addImport("frontend_ast", frontend_modules.ast);
+    scope_test_module.addImport("frontend_scope", frontend_modules.scope);
     const unit_test_root = b.createModule(.{
         .root_source_file = b.path("tests/unit/root.zig"),
         .target = target,
@@ -80,6 +88,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("string_bytes_tests", string_bytes_test_module);
     unit_test_root.addImport("lexer_tests", lexer_test_module);
     unit_test_root.addImport("parser_tests", parser_test_module);
+    unit_test_root.addImport("scope_tests", scope_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -122,6 +131,7 @@ const FrontendModules = struct {
     lexer: *std.Build.Module,
     ast: *std.Build.Module,
     parser: *std.Build.Module,
+    scope: *std.Build.Module,
 };
 
 fn createFrontendModules(
@@ -153,7 +163,13 @@ fn createFrontendModules(
     parser_module.addImport("frontend_token", token_module);
     parser_module.addImport("frontend_lexer", lexer_module);
     parser_module.addImport("frontend_ast", ast_module);
-    return .{ .token = token_module, .lexer = lexer_module, .ast = ast_module, .parser = parser_module };
+    const scope_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/scope.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scope_module.addImport("frontend_ast", ast_module);
+    return .{ .token = token_module, .lexer = lexer_module, .ast = ast_module, .parser = parser_module, .scope = scope_module };
 }
 
 fn addProbe(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, probe_symbol: []const u8) void {

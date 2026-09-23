@@ -3,6 +3,7 @@ const value_tests = @import("value_number_tests");
 const string_tests = @import("string_bytes_tests");
 const lexer_tests = @import("lexer_tests");
 const parser_tests = @import("parser_tests");
+const scope_tests = @import("scope_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -178,6 +179,30 @@ test "parser reports suite syntax errors with source locations" {
 
 test "parser marks deferred and permanently excluded syntax" {
     try parser_tests.testUnsupportedFeatures();
+}
+
+test "scope analysis classifies whole blocks and sibling scopes" {
+    try scope_tests.testWholeBlockClassification();
+}
+
+test "scope analysis resolves transitive closures and shadowing" {
+    try scope_tests.testClosuresAndShadowing();
+}
+
+test "scope analysis enforces global and nonlocal declarations" {
+    try scope_tests.testDeclarationsAndErrors();
+}
+
+test "scope analysis separates definition expressions and target effects" {
+    try scope_tests.testDefinitionEvaluationAndTargets();
+}
+
+test "scope analysis handles synthetic class and comprehension scopes" {
+    try scope_tests.testSyntheticClassAndComprehensionScopes();
+}
+
+test "scope analysis preserves import flags and owns names" {
+    try scope_tests.testImportFlagsAndOwnedNames();
 }
 
 test "lexer recognizes literal prefixes and triple quotes" {
