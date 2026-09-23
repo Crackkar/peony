@@ -133,7 +133,7 @@ test('WASM expands each starred argument before evaluating later arguments', asy
     ].join('\n');
     assert.equal(compile(api, handle, badStar), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /TypeError.*functions\.py:6:/);
+    assert.match(errorText(api, handle), /File "functions\.py", line 6[\s\S]*TypeError/);
     assert.equal(stdout(api, handle), '');
   } finally {
     api.peony_session_destroy(handle);
@@ -162,7 +162,7 @@ test('WASM evaluates definition-time defaults and annotations and reports binder
 
     assert.equal(compile(api, handle, 'def one(value):\n    return value\none(1, 2)\n', 'too-many.py'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /TypeError.*too-many\.py:3:/);
+    assert.match(errorText(api, handle), /File "too-many\.py", line 3[\s\S]*TypeError/);
 
     assert.equal(compile(api, handle, 'print("varargs enabled")\ndef collect(*items):\n    return items\nprint(collect(1, 2))\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.completed);
@@ -212,7 +212,7 @@ test('WASM timeslices nested frames without replay, cancellation resets calls, a
     assert.equal(stdout(api, first), '42\n');
     assert.equal(compile(api, second, 'print(secret())\n'), status.ok);
     assert.equal(api.peony_run(second, 0), status.pythonException);
-    assert.match(errorText(api, second), /NameError.*functions\.py:1:/);
+    assert.match(errorText(api, second), /File "functions\.py", line 1[\s\S]*NameError/);
   } finally {
     api.peony_session_destroy(first);
     api.peony_session_destroy(second);

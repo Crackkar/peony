@@ -42,6 +42,21 @@ pub const Opcode = enum(u8) {
     format_value,
     make_generator,
     yield_value,
+    enter_try,
+    try_else,
+    try_complete,
+    try_unhandled,
+    load_exception,
+    match_exception,
+    bind_exception,
+    raise_value,
+    raise_current,
+    assert_failed,
+    end_finally,
+    unwind_jump,
+    accept_exception,
+    with_enter,
+    with_exit,
 };
 
 /// Fixed 64-bit register instruction. The least-significant byte is the opcode;
@@ -113,6 +128,21 @@ pub const Instruction = struct {
             37 => .format_value,
             38 => .make_generator,
             39 => .yield_value,
+            40 => .enter_try,
+            41 => .try_else,
+            42 => .try_complete,
+            43 => .try_unhandled,
+            44 => .load_exception,
+            45 => .match_exception,
+            46 => .bind_exception,
+            47 => .raise_value,
+            48 => .raise_current,
+            49 => .assert_failed,
+            50 => .end_finally,
+            51 => .unwind_jump,
+            52 => .accept_exception,
+            53 => .with_enter,
+            54 => .with_exit,
             else => null,
         };
     }
@@ -210,6 +240,14 @@ pub const FormatSite = struct {
     spec: []const u8,
 };
 
+pub const TrySite = struct {
+    body_start_ip: u32 = 0,
+    handler_ip: u32 = 0,
+    finalizer_ip: u32 = std.math.maxInt(u32),
+    end_ip: u32 = 0,
+    handler_count: u16 = 0,
+};
+
 pub const code_flags = struct {
     pub const function: u32 = 1 << 0;
 };
@@ -234,8 +272,10 @@ pub const Code = struct {
     sequence_sites: []SequenceSite = &.{},
     slice_sites: []SliceSite = &.{},
     format_sites: []FormatSite = &.{},
+    try_sites: []TrySite = &.{},
     nested_codes: []*Code = &.{},
     positions: []SourcePosition = &.{},
+    source: []u8 = &.{},
     filename: []const u8 = "",
     display_name: []const u8 = "<module>",
     register_count: u32 = 0,
@@ -271,8 +311,10 @@ pub const Code = struct {
         self.allocator.free(self.slice_sites);
         for (self.format_sites) |site| self.allocator.free(site.spec);
         self.allocator.free(self.format_sites);
+        self.allocator.free(self.try_sites);
         self.allocator.free(self.nested_codes);
         self.allocator.free(self.positions);
+        if (self.source.len != 0) self.allocator.free(self.source);
         self.allocator.free(self.filename);
         self.allocator.free(self.display_name);
         self.allocator.free(self.root_slots);

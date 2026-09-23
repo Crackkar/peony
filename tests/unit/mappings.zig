@@ -361,7 +361,16 @@ fn expectRuntimeException(source: []const u8, kind_name: []const u8, location: [
     try std.testing.expectEqual(runtime_vm.RunStatus.python_exception, runtime.run(100_000));
     _ = runtime.pythonException() orelse return error.ExpectedPythonException;
     try std.testing.expect(std.mem.indexOf(u8, runtime.errorText(), kind_name) != null);
-    try std.testing.expect(std.mem.indexOf(u8, runtime.errorText(), location) != null);
+    try expectTraceLocation(runtime.errorText(), location);
+}
+
+fn expectTraceLocation(text: []const u8, location: []const u8) !void {
+    var parts = std.mem.splitScalar(u8, location, ':');
+    const filename = parts.next() orelse return error.InvalidTestLocation;
+    const line = parts.next() orelse return error.InvalidTestLocation;
+    const pattern = try std.fmt.allocPrint(std.testing.allocator, "File \"{s}\", line {s}", .{ filename, line });
+    defer std.testing.allocator.free(pattern);
+    try std.testing.expect(std.mem.indexOf(u8, text, pattern) != null);
 }
 
 fn expectRuntimeExceptionOutput(source: []const u8, expected_output: []const u8) !void {

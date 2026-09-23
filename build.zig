@@ -20,6 +20,8 @@ const abi_exports = [_][]const u8{
     "peony_stderr_consume",
     "peony_error_ptr",
     "peony_error_len",
+    "peony_traceback_ptr",
+    "peony_traceback_len",
 };
 
 pub fn build(b: *std.Build) void {
@@ -166,6 +168,14 @@ pub fn build(b: *std.Build) void {
     });
     formatting_test_module.addImport("runtime_vm", runtime_vm_module);
     formatting_test_module.addImport("runtime_exception", native_runtime.exception);
+    const exceptions_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/exceptions.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exceptions_test_module.addImport("runtime_vm", runtime_vm_module);
+    exceptions_test_module.addImport("runtime_exception", native_runtime.exception);
+    exceptions_test_module.addImport("runtime_value", native_runtime.value);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -202,6 +212,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("mapping_tests", mapping_test_module);
     unit_test_root.addImport("comprehension_tests", comprehension_test_module);
     unit_test_root.addImport("formatting_tests", formatting_test_module);
+    unit_test_root.addImport("exception_tests", exceptions_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -480,6 +491,7 @@ fn createRuntimeModules(
         .target = target,
         .optimize = optimize,
     });
+    exception_module.addImport("runtime_gc", gc_module);
     number_module.addImport("runtime_exception", exception_module);
 
     const slice_module = b.createModule(.{

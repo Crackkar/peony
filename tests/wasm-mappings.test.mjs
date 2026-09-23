@@ -94,7 +94,7 @@ test('WASM dict methods and live views follow Python behavior', async () => {
 
     assert.equal(compile(api, handle, 'mapping = {"a": 1}\nkeys = mapping.keys()\ncursor = iter(keys)\nnext(cursor)\nmapping["b"] = 2\nnext(cursor)\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /RuntimeError.*mappings\.py:6:/);
+    assert.match(errorText(api, handle), /File "mappings\.py", line 6[\s\S]*RuntimeError/);
 
     assert.equal(compile(api, handle, 'mapping = {}\nview = mapping.values()\nmapping["view"] = view\nprint(view)\nprint(mapping)\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.completed);
@@ -168,7 +168,7 @@ test('WASM routes positional-only names into **kwargs without binding the slot',
 
     assert.equal(compile(api, handle, 'def show(value, /, **keywords): print(value, keywords)\nshow(value=2)\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /TypeError.*missing required argument.*mappings\.py:2:/);
+    assert.match(errorText(api, handle), /File "mappings\.py", line 2[\s\S]*TypeError: missing required argument/);
   } finally {
     api.peony_session_destroy(handle);
   }

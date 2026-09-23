@@ -26,6 +26,10 @@ pub const Kind = enum {
     if_statement,
     while_statement,
     for_statement,
+    try_statement,
+    except_handler,
+    with_statement,
+    with_item,
     function_definition,
     class_definition,
     parameter,
@@ -81,6 +85,21 @@ pub const comprehension_flags = struct {
     pub const set: u32 = 2;
     pub const dict: u32 = 3;
     pub const generator: u32 = 4;
+};
+
+pub const try_flags = struct {
+    pub const has_else: u32 = 1 << 0;
+    pub const has_finally: u32 = 1 << 1;
+    pub const handler_count_shift: u5 = 2;
+};
+
+pub const handler_flags = struct {
+    pub const has_type: u32 = 1 << 0;
+    pub const has_target: u32 = 1 << 1;
+};
+
+pub const with_item_flags = struct {
+    pub const has_target: u32 = 1 << 0;
 };
 
 /// Children occupy one contiguous range in Ast.children. Names, literal spellings,

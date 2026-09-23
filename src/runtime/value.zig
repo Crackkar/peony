@@ -24,6 +24,7 @@ pub const Tag = enum {
     none,
     boolean,
     heap_object,
+    exception_class,
     unbound,
     deleted,
 };
@@ -34,6 +35,7 @@ const NativePayload = union(enum) {
     none,
     boolean: bool,
     heap_object: *gc.Header,
+    exception_class: u8,
     unbound,
     deleted,
 };
@@ -75,6 +77,19 @@ pub const Value = struct {
         return .{ .storage = .{ .heap_object = header } };
     }
 
+    /// Builtin exception classes are immediate values so exception matching
+    /// cannot need session allocation while reporting MemoryError.
+    pub fn exceptionClass(kind_index: u8) Value {
+        if (comptime use_nan_box) return .{ .storage = tagged(deleted_tag, @as(u64, kind_index) + 1) };
+        return .{ .storage = .{ .exception_class = kind_index } };
+    }
+
+    pub fn asExceptionClass(self: Value) ?u8 {
+        if (self.tag() != .exception_class) return null;
+        if (comptime use_nan_box) return @intCast((self.storage & payload_mask) - 1);
+        return self.storage.exception_class;
+    }
+
     pub fn unboundValue() Value {
         if (comptime use_nan_box) return .{ .storage = tagged(unbound_tag, 0) };
         return .{ .storage = .unbound };
@@ -93,7 +108,7 @@ pub const Value = struct {
                 false_tag, true_tag => .boolean,
                 object_tag => .heap_object,
                 unbound_tag => .unbound,
-                deleted_tag => .deleted,
+                deleted_tag => if ((self.storage & payload_mask) == 0) .deleted else .exception_class,
                 else => .float,
             };
         }
@@ -103,6 +118,7 @@ pub const Value = struct {
             .none => .none,
             .boolean => .boolean,
             .heap_object => .heap_object,
+            .exception_class => .exception_class,
             .unbound => .unbound,
             .deleted => .deleted,
         };
@@ -117,6 +133,7 @@ pub const Value = struct {
             .none, .unbound, .deleted => true,
             .boolean => |left| left == other.storage.boolean,
             .heap_object => |left| left == other.storage.heap_object,
+            .exception_class => |left| left == other.storage.exception_class,
         };
     }
 

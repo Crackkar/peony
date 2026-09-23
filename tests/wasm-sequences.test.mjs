@@ -133,11 +133,11 @@ test('WASM bytes containment handles integer and bytes probes', async () => {
 
     assert.equal(compile(api, handle, 'print(256 in b"a")\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /ValueError.*sequences\.py:1:/);
+    assert.match(errorText(api, handle), /File "sequences\.py", line 1[\s\S]*ValueError/);
 
     assert.equal(compile(api, handle, 'print("a" in b"a")\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /TypeError.*sequences\.py:1:/);
+    assert.match(errorText(api, handle), /File "sequences\.py", line 1[\s\S]*TypeError/);
   } finally {
     api.peony_session_destroy(handle);
   }
@@ -150,7 +150,7 @@ test('WASM list pop and sort keyword bounds match Python', async () => {
   try {
     assert.equal(compile(api, handle, 'items = [1]\nitems.pop(10 ** 100)\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /OverflowError.*sequences\.py:2:/);
+    assert.match(errorText(api, handle), /File "sequences\.py", line 2[\s\S]*OverflowError/);
 
     assert.equal(compile(api, handle, 'items = [2, 1]\nitems.sort(reverse=1)\nprint(items)\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.completed);
@@ -189,7 +189,7 @@ test('WASM rejects bad sequence operations and supports empty **call expansion',
   try {
     assert.equal(compile(api, handle, 'print([1, 2][::0])\n', 'step-zero.py'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /ValueError.*step-zero\.py:1:/);
+    assert.match(errorText(api, handle), /File "step-zero\.py", line 1[\s\S]*ValueError/);
 
     assert.equal(compile(api, handle, 'print("before")\nprint(1, **{})\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.completed);
@@ -214,11 +214,11 @@ test('WASM sequence bounds match the shared 64-bit Python integer model', async 
 
     assert.equal(compile(api, handle, 'print(len(range(2 ** 63)))\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /OverflowError.*sequences\.py:1:/);
+    assert.match(errorText(api, handle), /File "sequences\.py", line 1[\s\S]*OverflowError/);
 
     assert.equal(compile(api, handle, 'print([1] * (2 ** 40))\n'), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /MemoryError.*sequences\.py:1:/);
+    assert.match(errorText(api, handle), /File "sequences\.py", line 1[\s\S]*MemoryError/);
   } finally {
     api.peony_session_destroy(handle);
   }
@@ -260,7 +260,7 @@ test('WASM bounds recursive structural equality with RecursionError', async () =
     const source = 'left = []\nleft.append(left)\nright = []\nright.append(right)\nprint(left == right)\n';
     assert.equal(compile(api, handle, source), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /RecursionError.*sequences\.py:5:/);
+    assert.match(errorText(api, handle), /File "sequences\.py", line 5[\s\S]*RecursionError/);
   } finally {
     api.peony_session_destroy(handle);
   }
@@ -278,7 +278,7 @@ test('WASM repr escapes control bytes, selects readable quotes and bounds nestin
     const nested = 'value = []\nfor index in range(130):\n    value = [value]\nprint(value)\n';
     assert.equal(compile(api, handle, nested), status.ok);
     assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /RecursionError.*sequences\.py:4:/);
+    assert.match(errorText(api, handle), /File "sequences\.py", line 4[\s\S]*RecursionError/);
   } finally {
     api.peony_session_destroy(handle);
   }

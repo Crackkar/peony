@@ -352,6 +352,7 @@ pub fn hash(value: Value) HashResult {
         .none => .{ .value = 0x4e6f6e65 },
         .boolean => .{ .value = if (value.asBool().?) 1 else 0 },
         .heap_object => .{ .value = @intCast(@intFromPtr(value.asObject().?)) },
+        .exception_class => .{ .value = value.asExceptionClass().? },
         .unbound => .{ .value = 0x756e626f756e64 },
         .deleted => .{ .value = 0x64656c65746564 },
         .float, .small_int => unreachable,

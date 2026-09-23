@@ -127,17 +127,17 @@ test('WASM range failures are Python exceptions and sessions remain isolated', a
   try {
     assert.equal(compile(api, first, 'for item in range(0, 3, 0):\n    print("bad")\n', 'zero.py'), status.ok);
     assert.equal(api.peony_run(first, 1000), status.pythonException);
-    assert.match(errorText(api, first), /ValueError: range\(\) arg 3 must not be zero \(zero\.py:1:/);
+    assert.match(errorText(api, first), /File "zero\.py", line 1[\s\S]*ValueError: range\(\) arg 3 must not be zero/);
     assert.equal(stdout(api, first), '');
 
     assert.equal(compile(api, first, 'range = 7\nfor item in range(2):\n    print("bad")\n', 'shadow.py'), status.ok);
     assert.equal(api.peony_run(first, 1000), status.pythonException);
-    assert.match(errorText(api, first), /TypeError.*shadow\.py:2:/);
+    assert.match(errorText(api, first), /File "shadow\.py", line 2[\s\S]*TypeError/);
     assert.equal(stdout(api, first), '');
 
     assert.equal(compile(api, first, 'for left, right in range(2):\n    print("bad")\n'), status.ok);
     assert.equal(api.peony_run(first, 1000), status.pythonException);
-    assert.match(errorText(api, first), /TypeError.*control-flow\.py:1:/);
+    assert.match(errorText(api, first), /File "control-flow\.py", line 1[\s\S]*TypeError/);
     assert.equal(stdout(api, first), '');
     assert.equal(compile(api, second, 'for item in range(2):\n    print(item)\n'), status.ok);
     assert.equal(api.peony_stdout_len(first), 0);

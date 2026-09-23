@@ -212,7 +212,7 @@ pub fn testUnsupportedFeatures() !void {
     comp_ast.deinit();
     var fstring_ast = try expectAst("message = f'{name}'\n");
     fstring_ast.deinit();
-    try expectUnsupported("try:\n    pass\n", .later_commit, "try");
+    try expectError("try:\n    pass\n", .syntax_error, "requires except or finally");
     try expectUnsupported("async def f():\n    pass\n", .excluded, "async");
     try expectUnsupported("result = (yield from values)\n", .excluded, "yield from");
     try expectUnsupported("type Point = tuple[int, int]\n", .excluded, "type statement");

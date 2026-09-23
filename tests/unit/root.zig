@@ -11,6 +11,7 @@ const sequence_tests = @import("sequence_tests");
 const mapping_tests = @import("mapping_tests");
 const comprehension_tests = @import("comprehension_tests");
 const formatting_tests = @import("formatting_tests");
+const exception_tests = @import("exception_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -249,6 +250,78 @@ test "VM resolves builtin print and transports Python exceptions" {
 
 test "UnboundLocalError follows NameError hierarchy" {
     try compiler_vm_tests.testUnboundLocalErrorHierarchy();
+}
+
+test "Python exception hierarchy follows builtin inheritance" {
+    try exception_tests.testExceptionHierarchy();
+}
+
+test "try except else finally and assert control flow" {
+    try exception_tests.testTryExceptElseFinallyAndAssert();
+}
+
+test "finally runs during return and loop control flow" {
+    try exception_tests.testFinallyRunsForReturnBreakAndContinue();
+}
+
+test "raise from and exception target cleanup" {
+    try exception_tests.testRaiseCauseAndExceptTargetCleanup();
+}
+
+test "full-cap MemoryError remains catchable and session recovers" {
+    try exception_tests.testCappedMemoryErrorHandlerAndSessionRecovery();
+}
+
+test "try/finally transfer preserves nesting and handler binding cleanup" {
+    try exception_tests.testNestedFinallyLoopTransferAndHandlerCleanup();
+}
+
+test "raise cause/context and traceback frame behavior" {
+    try exception_tests.testRaiseContextCauseAndTracebackFrames();
+}
+
+test "generator and synchronous callback errors unwind through their own finally" {
+    try exception_tests.testGeneratorAndCallbackFailuresRunInnerFinally();
+}
+
+test "unhandled synchronous callback traceback includes caller site" {
+    try exception_tests.testUnhandledSynchronousCallbackAddsCallerTraceback();
+}
+
+test "with managers enter left to right and exit in reverse" {
+    try exception_tests.testWithManagersEnterInOrderAndExitInReverse();
+}
+
+test "with suppression and enter failure semantics" {
+    try exception_tests.testWithSuppressionAndEnterFailure();
+}
+
+test "with target binding failure and return still call exit" {
+    try exception_tests.testWithTargetBindFailureStillExitsAndReturnExits();
+}
+
+test "with cancellation skips exit and resets" {
+    try exception_tests.testWithCancellationSkipsExit();
+}
+
+test "with exit runs for loop break and continue transfers" {
+    try exception_tests.testWithExitRunsForLoopTransfers();
+}
+
+test "a loop jump inside finally preserves the active try block" {
+    try exception_tests.testJumpInsideFinallyPreservesTheTryBlock();
+}
+
+test "pending exceptions resume through nested finally across timeslices" {
+    try exception_tests.testPendingExceptionContinuationSurvivesNestedTryAcrossTimeslices();
+}
+
+test "pending exceptions resume through called frames across timeslices" {
+    try exception_tests.testPendingExceptionContinuationSurvivesCalledFrameAcrossTimeslices();
+}
+
+test "assertion message survives GC and reset" {
+    try exception_tests.testAssertionMessageSurvivesCollectionAndReset();
 }
 
 test "lists alias and mutate through methods, repr, cycles and equality" {

@@ -124,10 +124,14 @@ const Parser = struct {
         }
         if (self.atText("try")) {
             if (self.containsExceptStar()) return self.failUnsupported(.excluded, "except* syntax is permanently excluded");
-            return self.failUnsupported(.later_commit, "try statements are not parsed in this commit");
+            statements.append(self.allocator, try self.parseTry()) catch return error.OutOfMemory;
+            return;
         }
         if (self.atText("class")) return self.failUnsupported(.later_commit, "class definitions are not parsed in this commit");
-        if (self.atText("with")) return self.failUnsupported(.later_commit, "with statements are not parsed in this commit");
+        if (self.atText("with")) {
+            statements.append(self.allocator, try self.parseWith()) catch return error.OutOfMemory;
+            return;
+        }
         if (self.atText("import") or self.atText("from")) return self.failUnsupported(.later_commit, "import statements are not parsed in this commit");
         if (self.atText("match") and self.looksLikeMatchStatement()) return self.failUnsupported(.later_commit, "match statements are not parsed in this commit");
         if (self.atText("type") and self.peekKind(1, .identifier) and self.peekText(2, "=")) return self.failUnsupported(.excluded, "type statements and PEP 695 syntax are permanently excluded");
@@ -359,6 +363,104 @@ const Parser = struct {
             end = self.node(alternative).span.end;
         }
         return self.addNode(.for_statement, .{ .start = start.start, .end = end }, "", 0, children.items);
+    }
+
+    fn parseTry(self: *Parser) ParseError!NodeId {
+        const start = self.advance();
+        _ = try self.expectText(":", "expected ':' after try");
+        const body = try self.parseSuite();
+        var children: std.ArrayList(NodeId) = .empty;
+        try children.append(self.allocator, body);
+        var handler_count: u32 = 0;
+        var flags: u32 = 0;
+        var end = self.node(body).span.end;
+        var bare_handler_seen = false;
+
+        while (self.atText("except")) {
+            const except_token = self.advance();
+            if (bare_handler_seen) return self.failAtToken(except_token, "default 'except:' must be last");
+            if (self.atText("*")) return self.failUnsupported(.excluded, "except* syntax is permanently excluded");
+            var handler_children: std.ArrayList(NodeId) = .empty;
+            var handler_flags: u32 = 0;
+            var target_name: []const u8 = "";
+            if (!self.atText(":")) {
+                const exception_type = try self.parseExpression(0);
+                try handler_children.append(self.allocator, exception_type);
+                handler_flags |= ast_module.handler_flags.has_type;
+            } else {
+                bare_handler_seen = true;
+            }
+            if (self.atText("as")) {
+                _ = self.advance();
+                if (!self.at(.identifier)) return self.failAtCurrent("expected an identifier after 'as'");
+                const target = self.advance();
+                target_name = self.tokenText(target);
+                handler_flags |= ast_module.handler_flags.has_target;
+            }
+            _ = try self.expectText(":", "expected ':' after except clause");
+            const handler_body = try self.parseSuite();
+            try handler_children.append(self.allocator, handler_body);
+            const handler = try self.addNode(.except_handler, .{ .start = except_token.start, .end = self.node(handler_body).span.end }, target_name, handler_flags, handler_children.items);
+            try children.append(self.allocator, handler);
+            handler_count += 1;
+            end = self.node(handler_body).span.end;
+        }
+
+        if (self.atText("else")) {
+            if (handler_count == 0) return self.failAtCurrent("'else' requires an 'except' clause");
+            _ = self.advance();
+            _ = try self.expectText(":", "expected ':' after try else");
+            const alternative = try self.parseSuite();
+            try children.append(self.allocator, alternative);
+            flags |= ast_module.try_flags.has_else;
+            end = self.node(alternative).span.end;
+        }
+        if (self.atText("finally")) {
+            _ = self.advance();
+            _ = try self.expectText(":", "expected ':' after finally");
+            const final_body = try self.parseSuite();
+            try children.append(self.allocator, final_body);
+            flags |= ast_module.try_flags.has_finally;
+            end = self.node(final_body).span.end;
+        }
+        if (handler_count == 0 and flags & ast_module.try_flags.has_finally == 0) {
+            return self.failSpan("try statement requires except or finally", .{ .start = start.start, .end = end });
+        }
+        flags |= handler_count << ast_module.try_flags.handler_count_shift;
+        return self.addNode(.try_statement, .{ .start = start.start, .end = end }, "", flags, children.items);
+    }
+
+    fn parseWith(self: *Parser) ParseError!NodeId {
+        const start = self.advance();
+        var children: std.ArrayList(NodeId) = .empty;
+        var item_count: u32 = 0;
+        while (true) {
+            const context = try self.parseExpression(0);
+            var item_children: std.ArrayList(NodeId) = .empty;
+            try item_children.append(self.allocator, context);
+            var item_flags: u32 = 0;
+            if (self.atText("as")) {
+                _ = self.advance();
+                const target = try self.parseExpression(0);
+                try self.validateTarget(target, .assignment);
+                try item_children.append(self.allocator, target);
+                item_flags |= ast_module.with_item_flags.has_target;
+            }
+            const item_end = self.node(item_children.items[item_children.items.len - 1]).span.end;
+            try children.append(self.allocator, try self.addNode(.with_item, .{ .start = self.node(context).span.start, .end = item_end }, "", item_flags, item_children.items));
+            item_count += 1;
+            if (!self.atText(",")) break;
+            _ = self.advance();
+        }
+        _ = try self.expectText(":", "expected ':' after with items");
+        const old_loop_depth = self.loop_depth;
+        const body = self.parseSuite() catch |err| {
+            self.loop_depth = old_loop_depth;
+            return err;
+        };
+        self.loop_depth = old_loop_depth;
+        try children.append(self.allocator, body);
+        return self.addNode(.with_statement, .{ .start = start.start, .end = self.node(body).span.end }, "", item_count, children.items);
     }
 
     fn parseFunction(self: *Parser) ParseError!NodeId {

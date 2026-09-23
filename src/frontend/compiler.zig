@@ -151,6 +151,7 @@ const Compiler = struct {
     sequence_sites: std.ArrayList(bytecode.SequenceSite) = .empty,
     slice_sites: std.ArrayList(bytecode.SliceSite) = .empty,
     format_sites: std.ArrayList(bytecode.FormatSite) = .empty,
+    try_sites: std.ArrayList(bytecode.TrySite) = .empty,
     nested_codes: std.ArrayList(*Code) = .empty,
     local_names: std.ArrayList([]const u8) = .empty,
     cell_names: std.ArrayList([]const u8) = .empty,
@@ -183,7 +184,14 @@ const Compiler = struct {
             allocator.destroy(code);
             return .{ .heap = heap, .ast = ast, .analysis = analysis, .allocator = allocator, .scratch_allocator = scratch_allocator, .code = undefined, .pending_exception = .{ .kind = .memory_error, .message = "session memory limit exceeded" } };
         };
+        code.source = allocator.dupe(u8, ast.source) catch {
+            allocator.free(code.display_name);
+            allocator.free(code.filename);
+            allocator.destroy(code);
+            return .{ .heap = heap, .ast = ast, .analysis = analysis, .allocator = allocator, .scratch_allocator = scratch_allocator, .code = undefined, .pending_exception = .{ .kind = .memory_error, .message = "session memory limit exceeded" } };
+        };
         code.root_slots = allocator.alloc(gc.Root, ast.nodes.len) catch {
+            if (code.source.len != 0) allocator.free(code.source);
             allocator.free(code.display_name);
             allocator.free(code.filename);
             allocator.destroy(code);
@@ -204,6 +212,12 @@ const Compiler = struct {
             return error.OutOfMemory;
         };
         code.display_name = allocator.dupe(u8, display_name) catch {
+            allocator.free(code.filename);
+            allocator.destroy(code);
+            return error.OutOfMemory;
+        };
+        code.source = allocator.dupe(u8, parent.code.source) catch {
+            allocator.free(code.display_name);
             allocator.free(code.filename);
             allocator.destroy(code);
             return error.OutOfMemory;
@@ -315,6 +329,7 @@ const Compiler = struct {
         self.code.sequence_sites = try self.sequence_sites.toOwnedSlice(self.allocator);
         self.code.slice_sites = try self.slice_sites.toOwnedSlice(self.allocator);
         self.code.format_sites = try self.format_sites.toOwnedSlice(self.allocator);
+        self.code.try_sites = try self.try_sites.toOwnedSlice(self.allocator);
         self.code.nested_codes = try self.nested_codes.toOwnedSlice(self.allocator);
         self.code.positions = try self.positions.toOwnedSlice(self.allocator);
         return self.code;
@@ -346,6 +361,7 @@ const Compiler = struct {
         self.slice_sites.deinit(self.allocator);
         for (self.format_sites.items) |site| self.allocator.free(site.spec);
         self.format_sites.deinit(self.allocator);
+        self.try_sites.deinit(self.allocator);
         self.nested_codes.deinit(self.allocator);
         self.positions.deinit(self.allocator);
         if (@intFromPtr(self.code) != 0) self.code.deinit(self.heap);
@@ -368,6 +384,8 @@ const Compiler = struct {
             .function_definition => try self.compileFunctionDefinition(node_id),
             .delete_statement => try self.compileDelete(node_id),
             .return_statement => try self.compileReturn(node_id),
+            .raise_statement => try self.compileRaise(node_id),
+            .assert_statement => try self.compileAssert(node_id),
             .global_statement, .nonlocal_statement => {},
             .expression_statement => {
                 if (self.ast.children(node_id).len != 1) return self.failUnsupported(node.span, "expression statement shape is unsupported");
@@ -379,6 +397,8 @@ const Compiler = struct {
             .if_statement => try self.compileIf(node_id),
             .while_statement => try self.compileWhile(node_id),
             .for_statement => try self.compileFor(node_id),
+            .try_statement => try self.compileTry(node_id),
+            .with_statement => try self.compileWith(node_id),
             .break_statement => try self.compileBreak(node_id),
             .continue_statement => try self.compileContinue(node_id),
             else => return self.failUnsupported(node.span, statementUnsupportedMessage(node.kind)),
@@ -396,6 +416,165 @@ const Compiler = struct {
         const result = if (children.len == 0) try self.loadConstant(Value.noneValue(), node.span) else try self.compileExpression(children[0]);
         try self.emit(.return_value, result, 0, 0, 0, node.span);
         self.temps.release(result);
+    }
+
+    fn compileRaise(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len == 0) {
+            try self.emit(.raise_current, 0, 0, 0, 0, node.span);
+            return;
+        }
+        if (children.len > 2) return self.failUnsupported(node.span, "raise statement shape is unsupported");
+        const raised = try self.compileExpression(children[0]);
+        if (children.len == 1) {
+            try self.emit(.raise_value, raised, 0, 0, 0, node.span);
+            self.temps.release(raised);
+            return;
+        }
+        const cause = self.compileExpression(children[1]) catch |err| {
+            self.temps.release(raised);
+            return err;
+        };
+        try self.emit(.raise_value, raised, cause, 0, 1, node.span);
+        self.temps.release(cause);
+        self.temps.release(raised);
+    }
+
+    fn compileAssert(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len == 0 or children.len > 2) return self.failUnsupported(node.span, "assert statement shape is unsupported");
+        const condition = try self.compileExpression(children[0]);
+        const succeeded = try self.emitJump(.jump_if_true, condition, 0, self.ast.node(children[0]).span);
+        self.temps.release(condition);
+        var message: ?u16 = null;
+        if (children.len == 2) message = try self.compileExpression(children[1]);
+        try self.emit(.assert_failed, if (message) |register| register else 0, 0, 0, if (message != null) 1 else 0, node.span);
+        if (message) |register| self.temps.release(register);
+        try self.patchJump(succeeded, try self.currentTarget(node.span));
+    }
+
+    fn compileTry(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const handler_count: usize = node.flags >> ast_module.try_flags.handler_count_shift;
+        const has_else = node.flags & ast_module.try_flags.has_else != 0;
+        const has_finally = node.flags & ast_module.try_flags.has_finally != 0;
+        if (children.len < 1 + handler_count) return self.failUnsupported(node.span, "try statement shape is unsupported");
+        const site_index = std.math.cast(u32, self.try_sites.items.len) orelse return self.failUnsupported(node.span, "too many try statements");
+        try self.try_sites.append(self.allocator, .{ .handler_count = std.math.cast(u16, handler_count) orelse return self.failUnsupported(node.span, "too many except handlers") });
+        try self.emitIndex(.enter_try, 0, site_index, 0, node.span);
+        self.try_sites.items[@intCast(site_index)].body_start_ip = try self.currentTarget(node.span);
+        try self.compileStatement(children[0]);
+        try self.emitIndex(.try_else, 0, site_index, 0, node.span);
+
+        var cursor: usize = 1 + handler_count;
+        if (has_else) {
+            if (cursor >= children.len) return self.failUnsupported(node.span, "try else clause is missing");
+            try self.compileStatement(children[cursor]);
+            cursor += 1;
+        }
+        try self.emitIndex(.try_complete, 0, site_index, 0, node.span);
+
+        const handler_ip = try self.currentTarget(node.span);
+        var handler_node_index: usize = 1;
+        while (handler_node_index <= handler_count) : (handler_node_index += 1) {
+            const handler_id = children[handler_node_index];
+            const handler = self.ast.node(handler_id);
+            const handler_children = self.ast.children(handler_id);
+            var mismatch_jump: ?u32 = null;
+            if (handler.flags & ast_module.handler_flags.has_type != 0) {
+                if (handler_children.len < 2) return self.failUnsupported(handler.span, "except handler shape is unsupported");
+                const type_value = try self.compileExpression(handler_children[0]);
+                const matched = try self.acquire(handler.span);
+                try self.emit(.match_exception, matched, type_value, 0, 0, handler.span);
+                mismatch_jump = try self.emitJump(.jump_if_false, matched, 0, handler.span);
+                self.temps.release(matched);
+                self.temps.release(type_value);
+            }
+            try self.emitIndex(.accept_exception, 0, site_index, 0, handler.span);
+            const body_index: usize = @intFromBool(handler.flags & ast_module.handler_flags.has_type != 0);
+            if (handler.flags & ast_module.handler_flags.has_target != 0) {
+                const binding = self.analysis.bindingOf(handler_id) orelse .global_implicit;
+                const name_index = try self.internName(handler.text);
+                const binding_flag: u8 = switch (binding) {
+                    .local => 0,
+                    .cell => 1,
+                    .free => 2,
+                    .global_explicit, .global_implicit => 3,
+                    .class_local => return self.failUnsupported(handler.span, "exception binding in a class body is not implemented yet"),
+                };
+                try self.emitIndex(.bind_exception, 0, name_index, binding_flag, handler.span);
+            }
+            if (body_index >= handler_children.len) return self.failUnsupported(handler.span, "except handler body is missing");
+            try self.compileStatement(handler_children[body_index]);
+            try self.emitIndex(.try_complete, 0, site_index, 0, handler.span);
+            if (mismatch_jump) |jump| try self.patchJump(jump, try self.currentTarget(handler.span));
+        }
+        try self.emitIndex(.try_unhandled, 0, site_index, 0, node.span);
+
+        if (has_finally) {
+            if (cursor >= children.len) return self.failUnsupported(node.span, "try finally clause is missing");
+            self.try_sites.items[@intCast(site_index)].finalizer_ip = try self.currentTarget(node.span);
+            try self.compileStatement(children[cursor]);
+            try self.emitIndex(.end_finally, 0, site_index, 0, node.span);
+            cursor += 1;
+        }
+        const end_ip = try self.currentTarget(node.span);
+        self.try_sites.items[@intCast(site_index)].handler_ip = handler_ip;
+        self.try_sites.items[@intCast(site_index)].end_ip = end_ip;
+        if (cursor != children.len) return self.failUnsupported(node.span, "try statement has unexpected clauses");
+    }
+
+    fn compileWith(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const item_count: usize = node.flags;
+        if (item_count == 0 or children.len != item_count + 1) return self.failUnsupported(node.span, "with statement shape is unsupported");
+        try self.compileWithItems(node_id, 0);
+    }
+
+    fn compileWithItems(self: *Compiler, node_id: NodeId, item_index: usize) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const item_count: usize = node.flags;
+        if (item_index == item_count) return self.compileStatement(children[item_count]);
+        const item_id = children[item_index];
+        const item = self.ast.node(item_id);
+        const item_children = self.ast.children(item_id);
+        if (item_children.len == 0) return self.failUnsupported(item.span, "with item is missing its context expression");
+
+        const manager = try self.compileExpression(item_children[0]);
+        const entered = self.acquire(item.span) catch |err| {
+            self.temps.release(manager);
+            return err;
+        };
+        try self.emit(.with_enter, entered, manager, 0, 0, item.span);
+
+        const site_index = std.math.cast(u32, self.try_sites.items.len) orelse return self.failUnsupported(item.span, "too many with statements");
+        try self.try_sites.append(self.allocator, .{ .handler_count = 0 });
+        try self.emitIndex(.enter_try, 0, site_index, 0, item.span);
+        self.try_sites.items[@intCast(site_index)].body_start_ip = try self.currentTarget(item.span);
+        if (item.flags & ast_module.with_item_flags.has_target != 0) {
+            if (item_children.len != 2) return self.failUnsupported(item.span, "with target shape is unsupported");
+            try self.compileStoreTarget(item_children[1], entered);
+        } else if (item_children.len != 1) {
+            return self.failUnsupported(item.span, "with item has an unexpected target");
+        }
+        self.temps.release(entered);
+        try self.compileWithItems(node_id, item_index + 1);
+        try self.emitIndex(.try_complete, 0, site_index, 0, item.span);
+        try self.emitIndex(.try_unhandled, 0, site_index, 0, item.span);
+
+        const finalizer_ip = try self.currentTarget(item.span);
+        self.try_sites.items[@intCast(site_index)].finalizer_ip = finalizer_ip;
+        try self.emit(.with_exit, manager, 0, 0, 0, item.span);
+        try self.emitIndex(.end_finally, 0, site_index, 0, item.span);
+        const end_ip = try self.currentTarget(item.span);
+        self.try_sites.items[@intCast(site_index)].handler_ip = finalizer_ip;
+        self.try_sites.items[@intCast(site_index)].end_ip = end_ip;
+        self.temps.release(manager);
     }
 
     fn compileFunctionDefinition(self: *Compiler, node_id: NodeId) CompileError!void {
@@ -575,14 +754,14 @@ const Compiler = struct {
 
     fn compileBreak(self: *Compiler, node_id: NodeId) CompileError!void {
         if (self.loop_stack.items.len == 0) return self.failUnsupported(self.ast.node(node_id).span, "break outside loop");
-        const jump_index = try self.emitJump(.jump, 0, 0, self.ast.node(node_id).span);
+        const jump_index = try self.emitJump(.unwind_jump, 0, 0, self.ast.node(node_id).span);
         try self.loop_stack.items[self.loop_stack.items.len - 1].break_jumps.append(self.scratch_allocator, jump_index);
     }
 
     fn compileContinue(self: *Compiler, node_id: NodeId) CompileError!void {
         if (self.loop_stack.items.len == 0) return self.failUnsupported(self.ast.node(node_id).span, "continue outside loop");
         const target = self.loop_stack.items[self.loop_stack.items.len - 1].continue_target;
-        _ = try self.emitJump(.jump, 0, target, self.ast.node(node_id).span);
+        _ = try self.emitJump(.unwind_jump, 0, target, self.ast.node(node_id).span);
     }
 
     fn compileAugmentedAssignment(self: *Compiler, node_id: NodeId) CompileError!void {

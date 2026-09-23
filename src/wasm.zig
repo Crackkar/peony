@@ -180,6 +180,18 @@ export fn peony_error_len(handle: u32) u32 {
     return @intCast(currentError(slot).len);
 }
 
+export fn peony_traceback_ptr(handle: u32) u32 {
+    const slot = sessionSlot(handle) orelse return 0;
+    const bytes = slot.runtime.tracebackJson();
+    if (bytes.len == 0) return 0;
+    return @intCast(@intFromPtr(bytes.ptr));
+}
+
+export fn peony_traceback_len(handle: u32) u32 {
+    const slot = sessionSlot(handle) orelse return 0;
+    return @intCast(slot.runtime.tracebackJson().len);
+}
+
 fn currentError(slot: *const SessionSlot) []const u8 {
     if (slot.host_error.len != 0) return slot.host_error;
     return slot.runtime.errorText();

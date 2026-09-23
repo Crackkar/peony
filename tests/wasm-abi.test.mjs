@@ -36,6 +36,8 @@ test('ABI v1 exports linear memory and the documented entry points', async () =>
     'peony_stderr_consume',
     'peony_error_ptr',
     'peony_error_len',
+    'peony_traceback_ptr',
+    'peony_traceback_len',
   ]) {
     assert.equal(typeof exports[name], 'function', `missing export ${name}`);
   }

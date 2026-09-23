@@ -223,7 +223,16 @@ fn expectRuntimeException(source: []const u8, kind: exceptions.PythonExceptionKi
     try std.testing.expectEqual(runtime_vm.RunStatus.python_exception, runtime.run(10_000));
     const exception = runtime.pythonException() orelse return error.ExpectedPythonException;
     try std.testing.expectEqual(kind, exception.kind);
-    try std.testing.expect(std.mem.indexOf(u8, runtime.errorText(), location) != null);
+    try expectTraceLocation(runtime.errorText(), location);
+}
+
+fn expectTraceLocation(text: []const u8, location: []const u8) !void {
+    var parts = std.mem.splitScalar(u8, location, ':');
+    const filename = parts.next() orelse return error.InvalidTestLocation;
+    const line = parts.next() orelse return error.InvalidTestLocation;
+    const pattern = try std.fmt.allocPrint(std.testing.allocator, "File \"{s}\", line {s}", .{ filename, line });
+    defer std.testing.allocator.free(pattern);
+    try std.testing.expect(std.mem.indexOf(u8, text, pattern) != null);
 }
 
 fn expectUnsupported(source: []const u8) !void {

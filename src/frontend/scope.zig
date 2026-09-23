@@ -205,6 +205,8 @@ const Builder = struct {
             .augmented_assignment => try self.visitAugmentedAssignment(scope_id, node_id),
             .delete_statement => try self.visitDelete(scope_id, node_id),
             .for_statement => try self.visitFor(scope_id, node_id),
+            .try_statement => try self.visitTry(scope_id, node_id),
+            .with_statement => try self.visitWith(scope_id, node_id),
             .named_expression => try self.visitNamedExpression(scope_id, node_id),
             .parameter => try self.visitChildren(scope_id, node_id),
             else => try self.visitChildren(scope_id, node_id),
@@ -395,6 +397,58 @@ const Builder = struct {
         try self.visitTarget(scope_id, children[0], .assignment);
         try self.visit(scope_id, children[1]);
         for (children[2..]) |child| try self.visit(scope_id, child);
+    }
+
+    fn visitTry(self: *Builder, scope_id: ScopeId, node_id: NodeId) AnalyzeError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const handler_count: usize = node.flags >> ast_module.try_flags.handler_count_shift;
+        if (children.len < 1 + handler_count) return error.ScopeAbort;
+        try self.visit(scope_id, children[0]);
+        var cursor: usize = 1;
+        for (children[1 .. 1 + handler_count]) |handler_id| {
+            const handler = self.ast.node(handler_id);
+            self.node_scopes[@intCast(handler_id)] = scope_id;
+            const handler_children = self.ast.children(handler_id);
+            if (handler.flags & ast_module.handler_flags.has_type != 0) {
+                if (handler_children.len == 0) return error.ScopeAbort;
+                try self.visit(scope_id, handler_children[0]);
+            }
+            const body_index: usize = @intFromBool(handler.flags & ast_module.handler_flags.has_type != 0);
+            if (handler.flags & ast_module.handler_flags.has_target != 0) {
+                try self.note(scope_id, handler.text, symbol_flags.assign, handler_id);
+            }
+            if (body_index >= handler_children.len) return error.ScopeAbort;
+            try self.visit(scope_id, handler_children[body_index]);
+            cursor += 1;
+        }
+        if (node.flags & ast_module.try_flags.has_else != 0) {
+            if (cursor >= children.len) return error.ScopeAbort;
+            try self.visit(scope_id, children[cursor]);
+            cursor += 1;
+        }
+        if (node.flags & ast_module.try_flags.has_finally != 0) {
+            if (cursor >= children.len) return error.ScopeAbort;
+            try self.visit(scope_id, children[cursor]);
+        }
+    }
+
+    fn visitWith(self: *Builder, scope_id: ScopeId, node_id: NodeId) AnalyzeError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const item_count: usize = node.flags;
+        if (item_count == 0 or children.len != item_count + 1) return error.ScopeAbort;
+        for (children[0..item_count]) |item_id| {
+            const item = self.ast.node(item_id);
+            const item_children = self.ast.children(item_id);
+            if (item_children.len == 0) return error.ScopeAbort;
+            try self.visit(scope_id, item_children[0]);
+            if (item.flags & ast_module.with_item_flags.has_target != 0) {
+                if (item_children.len != 2) return error.ScopeAbort;
+                try self.visitTarget(scope_id, item_children[1], .assignment);
+            }
+        }
+        try self.visit(scope_id, children[item_count]);
     }
 
     fn visitNamedExpression(self: *Builder, scope_id: ScopeId, node_id: NodeId) AnalyzeError!void {
@@ -596,7 +650,7 @@ const Builder = struct {
 
     fn assignOccurrenceBindings(self: *Builder) std.mem.Allocator.Error!void {
         for (self.ast.nodes, 0..) |node, index| {
-            if (node.kind != .name or self.node_scopes[index] == no_scope) continue;
+            if ((node.kind != .name and node.kind != .except_handler) or self.node_scopes[index] == no_scope) continue;
             const scope_id = self.node_scopes[index];
             if (self.symbolIndex(scope_id, node.text)) |symbol_index| {
                 self.node_bindings[index] = self.scopes.items[@intCast(scope_id)].symbols.items[symbol_index].value.binding;
