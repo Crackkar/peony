@@ -1,7 +1,13 @@
 const std = @import("std");
 const abi = @import("abi.zig");
-const runtime_allocator = @import("runtime/allocator.zig");
-const gc = @import("runtime/gc.zig");
+const runtime_allocator = @import("runtime_gc");
+const runtime_value = @import("runtime_value");
+const runtime_number = @import("runtime_number");
+
+comptime {
+    _ = @sizeOf(runtime_value.Value);
+    _ = runtime_number.ValueResult;
+}
 
 pub const std_options_debug_io: std.Io = std.Io.failing;
 
@@ -15,7 +21,7 @@ const SessionSlot = struct {
     generation: u32 = 1,
     error_ready: bool = false,
     allocator: runtime_allocator.SessionAllocator = undefined,
-    heap: gc.Heap = .{},
+    heap: runtime_allocator.Heap = .{},
 };
 
 const Transfer = struct {
