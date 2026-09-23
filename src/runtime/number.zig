@@ -1,7 +1,7 @@
 const std = @import("std");
 const bigint = std.math.big.int;
 const gc = @import("runtime_gc");
-const exceptions = @import("exception.zig");
+const exceptions = @import("runtime_exception");
 const values = @import("runtime_value");
 
 pub const Value = values.Value;

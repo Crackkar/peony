@@ -45,6 +45,15 @@ pub fn build(b: *std.Build) void {
     });
     value_number_test_module.addImport("runtime_value", native_runtime.value);
     value_number_test_module.addImport("runtime_number", native_runtime.number);
+    const string_bytes_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/string_bytes.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    string_bytes_test_module.addImport("runtime_number", native_runtime.number);
+    string_bytes_test_module.addImport("runtime_string", native_runtime.string);
+    string_bytes_test_module.addImport("runtime_bytes", native_runtime.bytes);
+    string_bytes_test_module.addImport("runtime_unicode", native_runtime.unicode);
     const unit_test_root = b.createModule(.{
         .root_source_file = b.path("tests/unit/root.zig"),
         .target = target,
@@ -53,6 +62,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("abi", abi_module);
     unit_test_root.addImport("runtime_gc_tests", gc_test_module);
     unit_test_root.addImport("value_number_tests", value_number_test_module);
+    unit_test_root.addImport("string_bytes_tests", string_bytes_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -122,6 +132,10 @@ const RuntimeModules = struct {
     gc: *std.Build.Module,
     value: *std.Build.Module,
     number: *std.Build.Module,
+    exception: *std.Build.Module,
+    unicode: *std.Build.Module,
+    string: *std.Build.Module,
+    bytes: *std.Build.Module,
 };
 
 fn createRuntimeModules(
@@ -147,11 +161,57 @@ fn createRuntimeModules(
     });
     number_module.addImport("runtime_gc", gc_module);
     number_module.addImport("runtime_value", value_module);
-    return .{ .gc = gc_module, .value = value_module, .number = number_module };
+    const exception_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/exception.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    number_module.addImport("runtime_exception", exception_module);
+
+    const unicode_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/unicode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const unicode_blob_module = b.createModule(.{
+        .root_source_file = b.path("data/unicode_data.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    unicode_module.addImport("unicode_blob", unicode_blob_module);
+    const string_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/string.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    string_module.addImport("runtime_gc", gc_module);
+    string_module.addImport("runtime_unicode", unicode_module);
+    string_module.addImport("runtime_exception", exception_module);
+    const bytes_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/bytes.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bytes_module.addImport("runtime_gc", gc_module);
+    bytes_module.addImport("runtime_string", string_module);
+    bytes_module.addImport("runtime_exception", exception_module);
+    return .{
+        .gc = gc_module,
+        .value = value_module,
+        .number = number_module,
+        .exception = exception_module,
+        .unicode = unicode_module,
+        .string = string_module,
+        .bytes = bytes_module,
+    };
 }
 
 fn addRuntimeImports(module: *std.Build.Module, runtime: RuntimeModules) void {
     module.addImport("runtime_gc", runtime.gc);
     module.addImport("runtime_value", runtime.value);
     module.addImport("runtime_number", runtime.number);
+    module.addImport("runtime_exception", runtime.exception);
+    module.addImport("runtime_unicode", runtime.unicode);
+    module.addImport("runtime_string", runtime.string);
+    module.addImport("runtime_bytes", runtime.bytes);
 }

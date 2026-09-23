@@ -6,6 +6,8 @@ pub const PythonExceptionKind = enum {
     value_error,
     overflow_error,
     type_error,
+    index_error,
+    unicode_decode_error,
 };
 
 /// Allocation-safe transport for Python faults. Messages are static until the runtime adds owned strings.
@@ -32,6 +34,6 @@ pub fn isSubclass(kind: PythonExceptionKind, base: PythonExceptionKind) bool {
     return switch (kind) {
         .base_exception => false,
         .exception => base == .base_exception,
-        .memory_error, .zero_division_error, .value_error, .overflow_error, .type_error => base == .exception,
+        .memory_error, .zero_division_error, .value_error, .overflow_error, .type_error, .index_error, .unicode_decode_error => base == .exception,
     };
 }

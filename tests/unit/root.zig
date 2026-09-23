@@ -1,5 +1,6 @@
 const gc_tests = @import("runtime_gc_tests");
 const value_tests = @import("value_number_tests");
+const string_tests = @import("string_bytes_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -83,4 +84,32 @@ test "memory cap produces a Python MemoryError and keeps the heap usable" {
 
 test "collecting a bigint reclaims its limbs" {
     try value_tests.testBigIntLimbReclamation();
+}
+
+test "UTF-8 strings validate and index by code point" {
+    try string_tests.testUtf8IndexAndSlice();
+}
+
+test "strings compare hash and concatenate by content" {
+    try string_tests.testStringEqualityAndConcat();
+}
+
+test "Unicode 15 casing classification and casefold" {
+    try string_tests.testUnicodeOperations();
+}
+
+test "string search split join strip replace count and prefixes" {
+    try string_tests.testStringOperations();
+}
+
+test "immutable bytes index slice encode and decode" {
+    try string_tests.testBytesOperations();
+}
+
+test "invalid UTF-8 bytes decode as UnicodeDecodeError" {
+    try string_tests.testInvalidBytesDecode();
+}
+
+test "string and bytes storage obey the session cap and GC" {
+    try string_tests.testStringBytesAccounting();
 }
