@@ -9,6 +9,8 @@ const control_flow_tests = @import("control_flow_tests");
 const functions_tests = @import("functions_tests");
 const sequence_tests = @import("sequence_tests");
 const mapping_tests = @import("mapping_tests");
+const comprehension_tests = @import("comprehension_tests");
+const formatting_tests = @import("formatting_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -406,8 +408,68 @@ test "function construction cap failure reports MemoryError and recovers" {
     try functions_tests.testFunctionConstructionMemoryErrorAndRecovery();
 }
 
-test "dictionary unpacking stays explicitly unsupported" {
-    try functions_tests.testDictionaryUnpackingRemainsExplicitlyUnsupported();
+test "empty double-star call expansion accepts an empty mapping" {
+    try functions_tests.testEmptyDoubleStarExpansion();
+}
+
+test "comprehension scopes, nested clauses and late binding" {
+    try comprehension_tests.testComprehensionScopesNestedClausesAndLateBinding();
+}
+
+test "generator expressions defer filters and bodies and retain roots" {
+    try comprehension_tests.testGeneratorExpressionsAreLazyAndRooted();
+}
+
+test "lambda and walrus execute while comprehension walrus is rejected" {
+    try comprehension_tests.testLambdaWalrusAndComprehensionWalrusBoundary();
+}
+
+test "map filter sorted stable sort and list index bounds" {
+    try comprehension_tests.testLazyMapFilterSortedStableSortAndListIndexBounds();
+}
+
+test "map supports multiple iterables native callables and filter None" {
+    try comprehension_tests.testMapMultipleIterablesFilterNoneAndNativeCallbacks();
+}
+
+test "keyed list sort reports callback mutation" {
+    try comprehension_tests.testKeySortRejectsListMutation();
+}
+
+test "temporary keyed-sort receiver and callback stay rooted through GC" {
+    try comprehension_tests.testTemporaryReceiverAndCallbackSurviveSortCollection();
+}
+
+test "sorting spends the shared synchronous work budget" {
+    try comprehension_tests.testSortUsesSharedSynchronousWorkLimit();
+}
+
+test "generator work cap recovery and outer cancellation checkpoint" {
+    try comprehension_tests.testGeneratorWorkLimitCancelCheckpointAndReuse();
+}
+
+test "synchronous callback allocation failure cleans up and recovers" {
+    try comprehension_tests.testSyncCallbackAllocationFailureRecoversSession();
+}
+
+test "f-string conversions and expressions evaluate in order" {
+    try formatting_tests.testFStringConversionsFormattingAndEvaluationOrder();
+}
+
+test "format builtin str format and percent operators use shared outputs" {
+    try formatting_tests.testSharedFormatBuiltinStringFormatAndPercentOperators();
+}
+
+test "format errors and large width respect the session budget" {
+    try formatting_tests.testFormattingErrorsAndHugePrecisionAreBounded();
+}
+
+test "f-string dynamic spec and debug equals boundaries are explicit" {
+    try formatting_tests.testDeferredFStringSpecAndDebugSyntaxBoundaries();
+}
+
+test "formatting supports signs characters float types and converted string specs" {
+    try formatting_tests.testFormatSignsCharacterFloatTypesAndConvertedStringSpec();
 }
 
 test "ordered mapping keys preserve Python numeric equality and order" {

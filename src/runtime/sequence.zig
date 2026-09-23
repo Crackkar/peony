@@ -9,6 +9,7 @@ const Value = value_module.Value;
 pub const List = struct {
     header: gc.Header align(8),
     items: std.ArrayList(Value) = .empty,
+    version: u64 = 0,
 };
 
 pub const Tuple = struct {
@@ -61,6 +62,7 @@ pub fn createTuple(heap: *gc.Heap, values: []const Value) TupleResult {
 
 pub fn append(heap: *gc.Heap, list: *List, value: Value) exceptions.Result(void) {
     list.items.append(heap.allocator, value) catch return memoryError(void);
+    list.version +%= 1;
     return .{ .value = {} };
 }
 
@@ -73,6 +75,7 @@ pub fn extend(heap: *gc.Heap, list: *List, values: []const Value) exceptions.Res
     }
     defer if (snapshot) |copy_values| heap.allocator.free(copy_values);
     list.items.appendSlice(heap.allocator, snapshot orelse values) catch return memoryError(void);
+    if (values.len != 0) list.version +%= 1;
     return .{ .value = {} };
 }
 
@@ -88,23 +91,29 @@ pub fn insert(heap: *gc.Heap, list: *List, index_object: Value, value: Value) ex
     if (index < 0) index += item_count;
     index = @min(@max(index, 0), item_count);
     list.items.insert(heap.allocator, @intCast(index), value) catch return memoryError(void);
+    list.version +%= 1;
     return .{ .value = {} };
 }
 
 pub fn pop(list: *List, index_value: usize) exceptions.Result(Value) {
     if (list.items.items.len == 0 or index_value >= list.items.items.len) return pythonError(Value, .index_error, "pop index out of range");
-    return .{ .value = list.items.orderedRemove(index_value) };
+    const value = list.items.orderedRemove(index_value);
+    list.version +%= 1;
+    return .{ .value = value };
 }
 
 pub fn remove(heap: *gc.Heap, list: *List, index_value: usize) exceptions.Result(void) {
     _ = heap;
     if (index_value >= list.items.items.len) return pythonError(void, .index_error, "list.remove(x): x not in list");
     _ = list.items.orderedRemove(index_value);
+    list.version +%= 1;
     return .{ .value = {} };
 }
 
 pub fn clear(heap: *gc.Heap, list: *List) void {
+    const changed = list.items.items.len != 0;
     list.items.clearAndFree(heap.allocator);
+    if (changed) list.version +%= 1;
 }
 
 pub fn copy(heap: *gc.Heap, list: *List) ListResult {
@@ -113,6 +122,7 @@ pub fn copy(heap: *gc.Heap, list: *List) ListResult {
 
 pub fn reverse(list: *List) void {
     std.mem.reverse(Value, list.items.items);
+    if (list.items.items.len > 1) list.version +%= 1;
 }
 
 pub fn getIndex(item_count: usize, value: Value) exceptions.Result(usize) {

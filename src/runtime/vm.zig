@@ -15,6 +15,7 @@ const iterator = @import("runtime_iterator");
 const functions = @import("runtime_function");
 const binder = @import("runtime_binder");
 const ast_module = @import("frontend_ast");
+const format_rules = @import("format.zig");
 
 const Value = value_module.Value;
 const Code = bytecode.Code;
@@ -49,6 +50,7 @@ const Frame = struct {
     code: *Code,
     previous: ?*Frame = null,
     return_destination: ?u16 = null,
+    generator_owner: ?*iterator.Iterator = null,
     ip: usize = 0,
     registers: []Value = &.{},
     locals: []Value = &.{},
@@ -69,6 +71,17 @@ const Frame = struct {
         return self.cellRootStart() + self.local_cells.len;
     }
 };
+
+fn destroyGeneratorFrameOpaque(pointer: *anyopaque, allocator: std.mem.Allocator) void {
+    const frame: *Frame = @ptrCast(@alignCast(pointer));
+    if (frame.root_frame.stack != null) frame.root_frame.pop();
+    if (frame.roots.len != 0) allocator.free(frame.roots);
+    if (frame.free_cells.len != 0) allocator.free(frame.free_cells);
+    if (frame.local_cells.len != 0) allocator.free(frame.local_cells);
+    if (frame.locals.len != 0) allocator.free(frame.locals);
+    if (frame.registers.len != 0) allocator.free(frame.registers);
+    allocator.destroy(frame);
+}
 
 const environment_kind = gc.Kind{
     .trace = traceEnvironment,
@@ -103,6 +116,8 @@ pub const Runtime = struct {
     register_roots: []gc.Root = &.{},
     register_frame: gc.RootFrame = .{},
     instruction_pointer: usize = 0,
+    resuming_generator: ?*iterator.Iterator = null,
+    synchronous_work_remaining: ?usize = null,
     stdout_bytes: std.ArrayList(u8) = .empty,
     repr_path: std.ArrayList(*gc.Header) = .empty,
     value_equality_depth: usize = 0,
@@ -332,7 +347,29 @@ pub const Runtime = struct {
     }
 
     fn unwindFrames(self: *Runtime) void {
-        while (self.popFrame()) |frame| self.freeFrameStorage(frame);
+        while (self.popFrame()) |frame| {
+            self.forgetGeneratorFrame(frame);
+            self.freeFrameStorage(frame);
+        }
+    }
+
+    fn unwindFramesUntil(self: *Runtime, boundary: *Frame) void {
+        while (self.top_frame != boundary) {
+            const frame = self.popFrame() orelse break;
+            self.forgetGeneratorFrame(frame);
+            self.freeFrameStorage(frame);
+        }
+    }
+
+    fn forgetGeneratorFrame(self: *Runtime, frame: *Frame) void {
+        _ = self;
+        if (frame.generator_owner) |owner| {
+            if (owner.generator_frame == @as(*anyopaque, @ptrCast(frame))) {
+                owner.generator_frame = null;
+                owner.generator_roots = &.{};
+                owner.generator_done = true;
+            }
+        }
     }
 
     fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
@@ -769,6 +806,53 @@ pub const Runtime = struct {
                 const value = number.fromInt(&self.heap, signed);
                 return self.storeValueResult(destination, value, line, column);
             },
+            .str_constructor => {
+                if (positional.len > 1 or keywords.len != 0) return self.nativeArity(line, column);
+                const owned = if (positional.len == 0) blk: {
+                    break :blk self.heap.allocator.dupe(u8, "") catch {
+                        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                        return false;
+                    };
+                } else self.renderValueOwned(positional[0], false, line, column) orelse return false;
+                defer self.heap.allocator.free(owned);
+                return self.storeStringResult(destination, string.create(&self.heap, owned), line, column);
+            },
+            .format_builtin => {
+                if (positional.len == 0 or positional.len > 2 or keywords.len != 0) return self.nativeArity(line, column);
+                const spec = if (positional.len == 2) self.valueString(positional[1]) orelse return self.nativeTypeError(line, column, "format specifier must be a string") else "";
+                return self.executeFormatValue(destination, positional[0], spec, 0, line, column);
+            },
+            .map, .filter => {
+                if (keywords.len != 0 or (native == .filter and positional.len != 2) or (native == .map and positional.len < 2)) return self.nativeArity(line, column);
+                const created = iterator.createMapFilter(&self.heap, native == .filter, positional[0], positional[1..]);
+                return self.storeIteratorOutcome(destination, created, line, column);
+            },
+            .sorted => {
+                if (positional.len != 1 or keywords.len > 2) return self.nativeArity(line, column);
+                var reverse = false;
+                var key: ?Value = null;
+                for (keywords) |keyword| {
+                    if (std.mem.eql(u8, keyword.name, "reverse")) reverse = self.valueTruthy(keyword.value, line, column) orelse return false else if (std.mem.eql(u8, keyword.name, "key")) {
+                        if (keyword.value.tag() != .none and !self.isCallable(keyword.value)) return self.nativeTypeError(line, column, "key must be callable or None");
+                        if (keyword.value.tag() != .none) key = keyword.value;
+                    } else return self.nativeTypeError(line, column, "unexpected keyword argument");
+                }
+                const list_result = sequence.createList(&self.heap, &.{});
+                const list = switch (list_result) {
+                    .value => |selected| selected,
+                    .python_exception => |exception| { self.setException(exception, line, column, null); return false; },
+                    .engine_error => return self.engineFault(),
+                };
+                var list_root = gc.Root{ .object = &list.header };
+                var root_frame = gc.RootFrame{};
+                root_frame.push(&self.heap.roots);
+                root_frame.add(&list_root);
+                defer root_frame.pop();
+                if (!self.extendListFromIterable(destination, list, positional[0], line, column)) return false;
+                if (!self.sortListWithKey(list, key, reverse, destination, line, column)) return false;
+                self.setRegister(destination, Value.object(&list.header));
+                return true;
+            },
             .dict, .set => return self.executeMappingConstructor(destination, native == .set, positional, keywords, line, column),
             .dict_get, .dict_keys, .dict_values, .dict_items, .dict_pop, .dict_setdefault, .dict_update, .dict_clear, .dict_copy,
             .set_add, .set_remove, .set_discard, .set_pop, .set_update, .set_clear, .set_copy,
@@ -777,12 +861,18 @@ pub const Runtime = struct {
                 const header = bound_self.asObject() orelse return self.engineFault();
                 const list = sequence.listFromHeader(header) orelse return self.engineFault();
                 if (native == .list_sort) {
-                    if (positional.len != 0 or keywords.len > 1 or (keywords.len == 1 and !std.mem.eql(u8, keywords[0].name, "reverse"))) return self.nativeTypeError(line, column, "invalid list.sort arguments");
+                    if (positional.len != 0 or keywords.len > 2) return self.nativeTypeError(line, column, "invalid list.sort arguments");
                     var reverse = false;
-                    if (keywords.len == 1) {
-                        reverse = self.valueTruthy(keywords[0].value, line, column) orelse return false;
+                    var key: ?Value = null;
+                    for (keywords) |keyword| {
+                        if (std.mem.eql(u8, keyword.name, "reverse")) {
+                            reverse = self.valueTruthy(keyword.value, line, column) orelse return false;
+                        } else if (std.mem.eql(u8, keyword.name, "key")) {
+                            if (keyword.value.tag() != .none and !self.isCallable(keyword.value)) return self.nativeTypeError(line, column, "key must be callable or None");
+                            if (keyword.value.tag() != .none) key = keyword.value;
+                        } else return self.nativeTypeError(line, column, "invalid list.sort arguments");
                     }
-                    if (!self.sortList(list, reverse, line, column)) return false;
+                    if (!self.sortListWithKey(list, key, reverse, destination, line, column)) return false;
                     self.setRegister(destination, Value.noneValue());
                     return true;
                 }
@@ -831,10 +921,13 @@ pub const Runtime = struct {
                         return true;
                     },
                     .list_index, .list_count => {
-                        if (positional.len != 1) return self.nativeArity(line, column);
+                        if ((native == .list_count and positional.len != 1) or (native == .list_index and (positional.len < 1 or positional.len > 3))) return self.nativeArity(line, column);
+                        const length = list.items.items.len;
+                        const start = if (native == .list_index and positional.len >= 2) self.normalizeSearchBound(positional[1], length, line, column) orelse return false else 0;
+                        const stop = if (native == .list_index and positional.len >= 3) self.normalizeSearchBound(positional[2], length, line, column) orelse return false else length;
                         var count: usize = 0;
                         var found: ?usize = null;
-                        for (list.items.items, 0..) |value, index| {
+                        for (list.items.items[start..@max(start, stop)], start..) |value, index| {
                             const equal = self.valuesEqual(value, positional[0], line, column) orelse return false;
                             if (equal) {
                                 count += 1;
@@ -861,9 +954,10 @@ pub const Runtime = struct {
                     else => return self.engineFault(),
                 }
             },
-            .str_find, .str_index, .str_split, .str_join, .str_strip, .str_upper, .str_lower, .str_replace, .str_count, .str_startswith, .str_endswith, .str_encode => {
+            .str_find, .str_index, .str_split, .str_join, .str_strip, .str_upper, .str_lower, .str_replace, .str_count, .str_startswith, .str_endswith, .str_encode, .str_format => {
                 const header = bound_self.asObject() orelse return self.engineFault();
                 const text = string.fromHeader(header) orelse return self.engineFault();
+                if (native == .str_format) return self.executeStrFormat(destination, text, positional, keywords, line, column);
                 return self.executeStringNative(destination, native, text, positional, keywords, line, column);
             },
             .bytes_split, .bytes_find, .bytes_decode => {
@@ -921,7 +1015,7 @@ pub const Runtime = struct {
                 if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
                 const header = positional[0].asObject() orelse return self.nativeTypeError(line, column, "object is not an iterator");
                 const loop_iterator = iterator.iteratorFromHeader(header) orelse return self.nativeTypeError(line, column, "object is not an iterator");
-                return switch (iterator.next(&self.heap, loop_iterator)) {
+                return switch (self.nextIteratorValue(loop_iterator, destination, line, column)) {
                     .item => |value| blk: {
                         self.setRegister(destination, value);
                         break :blk true;
@@ -1328,6 +1422,402 @@ pub const Runtime = struct {
         }
     }
 
+    fn executeFormatValue(self: *Runtime, destination: u16, value: Value, spec: []const u8, conversion: u8, line: u32, column: u32) bool {
+        const rendered = self.makeFormattedText(value, spec, conversion, line, column) orelse return false;
+        defer self.heap.allocator.free(rendered);
+        return self.storeStringResult(destination, string.create(&self.heap, rendered), line, column);
+    }
+
+    fn executeStrFormat(self: *Runtime, destination: u16, template: *string.Str, positional: []const Value, keywords: []const binder.Keyword, line: u32, column: u32) bool {
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(self.heap.allocator);
+        const source = string.content(template);
+        var index: usize = 0;
+        var automatic: usize = 0;
+        var numbering_mode: enum { unset, automatic, manual } = .unset;
+        while (index < source.len) {
+            if (index + 1 < source.len and source[index] == '{' and source[index + 1] == '{') {
+                output.append(self.heap.allocator, '{') catch { _ = self.formatMemoryFailure(line, column); return false; };
+                index += 2;
+                continue;
+            }
+            if (index + 1 < source.len and source[index] == '}' and source[index + 1] == '}') {
+                output.append(self.heap.allocator, '}') catch { _ = self.formatMemoryFailure(line, column); return false; };
+                index += 2;
+                continue;
+            }
+            if (source[index] == '}') {
+                _ = self.formatValueError(line, column, "single '}' encountered in format string");
+                return false;
+            }
+            if (source[index] != '{') {
+                output.append(self.heap.allocator, source[index]) catch { _ = self.formatMemoryFailure(line, column); return false; };
+                index += 1;
+                continue;
+            }
+            const close = std.mem.indexOfScalarPos(u8, source, index + 1, '}') orelse { _ = self.formatValueError(line, column, "unmatched '{' in format string"); return false; };
+            const field = source[index + 1 .. close];
+            const colon = std.mem.indexOfScalar(u8, field, ':');
+            const name = if (colon) |at| field[0..at] else field;
+            const spec = if (colon) |at| field[at + 1 ..] else "";
+            var value: ?Value = null;
+            if (name.len == 0) {
+                if (numbering_mode == .manual) {
+                    _ = self.formatValueError(line, column, "cannot switch from manual field specification to automatic field numbering");
+                    return false;
+                }
+                numbering_mode = .automatic;
+                if (automatic >= positional.len) { _ = self.formatValueError(line, column, "replacement index out of range"); return false; }
+                value = positional[automatic];
+                automatic += 1;
+            } else if (std.fmt.parseInt(usize, name, 10) catch null) |position| {
+                if (numbering_mode == .automatic) {
+                    _ = self.formatValueError(line, column, "cannot switch from automatic field numbering to manual field specification");
+                    return false;
+                }
+                numbering_mode = .manual;
+                if (position >= positional.len) { _ = self.formatValueError(line, column, "replacement index out of range"); return false; }
+                value = positional[position];
+            } else {
+                for (keywords) |keyword| if (std.mem.eql(u8, keyword.name, name)) {
+                    value = keyword.value;
+                    break;
+                };
+            }
+            const selected = value orelse {
+                self.setException(.{ .kind = .key_error, .message = "format key is missing" }, line, column, null);
+                return false;
+            };
+            const formatted = self.makeFormattedText(selected, spec, 0, line, column) orelse return false;
+            defer self.heap.allocator.free(formatted);
+            output.appendSlice(self.heap.allocator, formatted) catch { _ = self.formatMemoryFailure(line, column); return false; };
+            index = close + 1;
+        }
+        const owned = output.toOwnedSlice(self.heap.allocator) catch { _ = self.formatMemoryFailure(line, column); return false; };
+        defer self.heap.allocator.free(owned);
+        return self.storeStringResult(destination, string.create(&self.heap, owned), line, column);
+    }
+
+    fn makeFormattedText(self: *Runtime, value: Value, spec: []const u8, conversion: u8, line: u32, column: u32) ?[]u8 {
+        var text: []u8 = undefined;
+        if (conversion == 2 or conversion == 3) {
+            text = self.renderValueOwned(value, true, line, column) orelse return null;
+        } else if ((conversion == 0 or conversion == 1) and value.asObject() != null) {
+            if (string.fromHeader(value.asObject().?)) |string_value| {
+                text = self.heap.allocator.dupe(u8, string.content(string_value)) catch return self.formatMemoryFailure(line, column);
+            } else {
+                text = self.renderValueOwned(value, conversion == 2, line, column) orelse return null;
+            }
+        } else {
+            text = self.renderValueOwned(value, false, line, column) orelse return null;
+        }
+        defer self.heap.allocator.free(text);
+        if (conversion == 3) {
+            const ascii = self.asciiEscape(text) orelse return self.formatMemoryFailure(line, column);
+            self.heap.allocator.free(text);
+            text = ascii;
+        }
+        if (spec.len == 0) return self.heap.allocator.dupe(u8, text) catch self.formatMemoryFailure(line, column);
+        const is_string = conversion != 0 or (value.asObject() != null and string.fromHeader(value.asObject().?) != null);
+        return self.applyFormatSpec(value, text, spec, line, column, is_string);
+    }
+
+    fn renderValueOwned(self: *Runtime, value: Value, nested: bool, line: u32, column: u32) ?[]u8 {
+        const saved = self.stdout_bytes;
+        self.stdout_bytes = .empty;
+        const ok = self.appendValueMode(value, nested, line, column);
+        const rendered = self.stdout_bytes.toOwnedSlice(self.heap.allocator) catch null;
+        self.stdout_bytes = saved;
+        if (!ok or rendered == null) {
+            if (rendered) |owned| self.heap.allocator.free(owned);
+            if (self.last_exception == null) self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return null;
+        }
+        return rendered.?;
+    }
+
+    fn asciiEscape(self: *Runtime, input: []const u8) ?[]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(self.heap.allocator);
+        var index: usize = 0;
+        while (index < input.len) {
+            const first = input[index];
+            if (first < 0x80) {
+                output.append(self.heap.allocator, first) catch return null;
+                index += 1;
+                continue;
+            }
+            const width = std.unicode.utf8ByteSequenceLength(first) catch 1;
+            const slice_bytes = input[index..@min(input.len, index + width)];
+            const scalar = std.unicode.utf8Decode(slice_bytes) catch first;
+            var escaped: []u8 = undefined;
+            if (scalar <= 0xff) {
+                escaped = std.fmt.allocPrint(self.heap.allocator, "\\x{x:0>2}", .{scalar}) catch return null;
+            } else if (scalar <= 0xffff) {
+                escaped = std.fmt.allocPrint(self.heap.allocator, "\\u{x:0>4}", .{scalar}) catch return null;
+            } else {
+                escaped = std.fmt.allocPrint(self.heap.allocator, "\\U{x:0>8}", .{scalar}) catch return null;
+            }
+            defer self.heap.allocator.free(escaped);
+            output.appendSlice(self.heap.allocator, escaped) catch return null;
+            index += width;
+        }
+        return output.toOwnedSlice(self.heap.allocator) catch null;
+    }
+
+    fn applyFormatSpec(self: *Runtime, value: Value, text: []const u8, spec: []const u8, line: u32, column: u32, force_string: bool) ?[]u8 {
+        const parsed = format_rules.parse(spec) catch |err| return switch (err) {
+            error.Overflow => self.formatMemoryFailure(line, column),
+            error.MissingPrecisionDigits => self.formatValueError(line, column, "precision requires digits"),
+            error.Invalid => self.formatValueError(line, column, "invalid format specifier"),
+        };
+        const kind = parsed.kind;
+        const is_string = force_string or (value.asObject() != null and string.fromHeader(value.asObject().?) != null);
+        if (is_string) {
+            if ((kind != 0 and kind != 's') or parsed.sign_specified or parsed.alternate or parsed.comma or parsed.alignment == '=') return self.formatValueError(line, column, "invalid format specifier for string");
+            const selected = if (parsed.precision) |precision| truncateUtf8(text, precision) else text;
+            return self.padFormatted(selected, parsed.width, parsed.fill, parsed.alignment, 0, line, column);
+        }
+        if (kind == 'c') {
+            if (!number.isIntegerValue(value)) return self.formatTypeError(line, column, "'c' requires an integer");
+            if (parsed.sign_specified or parsed.alternate or parsed.comma or parsed.precision != null or parsed.alignment == '=') return self.formatValueError(line, column, "invalid format specifier with 'c'");
+            const scalar = number.toInt(u21, value) orelse return self.formatValueError(line, column, "character argument not in range(0x110000)");
+            var encoded: [4]u8 = undefined;
+            const length = std.unicode.utf8Encode(scalar, &encoded) catch return self.formatValueError(line, column, "character argument not in range(0x110000)");
+            return self.padFormatted(encoded[0..length], parsed.width, parsed.fill, parsed.alignment, 0, line, column);
+        }
+        const is_float_kind = kind == 'e' or kind == 'E' or kind == 'f' or kind == 'F' or kind == 'g' or kind == 'G' or kind == '%';
+        const use_float = is_float_kind or (kind == 0 and value.asFloat() != null);
+        if (use_float) {
+            const float_value = switch (number.toFloat(&self.heap, value)) {
+                .value => |selected| selected,
+                .python_exception => |exception| { self.setException(exception, line, column, null); return null; },
+                .engine_error => { _ = self.engineFault(); return null; },
+            };
+            if (kind == 0) {
+                var default_text = if (parsed.precision) |precision|
+                    self.formatFloat(float_value, precision, 'g', parsed.alternate, line, column) orelse return null
+                else
+                    self.heap.allocator.dupe(u8, text) catch return self.formatMemoryFailure(line, column);
+                if (parsed.comma) {
+                    const grouped = self.groupThousands(default_text) orelse {
+                        self.heap.allocator.free(default_text);
+                        return self.formatMemoryFailure(line, column);
+                    };
+                    self.heap.allocator.free(default_text);
+                    default_text = grouped;
+                }
+                defer self.heap.allocator.free(default_text);
+                return self.padSignedNumeric(default_text, parsed, line, column);
+            }
+            if (parsed.alternate and kind != 'g' and kind != 'G') return self.formatValueError(line, column, "alternate form is not supported for this float format");
+            if (parsed.comma and (kind == 'e' or kind == 'E' or kind == 'g' or kind == 'G')) return self.formatValueError(line, column, "grouping is not supported for this float format");
+            const actual_kind: u8 = if (kind == 0) 'g' else kind;
+            const precision = parsed.precision orelse 6;
+            const scaled = if (actual_kind == '%') float_value * 100 else float_value;
+            var float_text = self.formatFloat(scaled, precision, actual_kind, parsed.alternate, line, column) orelse return null;
+            if (parsed.comma) {
+                const grouped = self.groupThousands(float_text) orelse { self.heap.allocator.free(float_text); return self.formatMemoryFailure(line, column); };
+                self.heap.allocator.free(float_text);
+                float_text = grouped;
+            }
+            defer self.heap.allocator.free(float_text);
+            if (actual_kind == '%') {
+                const percent = self.heap.allocator.dupeZ(u8, float_text) catch return self.formatMemoryFailure(line, column);
+                defer self.heap.allocator.free(percent);
+                var composed: std.ArrayList(u8) = .empty;
+                defer composed.deinit(self.heap.allocator);
+                composed.appendSlice(self.heap.allocator, percent) catch return self.formatMemoryFailure(line, column);
+                composed.append(self.heap.allocator, '%') catch return self.formatMemoryFailure(line, column);
+                const result = composed.toOwnedSlice(self.heap.allocator) catch return self.formatMemoryFailure(line, column);
+                defer self.heap.allocator.free(result);
+                return self.padSignedNumeric(result, parsed, line, column);
+            }
+            return self.padSignedNumeric(float_text, parsed, line, column);
+        }
+        if (kind != 0 and kind != 'd' and kind != 'b' and kind != 'o' and kind != 'x' and kind != 'X') return self.formatValueError(line, column, "invalid format specifier");
+        if (!number.isIntegerValue(value)) return self.formatTypeError(line, column, "integer format requires an integer");
+        if (parsed.precision != null or (parsed.comma and kind != 0 and kind != 'd')) return self.formatValueError(line, column, "invalid format specifier for integer");
+        const base: u8 = if (kind == 'b') 2 else if (kind == 'o') 8 else if (kind == 'x' or kind == 'X') 16 else 10;
+        const digits_result = number.formatIntegerBase(&self.heap, value, base, if (kind == 'X') .upper else .lower) orelse return self.formatTypeError(line, column, "integer format requires an integer");
+        var digits_owned = switch (digits_result) {
+            .value => |selected| selected,
+            .python_exception => |exception| { self.setException(exception, line, column, null); return null; },
+            .engine_error => { _ = self.engineFault(); return null; },
+        };
+        defer self.heap.allocator.free(digits_owned);
+        const negative = digits_owned.len != 0 and digits_owned[0] == '-';
+        const digit_start: usize = @intFromBool(negative);
+        var digit_slice = digits_owned[digit_start..];
+        if (parsed.comma) {
+            const grouped = self.groupThousands(digit_slice) orelse return self.formatMemoryFailure(line, column);
+            self.heap.allocator.free(digits_owned);
+            digits_owned = grouped;
+            digit_slice = digits_owned;
+        }
+        const prefix: []const u8 = if (parsed.alternate and base == 16) (if (kind == 'X') "0X" else "0x") else if (parsed.alternate and base == 8) "0o" else if (parsed.alternate and base == 2) "0b" else "";
+        const sign: []const u8 = if (negative) "-" else if (parsed.sign == '+') "+" else if (parsed.sign == ' ') " " else "";
+        var composed: std.ArrayList(u8) = .empty;
+        defer composed.deinit(self.heap.allocator);
+        composed.appendSlice(self.heap.allocator, sign) catch return self.formatMemoryFailure(line, column);
+        composed.appendSlice(self.heap.allocator, prefix) catch return self.formatMemoryFailure(line, column);
+        composed.appendSlice(self.heap.allocator, digit_slice) catch return self.formatMemoryFailure(line, column);
+        const numeric = composed.toOwnedSlice(self.heap.allocator) catch return self.formatMemoryFailure(line, column);
+        defer self.heap.allocator.free(numeric);
+        return self.padFormatted(numeric, parsed.width, parsed.fill, parsed.alignment, sign.len + prefix.len, line, column);
+    }
+
+    fn padSignedNumeric(self: *Runtime, text: []const u8, spec: format_rules.Spec, line: u32, column: u32) ?[]u8 {
+        const has_minus = text.len != 0 and text[0] == '-';
+        const has_sign = has_minus or spec.sign_specified;
+        const sign: []const u8 = if (has_minus) "-" else if (spec.sign == '+') "+" else if (spec.sign == ' ') " " else "";
+        if (!has_sign) return self.padFormatted(text, spec.width, spec.fill, spec.alignment, 0, line, column);
+        var combined: std.ArrayList(u8) = .empty;
+        defer combined.deinit(self.heap.allocator);
+        combined.appendSlice(self.heap.allocator, sign) catch return self.formatMemoryFailure(line, column);
+        if (has_minus) combined.appendSlice(self.heap.allocator, text[1..]) catch return self.formatMemoryFailure(line, column) else combined.appendSlice(self.heap.allocator, text) catch return self.formatMemoryFailure(line, column);
+        const signed = combined.toOwnedSlice(self.heap.allocator) catch return self.formatMemoryFailure(line, column);
+        defer self.heap.allocator.free(signed);
+        return self.padFormatted(signed, spec.width, spec.fill, spec.alignment, sign.len, line, column);
+    }
+
+    fn padFormatted(self: *Runtime, text: []const u8, width: usize, fill: u8, requested_align: u8, head_len: usize, line: u32, column: u32) ?[]u8 {
+        const length = std.unicode.utf8CountCodepoints(text) catch text.len;
+        if (width <= length) return self.heap.allocator.dupe(u8, text) catch self.formatMemoryFailure(line, column);
+        const padding = width - length;
+        if (padding > self.remainingSessionBytes()) return self.formatMemoryFailure(line, column);
+        const alignment = if (requested_align == 0) '>' else requested_align;
+        const left = if (alignment == '<') 0 else if (alignment == '^') padding / 2 else padding;
+        const right = padding - left;
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(self.heap.allocator);
+        const internal = alignment == '=' and head_len != 0;
+        if (!internal) output.appendNTimes(self.heap.allocator, fill, left) catch return self.formatMemoryFailure(line, column);
+        if (internal) {
+            output.appendSlice(self.heap.allocator, text[0..@min(head_len, text.len)]) catch return self.formatMemoryFailure(line, column);
+            output.appendNTimes(self.heap.allocator, fill, padding) catch return self.formatMemoryFailure(line, column);
+            output.appendSlice(self.heap.allocator, text[@min(head_len, text.len)..]) catch return self.formatMemoryFailure(line, column);
+        } else output.appendSlice(self.heap.allocator, text) catch return self.formatMemoryFailure(line, column);
+        if (!internal) output.appendNTimes(self.heap.allocator, fill, right) catch return self.formatMemoryFailure(line, column);
+        return output.toOwnedSlice(self.heap.allocator) catch self.formatMemoryFailure(line, column);
+    }
+
+    fn formatFloat(self: *Runtime, value: f64, precision: usize, kind: u8, alternate: bool, line: u32, column: u32) ?[]u8 {
+        if (precision > 256 or precision > self.remainingSessionBytes()) return self.formatMemoryFailure(line, column);
+        const upper = kind == 'E' or kind == 'F' or kind == 'G';
+        if (kind == 'g' or kind == 'G') return self.formatGeneralFloat(value, precision, alternate, upper, line, column);
+        const scientific = kind == 'e' or kind == 'E';
+        const rendered_value = if (scientific) value else roundDecimalTieEven(value, precision);
+        const mode: std.fmt.float.Mode = if (scientific) .scientific else .decimal;
+        var buffer: [std.fmt.float.bufferSize(.decimal, f64)]u8 = undefined;
+        const rendered = std.fmt.float.render(&buffer, rendered_value, .{ .mode = mode, .precision = precision }) catch return self.formatMemoryFailure(line, column);
+        if (scientific) {
+            const marker = std.mem.indexOfScalar(u8, rendered, 'e') orelse return self.formatValueError(line, column, "float formatter omitted exponent");
+            const mantissa = rendered[0..marker];
+            const parsed_exponent = std.fmt.parseInt(i32, rendered[marker + 1 ..], 10) catch return self.formatValueError(line, column, "invalid float exponent");
+            return self.normalizedScientific(mantissa, parsed_exponent, upper, line, column);
+        }
+        const owned = self.heap.allocator.dupe(u8, rendered) catch return self.formatMemoryFailure(line, column);
+        if (upper) {
+            for (@constCast(owned)) |*character| character.* = std.ascii.toUpper(character.*);
+        }
+        return owned;
+    }
+
+    fn formatGeneralFloat(self: *Runtime, value: f64, precision: usize, alternate: bool, upper: bool, line: u32, column: u32) ?[]u8 {
+        const significant = if (precision == 0) 1 else precision;
+        var buffer: [std.fmt.float.bufferSize(.decimal, f64)]u8 = undefined;
+        const rendered = std.fmt.float.render(&buffer, value, .{ .mode = .scientific, .precision = significant - 1 }) catch return self.formatMemoryFailure(line, column);
+        const marker = std.mem.indexOfScalar(u8, rendered, 'e') orelse {
+            const special = self.heap.allocator.dupe(u8, rendered) catch return self.formatMemoryFailure(line, column);
+            if (upper) {
+                for (@constCast(special)) |*character| character.* = std.ascii.toUpper(character.*);
+            }
+            return special;
+        };
+        const exponent = std.fmt.parseInt(i32, rendered[marker + 1 ..], 10) catch return self.formatValueError(line, column, "invalid float exponent");
+        const mantissa = if (alternate) rendered[0..marker] else trimFloatZeros(rendered[0..marker]);
+        if (exponent < -4 or exponent >= @as(i32, @intCast(significant))) {
+            return self.normalizedScientific(mantissa, exponent, upper, line, column);
+        }
+        return self.scientificMantissaToFixed(mantissa, exponent, line, column);
+    }
+
+    fn normalizedScientific(self: *Runtime, mantissa: []const u8, exponent: i32, upper: bool, line: u32, column: u32) ?[]u8 {
+        const marker: u8 = if (upper) 'E' else 'e';
+        const sign: u8 = if (exponent < 0) '-' else '+';
+        const magnitude: u32 = @intCast(@abs(exponent));
+        const result = std.fmt.allocPrint(self.heap.allocator, "{s}{c}{c}{d:0>2}", .{ mantissa, marker, sign, magnitude }) catch return self.formatMemoryFailure(line, column);
+        return result;
+    }
+
+    fn scientificMantissaToFixed(self: *Runtime, mantissa: []const u8, exponent: i32, line: u32, column: u32) ?[]u8 {
+        const negative = mantissa.len != 0 and mantissa[0] == '-';
+        const unsigned = if (negative) mantissa[1..] else mantissa;
+        var digits: std.ArrayList(u8) = .empty;
+        defer digits.deinit(self.heap.allocator);
+        for (unsigned) |character| if (character != '.') {
+            digits.append(self.heap.allocator, character) catch return self.formatMemoryFailure(line, column);
+        };
+        const decimal_position_signed = 1 + exponent;
+        const decimal_position: usize = if (decimal_position_signed > 0) @intCast(decimal_position_signed) else 0;
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(self.heap.allocator);
+        if (negative) output.append(self.heap.allocator, '-') catch return self.formatMemoryFailure(line, column);
+        if (decimal_position_signed <= 0) {
+            output.appendSlice(self.heap.allocator, "0.") catch return self.formatMemoryFailure(line, column);
+            output.appendNTimes(self.heap.allocator, '0', @intCast(-decimal_position_signed)) catch return self.formatMemoryFailure(line, column);
+            output.appendSlice(self.heap.allocator, digits.items) catch return self.formatMemoryFailure(line, column);
+        } else if (decimal_position >= digits.items.len) {
+            output.appendSlice(self.heap.allocator, digits.items) catch return self.formatMemoryFailure(line, column);
+            output.appendNTimes(self.heap.allocator, '0', decimal_position - digits.items.len) catch return self.formatMemoryFailure(line, column);
+        } else {
+            output.appendSlice(self.heap.allocator, digits.items[0..decimal_position]) catch return self.formatMemoryFailure(line, column);
+            output.append(self.heap.allocator, '.') catch return self.formatMemoryFailure(line, column);
+            output.appendSlice(self.heap.allocator, digits.items[decimal_position..]) catch return self.formatMemoryFailure(line, column);
+        }
+        return output.toOwnedSlice(self.heap.allocator) catch self.formatMemoryFailure(line, column);
+    }
+
+    fn groupThousands(self: *Runtime, input: []const u8) ?[]u8 {
+        const dot = std.mem.indexOfAny(u8, input, ".eE") orelse input.len;
+        const sign: usize = if (input.len != 0 and (input[0] == '-' or input[0] == '+')) 1 else 0;
+        const integer_digits = dot - sign;
+        if (integer_digits <= 3) return self.heap.allocator.dupe(u8, input) catch null;
+        const commas = (integer_digits - 1) / 3;
+        const total = input.len + commas;
+        var output = self.heap.allocator.alloc(u8, total) catch return null;
+        var out: usize = 0;
+        for (input, 0..) |character, index| {
+            if (index >= sign and index < dot and index != sign and (dot - index) % 3 == 0) {
+                output[out] = ',';
+                out += 1;
+            }
+            output[out] = character;
+            out += 1;
+        }
+        return output;
+    }
+
+    fn remainingSessionBytes(self: *const Runtime) usize {
+        return self.session_allocator.max_bytes -| self.session_allocator.live_bytes;
+    }
+
+    fn formatMemoryFailure(self: *Runtime, line: u32, column: u32) ?[]u8 {
+        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+        return null;
+    }
+
+    fn formatValueError(self: *Runtime, line: u32, column: u32, message: []const u8) ?[]u8 {
+        self.setException(.{ .kind = .value_error, .message = message }, line, column, null);
+        return null;
+    }
+
+    fn formatTypeError(self: *Runtime, line: u32, column: u32, message: []const u8) ?[]u8 {
+        self.setException(.{ .kind = .type_error, .message = message }, line, column, null);
+        return null;
+    }
+
     fn executeBytesNative(self: *Runtime, destination: u16, native: functions.Native, data: *byte_module.Bytes, positional: []const Value, keywords: []const binder.Keyword, line: u32, column: u32) bool {
         if (keywords.len != 0) return self.nativeTypeError(line, column, "bytes method does not accept keyword arguments");
         switch (native) {
@@ -1448,6 +1938,206 @@ pub const Runtime = struct {
         };
     }
 
+    fn nextIteratorValue(self: *Runtime, selected: *iterator.Iterator, destination: u16, line: u32, column: u32) iterator.NextResult {
+        switch (iterator.deferredKind(selected) orelse return iterator.next(&self.heap, selected)) {
+            .generator => {
+                const owns_work_budget = self.beginSynchronousWork();
+                defer self.endSynchronousWork(owns_work_budget);
+                return self.resumeGenerator(selected, line, column);
+            },
+            .map, .filter => |kind| {
+                const owns_work_budget = self.beginSynchronousWork();
+                defer self.endSynchronousWork(owns_work_budget);
+                if (selected.children.len == 0 or selected.values.len != selected.children.len) return .{ .engine_error = .internal_invariant };
+                while (true) {
+                    if (!self.chargeSynchronousWork(line, column)) return .{ .python_exception = self.last_exception.? };
+                    for (selected.children, 0..) |maybe_child, index| {
+                        const child = maybe_child orelse return .{ .engine_error = .internal_invariant };
+                        switch (self.nextIteratorValue(child, destination, line, column)) {
+                            .item => |value| selected.values[index] = value,
+                            .done => return .done,
+                            .python_exception => |exception| return .{ .python_exception = exception },
+                            .engine_error => |failure| return .{ .engine_error = failure },
+                        }
+                    }
+                    if (kind == .filter and selected.callback.tag() == .none) {
+                        const keep = self.valueTruthy(selected.values[0], line, column) orelse return .{ .python_exception = self.last_exception.? };
+                        if (keep) return .{ .item = selected.values[0] };
+                        continue;
+                    }
+                    const mapped = self.invokeCallableSync(selected.callback, selected.values, destination, line, column) orelse {
+                        return .{ .python_exception = self.last_exception orelse .{ .kind = .runtime_error, .message = "iterator callback failed" } };
+                    };
+                    if (kind == .map) return .{ .item = mapped };
+                    const keep = self.valueTruthy(mapped, line, column) orelse return .{ .python_exception = self.last_exception.? };
+                    if (keep) return .{ .item = selected.values[0] };
+                }
+            },
+        }
+    }
+
+    fn resumeGenerator(self: *Runtime, selected: *iterator.Iterator, line: u32, column: u32) iterator.NextResult {
+        const owns_work_budget = self.beginSynchronousWork();
+        defer self.endSynchronousWork(owns_work_budget);
+        if (selected.generator_done) return .done;
+        if (!selected.started) {
+            const frame = self.createGeneratorFrame(selected, line, column) orelse return .{ .python_exception = self.last_exception orelse .{ .kind = .runtime_error, .message = "generator frame creation failed" } };
+            selected.generator_frame = frame;
+            selected.generator_roots = frame.roots;
+            selected.generator_frame_destroy = destroyGeneratorFrameOpaque;
+            selected.started = true;
+        }
+        const frame: *Frame = @ptrCast(@alignCast(selected.generator_frame orelse return .{ .engine_error = .internal_invariant }));
+        const caller = self.top_frame orelse return .{ .engine_error = .internal_invariant };
+        const previous_generator = self.resuming_generator;
+        self.resuming_generator = selected;
+        defer self.resuming_generator = previous_generator;
+        selected.generator_yielded = null;
+        frame.previous = caller;
+        frame.root_frame.push(&self.heap.roots);
+        for (frame.roots) |*root| frame.root_frame.add(root);
+        self.top_frame = frame;
+        self.activateFrame(frame);
+        var steps: usize = 0;
+        while (true) : (steps += 1) {
+            if (selected.generator_yielded) |value| {
+                selected.generator_yielded = null;
+                return .{ .item = value };
+            }
+            if (selected.generator_done) return .done;
+            if (steps >= 1_000_000 or !self.chargeSynchronousWork(line, column)) {
+                if (self.last_exception == null) self.setException(.{ .kind = .runtime_error, .message = "generator exceeded synchronous work limit" }, line, column, null);
+                self.unwindFramesUntil(caller);
+                return .{ .python_exception = self.last_exception.? };
+            }
+            const active = self.top_frame orelse return .{ .engine_error = .internal_invariant };
+            if (active.ip >= active.code.instructions.len or active.code.positions.len != active.code.instructions.len) {
+                _ = self.engineFault();
+                self.unwindFramesUntil(caller);
+                return .{ .engine_error = .internal_invariant };
+            }
+            const position = active.code.positions[active.ip];
+            const instruction = active.code.instructions[active.ip];
+            active.ip += 1;
+            self.activateFrame(active);
+            if (!self.execute(instruction, position.line, position.column)) {
+                const failure: iterator.NextResult = if (self.engine_failed)
+                    .{ .engine_error = .internal_invariant }
+                else
+                    .{ .python_exception = self.last_exception orelse .{ .kind = .runtime_error, .message = "generator execution failed" } };
+                self.unwindFramesUntil(caller);
+                return failure;
+            }
+            if (self.top_frame == active) active.ip = self.instruction_pointer;
+        }
+    }
+
+    fn createGeneratorFrame(self: *Runtime, selected: *iterator.Iterator, line: u32, column: u32) ?*Frame {
+        const caller = self.top_frame orelse {
+            _ = self.engineFault();
+            return null;
+        };
+        const function_header = selected.callback.asObject() orelse {
+            self.setException(.{ .kind = .type_error, .message = "generator callback is not callable" }, line, column, null);
+            return null;
+        };
+        const function = functions.functionFromHeader(function_header) orelse {
+            self.setException(.{ .kind = .type_error, .message = "generator callback is not callable" }, line, column, null);
+            return null;
+        };
+        const code = function.code orelse {
+            self.setException(.{ .kind = .type_error, .message = "generator callback must be a Python function" }, line, column, null);
+            return null;
+        };
+        const outer = selected.inner orelse {
+            _ = self.engineFault();
+            return null;
+        };
+        const argument = Value.object(&outer.header);
+        const allocator = self.heap.allocator;
+        const binding = binder.bindFunction(&self.heap, allocator, code.parameter_names, code.parameter_flags, function.defaults, &.{argument}, &.{}) catch |err| {
+            self.setBinderException(err, line, column);
+            return null;
+        };
+        defer allocator.free(binding.values);
+        if (binding.extra_keywords.len != 0) allocator.free(binding.extra_keywords);
+        if (function.cells.len != code.free_names.len) {
+            _ = self.engineFault();
+            return null;
+        }
+        const bound_roots = allocator.alloc(gc.Root, binding.values.len) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return null;
+        };
+        defer allocator.free(bound_roots);
+        for (binding.values, 0..) |value, index| bound_roots[index] = .{ .object = value.asObject() };
+        var bound_frame = gc.RootFrame{};
+        bound_frame.push(&self.heap.roots);
+        for (bound_roots) |*root| bound_frame.add(root);
+        var bound_roots_active = true;
+        defer if (bound_roots_active) bound_frame.pop();
+        const frame = self.allocateFrame(code, null) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return null;
+        };
+        var complete = false;
+        defer if (!complete) {
+            if (bound_roots_active) {
+                bound_frame.pop();
+                bound_roots_active = false;
+            }
+            while (self.top_frame != caller) if (self.popFrame()) |abandoned| {
+                self.forgetGeneratorFrame(abandoned);
+                self.freeFrameStorage(abandoned);
+            } else break;
+        };
+        frame.root_frame.pop();
+        bound_frame.pop();
+        bound_roots_active = false;
+        frame.root_frame.push(&self.heap.roots);
+        for (frame.roots) |*root| frame.root_frame.add(root);
+        bound_frame.push(&self.heap.roots);
+        for (bound_roots) |*root| bound_frame.add(root);
+        bound_roots_active = true;
+        for (code.parameter_names, 0..) |name, index| {
+            const value = binding.values[index];
+            if (indexOfName(code.local_names, name)) |local_index| {
+                frame.locals[local_index] = value;
+                frame.roots[frame.localRootStart() + local_index].object = value.asObject();
+            } else if (indexOfName(code.cell_names, name)) |cell_index| {
+                frame.roots[frame.cellRootStart() + cell_index].object = value.asObject();
+            } else {
+                _ = self.engineFault();
+                return null;
+            }
+        }
+        for (function.cells, 0..) |cell, index| {
+            frame.free_cells[index] = cell;
+            frame.roots[frame.freeRootStart() + index].object = &cell.header;
+        }
+        for (code.cell_names, 0..) |_, index| {
+            const cell = functions.createCell(&self.heap, Value.unboundValue()) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return null;
+            };
+            frame.local_cells[index] = cell;
+            frame.roots[frame.cellRootStart() + index].object = &cell.header;
+        }
+        for (code.parameter_names, 0..) |name, index| if (!self.storeFrameLocal(frame, name, binding.values[index])) {
+            _ = self.engineFault();
+            return null;
+        };
+        bound_frame.pop();
+        bound_roots_active = false;
+        frame.root_frame.pop();
+        self.top_frame = caller;
+        frame.previous = null;
+        self.activateFrame(caller);
+        frame.generator_owner = selected;
+        complete = true;
+        return frame;
+    }
+
     fn materializeSequence(self: *Runtime, destination: u16, source: Value, want_tuple: bool, line: u32, column: u32) bool {
         if (source.asObject()) |header| {
             if (iterator.rangeFromHeader(header)) |range| {
@@ -1503,7 +2193,7 @@ pub const Runtime = struct {
         };
         roots[1].object = &list.header;
         while (true) {
-            switch (iterator.next(&self.heap, iterator_value)) {
+            switch (self.nextIteratorValue(iterator_value, destination, line, column)) {
                 .item => |item| {
                     roots[2].object = item.asObject();
                     switch (sequence.append(&self.heap, list, item)) {
@@ -1643,11 +2333,14 @@ pub const Runtime = struct {
     }
 
     fn sortList(self: *Runtime, list: *sequence.List, reverse: bool, line: u32, column: u32) bool {
+        const owns_work_budget = self.beginSynchronousWork();
+        defer self.endSynchronousWork(owns_work_budget);
         var index: usize = 1;
         while (index < list.items.items.len) : (index += 1) {
             const item = list.items.items[index];
             var position = index;
             while (position > 0) {
+                if (!self.chargeSynchronousWork(line, column)) return false;
                 const order = self.sortOrder(item, list.items.items[position - 1], line, column) orelse return false;
                 const precedes = if (reverse) order == .gt else order == .lt;
                 if (!precedes) break;
@@ -1656,7 +2349,231 @@ pub const Runtime = struct {
             }
             list.items.items[position] = item;
         }
+        list.version +%= 1;
         return true;
+    }
+
+    fn sortListWithKey(self: *Runtime, list: *sequence.List, key: ?Value, reverse: bool, destination: u16, line: u32, column: u32) bool {
+        const owns_work_budget = self.beginSynchronousWork();
+        defer self.endSynchronousWork(owns_work_budget);
+        const callback = key orelse return self.sortList(list, reverse, line, column);
+        var list_root = gc.Root{ .object = &list.header };
+        var callback_root = gc.Root{ .object = callback.asObject() };
+        var stable_roots_frame = gc.RootFrame{};
+        stable_roots_frame.push(&self.heap.roots);
+        stable_roots_frame.add(&list_root);
+        stable_roots_frame.add(&callback_root);
+        defer stable_roots_frame.pop();
+        const original_version = list.version;
+        const original_length = list.items.items.len;
+        const allocator = self.heap.allocator;
+        const count = list.items.items.len;
+        const values = allocator.dupe(Value, list.items.items) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer allocator.free(values);
+        const keys = allocator.alloc(Value, count) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer allocator.free(keys);
+        const roots = allocator.alloc(gc.Root, count * 2) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer allocator.free(roots);
+        for (0..count) |index| {
+            roots[index] = .{ .object = values[index].asObject() };
+            roots[count + index] = .{ .object = null };
+        }
+        var value_roots_frame = gc.RootFrame{};
+        value_roots_frame.push(&self.heap.roots);
+        for (roots) |*root| value_roots_frame.add(root);
+        defer value_roots_frame.pop();
+        for (values, 0..) |value, index| {
+            const returned = self.invokeCallableSync(callback, &.{value}, destination, line, column) orelse return false;
+            if (list.version != original_version or list.items.items.len != original_length) {
+                self.setException(.{ .kind = .value_error, .message = "list modified during sort" }, line, column, null);
+                return false;
+            }
+            keys[index] = returned;
+            roots[count + index].object = returned.asObject();
+        }
+        var order = allocator.alloc(usize, count) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer allocator.free(order);
+        for (order, 0..) |*position, index| position.* = index;
+        var index: usize = 1;
+        while (index < count) : (index += 1) {
+            const selected = order[index];
+            var position = index;
+            while (position > 0) {
+                if (!self.chargeSynchronousWork(line, column)) return false;
+                const compared = self.sortOrder(keys[selected], keys[order[position - 1]], line, column) orelse return false;
+                if (!(if (reverse) compared == .gt else compared == .lt)) break;
+                order[position] = order[position - 1];
+                position -= 1;
+            }
+            order[position] = selected;
+        }
+        if (list.version != original_version or list.items.items.len != original_length) {
+            self.setException(.{ .kind = .value_error, .message = "list modified during sort" }, line, column, null);
+            return false;
+        }
+        for (order, 0..) |source_index, target_index| list.items.items[target_index] = values[source_index];
+        list.version +%= 1;
+        return true;
+    }
+
+    fn isCallable(self: *const Runtime, value: Value) bool {
+        _ = self;
+        const header = value.asObject() orelse return false;
+        const function = functions.functionFromHeader(header) orelse return false;
+        return function.native != null or function.code != null;
+    }
+
+    fn beginSynchronousWork(self: *Runtime) bool {
+        if (self.synchronous_work_remaining != null) return false;
+        self.synchronous_work_remaining = 1_000_000;
+        return true;
+    }
+
+    fn endSynchronousWork(self: *Runtime, owns_budget: bool) void {
+        if (owns_budget) self.synchronous_work_remaining = null;
+    }
+
+    fn chargeSynchronousWork(self: *Runtime, line: u32, column: u32) bool {
+        const remaining = self.synchronous_work_remaining orelse return true;
+        if (remaining == 0) {
+            self.setException(.{ .kind = .runtime_error, .message = "synchronous operation exceeded work limit" }, line, column, null);
+            return false;
+        }
+        self.synchronous_work_remaining = remaining - 1;
+        return true;
+    }
+
+    fn invokeCallableSync(self: *Runtime, callable: Value, args: []const Value, destination: u16, line: u32, column: u32) ?Value {
+        const header = callable.asObject() orelse {
+            self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
+            return null;
+        };
+        const function = functions.functionFromHeader(header) orelse {
+            self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
+            return null;
+        };
+        if (function.native) |native| {
+            if (!self.executeNativeCall(destination, native, function.bound_self, args, &.{}, line, column)) return null;
+            return self.registers[destination];
+        }
+        return self.invokePythonSync(callable, args, destination, line, column);
+    }
+
+    fn invokePythonSync(self: *Runtime, callable: Value, args: []const Value, destination: u16, line: u32, column: u32) ?Value {
+        const owns_work_budget = self.beginSynchronousWork();
+        defer self.endSynchronousWork(owns_work_budget);
+        const header = callable.asObject() orelse {
+            self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
+            return null;
+        };
+        const function = functions.functionFromHeader(header) orelse {
+            self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
+            return null;
+        };
+        const function_code = function.code orelse {
+            self.setException(.{ .kind = .type_error, .message = "native callbacks are not supported here" }, line, column, null);
+            return null;
+        };
+        const caller = self.top_frame orelse {
+            _ = self.engineFault();
+            return null;
+        };
+        const allocator = self.heap.allocator;
+        const binding = binder.bindFunction(&self.heap, allocator, function_code.parameter_names, function_code.parameter_flags, function.defaults, args, &.{}) catch |err| {
+            self.setBinderException(err, line, column);
+            return null;
+        };
+        defer allocator.free(binding.values);
+        if (binding.extra_keywords.len != 0) allocator.free(binding.extra_keywords);
+        const bound_roots = allocator.alloc(gc.Root, binding.values.len) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return null;
+        };
+        defer allocator.free(bound_roots);
+        for (binding.values, 0..) |value, index| bound_roots[index] = .{ .object = value.asObject() };
+        var bound_frame = gc.RootFrame{};
+        bound_frame.push(&self.heap.roots);
+        for (bound_roots) |*root| bound_frame.add(root);
+        var bound_active = true;
+        defer if (bound_active) bound_frame.pop();
+        const frame = self.allocateFrame(function_code, destination) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return null;
+        };
+        var complete = false;
+        defer if (!complete) {
+            if (bound_active) {
+                bound_frame.pop();
+                bound_active = false;
+            }
+            self.unwindFramesUntil(caller);
+        };
+        frame.root_frame.pop();
+        bound_frame.pop();
+        bound_active = false;
+        frame.root_frame.push(&self.heap.roots);
+        for (frame.roots) |*root| frame.root_frame.add(root);
+        bound_frame.push(&self.heap.roots);
+        for (bound_roots) |*root| bound_frame.add(root);
+        bound_active = true;
+        if (function.cells.len != function_code.free_names.len) {
+            _ = self.engineFault();
+            return null;
+        }
+        for (function.cells, 0..) |cell, index| {
+            frame.free_cells[index] = cell;
+            frame.roots[frame.freeRootStart() + index].object = &cell.header;
+        }
+        for (function_code.cell_names, 0..) |_, index| {
+            const cell = functions.createCell(&self.heap, Value.unboundValue()) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return null;
+            };
+            frame.local_cells[index] = cell;
+            frame.roots[frame.cellRootStart() + index].object = &cell.header;
+        }
+        for (function_code.parameter_names, 0..) |name, index| {
+            if (!self.storeFrameLocal(frame, name, binding.values[index])) {
+                _ = self.engineFault();
+                return null;
+            }
+        }
+        bound_frame.pop();
+        bound_active = false;
+        var steps: usize = 0;
+        while (self.top_frame != caller) : (steps += 1) {
+            if (steps >= 1_000_000 or !self.chargeSynchronousWork(line, column)) {
+                if (self.last_exception == null) self.setException(.{ .kind = .runtime_error, .message = "synchronous callback exceeded work limit" }, line, column, null);
+                return null;
+            }
+            const active = self.top_frame orelse return null;
+            if (active.ip >= active.code.instructions.len or active.code.positions.len != active.code.instructions.len) {
+                _ = self.engineFault();
+                return null;
+            }
+            const position = active.code.positions[active.ip];
+            const instruction = active.code.instructions[active.ip];
+            active.ip += 1;
+            self.activateFrame(active);
+            if (!self.execute(instruction, position.line, position.column)) {
+                return null;
+            }
+            if (self.top_frame == active) active.ip = self.instruction_pointer;
+        }
+        complete = true;
+        return self.registers[destination];
     }
 
     fn sortOrder(self: *Runtime, left: Value, right: Value, line: u32, column: u32) ?std.math.Order {
@@ -2045,6 +2962,11 @@ pub const Runtime = struct {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
                 const result = self.registers[instruction.a()];
                 const frame = self.popFrame() orelse return self.engineFault();
+                if (frame.generator_owner != null) {
+                    self.forgetGeneratorFrame(frame);
+                    self.freeFrameStorage(frame);
+                    return true;
+                }
                 const return_destination = frame.return_destination;
                 self.freeFrameStorage(frame);
                 if (self.top_frame) |caller| {
@@ -2061,6 +2983,38 @@ pub const Runtime = struct {
                 if (!self.validRegister(instruction.a()) or !self.executeMakeFunction(instruction, line, column)) return false;
             },
             .make_sequence => return self.executeMakeSequence(instruction, line, column),
+            .list_append_value => {
+                if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
+                const header = self.registers[instruction.a()].asObject() orelse return self.engineFault();
+                const list = sequence.listFromHeader(header) orelse return self.engineFault();
+                return switch (sequence.append(&self.heap, list, self.registers[instruction.b()])) {
+                    .value => true,
+                    .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk false; },
+                    .engine_error => self.engineFault(),
+                };
+            },
+            .format_value => {
+                if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
+                const site: usize = instruction.c();
+                if (site >= code.format_sites.len) return self.engineFault();
+                return self.executeFormatValue(instruction.a(), self.registers[instruction.b()], code.format_sites[site].spec, instruction.flags(), line, column);
+            },
+            .make_generator => {
+                if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b()) or !self.validRegister(instruction.c())) return self.engineFault();
+                const created = iterator.createGenerator(&self.heap, self.registers[instruction.b()], self.registers[instruction.c()]);
+                return self.storeIteratorOutcome(instruction.a(), created, line, column);
+            },
+            .yield_value => {
+                if (!self.validRegister(instruction.a())) return self.engineFault();
+                const selected = self.resuming_generator orelse return self.engineFault();
+                const frame = self.top_frame orelse return self.engineFault();
+                if (frame.generator_owner != selected) return self.engineFault();
+                selected.generator_yielded = self.registers[instruction.a()];
+                if (frame.root_frame.stack != null) frame.root_frame.pop();
+                self.top_frame = frame.previous;
+                frame.previous = null;
+                if (self.top_frame) |caller| self.activateFrame(caller) else return self.engineFault();
+            },
             .make_mapping => return self.executeMakeMapping(instruction, line, column),
             .mapping_set => return self.executeMappingSet(instruction, line, column),
             .mapping_update => return self.executeMappingUpdate(instruction, line, column),
@@ -2145,7 +3099,7 @@ pub const Runtime = struct {
                 if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b()) or !self.validRegister(instruction.c())) return self.engineFault();
                 const header = self.registers[instruction.b()].asObject() orelse return self.engineFault();
                 const loop_iterator = iterator.iteratorFromHeader(header) orelse return self.engineFault();
-                switch (iterator.next(&self.heap, loop_iterator)) {
+                switch (self.nextIteratorValue(loop_iterator, instruction.a(), line, column)) {
                     .item => |item| {
                         self.setRegister(instruction.a(), item);
                         self.setRegister(instruction.c(), Value.trueValue());
@@ -2672,6 +3626,7 @@ pub const Runtime = struct {
             .engine_error => return self.engineFault(),
         };
         list.items.items[position] = self.registers[instruction.a()];
+        list.version +%= 1;
         return true;
     }
 
@@ -2709,6 +3664,7 @@ pub const Runtime = struct {
             .engine_error => return self.engineFault(),
         };
         _ = list.items.orderedRemove(position);
+        list.version +%= 1;
         return true;
     }
 
@@ -2893,6 +3849,7 @@ pub const Runtime = struct {
     }
 
     fn executeBinary(self: *Runtime, destination: u16, left: Value, right: Value, operation: u8, line: u32, column: u32) bool {
+        if (operation == 5) if (left.asObject()) |header| if (string.fromHeader(header)) |template| return self.executePercentFormat(destination, template, right, line, column);
         if (operation == 1 or operation == 7 or operation == 8) {
             const left_header = left.asObject() orelse null;
             const right_header = right.asObject() orelse null;
@@ -2918,6 +3875,26 @@ pub const Runtime = struct {
                                     self.setException(exception, line, column, null);
                                     break :blk false;
                                 },
+                                .engine_error => self.engineFault(),
+                            };
+                        }
+                    }
+                    if (byte_module.fromHeader(left_object)) |left_bytes| {
+                        if (byte_module.fromHeader(right_object)) |right_bytes| {
+                            const total = std.math.add(usize, left_bytes.data.len, right_bytes.data.len) catch {
+                                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                                return false;
+                            };
+                            const joined_data = self.heap.allocator.alloc(u8, total) catch {
+                                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                                return false;
+                            };
+                            defer self.heap.allocator.free(joined_data);
+                            @memcpy(joined_data[0..left_bytes.data.len], left_bytes.data);
+                            @memcpy(joined_data[left_bytes.data.len..], right_bytes.data);
+                            return switch (byte_module.create(&self.heap, joined_data)) {
+                                .value => |joined| blk: { self.setRegister(destination, Value.object(&joined.header)); break :blk true; },
+                                .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk false; },
                                 .engine_error => self.engineFault(),
                             };
                         }
@@ -2948,6 +3925,53 @@ pub const Runtime = struct {
             else => return self.engineFault(),
         };
         return self.storeNumberResult(destination, result, line, column);
+    }
+
+    fn executePercentFormat(self: *Runtime, destination: u16, template: *string.Str, arguments_value: Value, line: u32, column: u32) bool {
+        const arguments: []const Value = if (arguments_value.asObject()) |header| if (sequence.tupleFromHeader(header)) |tuple| tuple.items else &.{arguments_value} else &.{arguments_value};
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(self.heap.allocator);
+        const input = string.content(template);
+        var index: usize = 0;
+        var argument_index: usize = 0;
+        while (index < input.len) {
+            if (input[index] != '%') {
+                output.append(self.heap.allocator, input[index]) catch { _ = self.formatMemoryFailure(line, column); return false; };
+                index += 1;
+                continue;
+            }
+            index += 1;
+            if (index < input.len and input[index] == '%') {
+                output.append(self.heap.allocator, '%') catch { _ = self.formatMemoryFailure(line, column); return false; };
+                index += 1;
+                continue;
+            }
+            const spec_start = index;
+            while (index < input.len and std.mem.indexOfScalar(u8, "#0-+ ", input[index]) != null) : (index += 1) {}
+            while (index < input.len and std.ascii.isDigit(input[index])) : (index += 1) {}
+            if (index < input.len and input[index] == '.') {
+                index += 1;
+                while (index < input.len and std.ascii.isDigit(input[index])) : (index += 1) {}
+            }
+            if (index >= input.len) return self.nativeTypeError(line, column, "incomplete format");
+            const kind = input[index];
+            index += 1;
+            if (std.mem.indexOfScalar(u8, "sradiuxXof", kind) == null) { _ = self.formatValueError(line, column, "unsupported format character"); return false; }
+            if (argument_index >= arguments.len) return self.nativeTypeError(line, column, "not enough arguments for format string");
+            const argument = arguments[argument_index];
+            argument_index += 1;
+            const conversion: u8 = if (kind == 's') 1 else if (kind == 'r') 2 else if (kind == 'a') 3 else 0;
+            const fmt_kind = if (conversion != 0) 's' else if (kind == 'i' or kind == 'u') 'd' else kind;
+            const fmt_spec = std.fmt.allocPrint(self.heap.allocator, "{s}{c}", .{ input[spec_start .. index - 1], fmt_kind }) catch { _ = self.formatMemoryFailure(line, column); return false; };
+            defer self.heap.allocator.free(fmt_spec);
+            const formatted = self.makeFormattedText(argument, fmt_spec, conversion, line, column) orelse return false;
+            defer self.heap.allocator.free(formatted);
+            output.appendSlice(self.heap.allocator, formatted) catch { _ = self.formatMemoryFailure(line, column); return false; };
+        }
+        if (argument_index < arguments.len) return self.nativeTypeError(line, column, "not all arguments converted during string formatting");
+        const owned = output.toOwnedSlice(self.heap.allocator) catch { _ = self.formatMemoryFailure(line, column); return false; };
+        defer self.heap.allocator.free(owned);
+        return self.storeStringResult(destination, string.create(&self.heap, owned), line, column);
     }
 
     fn storeNumberResult(self: *Runtime, destination: u16, result: number.ValueResult, line: u32, column: u32) bool {
@@ -3214,6 +4238,24 @@ pub const Runtime = struct {
             return true;
         }
         return false;
+    }
+
+    fn normalizeSearchBound(self: *Runtime, value: Value, length: usize, line: u32, column: u32) ?usize {
+        if (!number.isIntegerValue(value)) {
+            self.setException(.{ .kind = .type_error, .message = "slice indices must be integers" }, line, column, null);
+            return null;
+        }
+        const len = std.math.cast(i64, length) orelse std.math.maxInt(i64);
+        const converted = number.toInt(i64, value) orelse {
+            const order = number.compare(value, Value.fromSmallInt(0).?);
+            return switch (order) {
+                .value => |comparison| if (comparison == .less) 0 else length,
+                .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk null; },
+                .engine_error => blk: { _ = self.engineFault(); break :blk null; },
+            };
+        };
+        const adjusted = if (converted < 0) converted + len else converted;
+        return @intCast(@max(0, @min(len, adjusted)));
     }
 
     fn compareValues(self: *Runtime, left: Value, right: Value, operation: u8, line: u32, column: u32) ?bool {
@@ -3530,6 +4572,35 @@ fn indexOfName(names: []const []const u8, name: []const u8) ?usize {
     return null;
 }
 
+fn truncateUtf8(input: []const u8, codepoints: usize) []const u8 {
+    var byte_index: usize = 0;
+    var seen: usize = 0;
+    while (byte_index < input.len and seen < codepoints) : (seen += 1) {
+        const width = std.unicode.utf8ByteSequenceLength(input[byte_index]) catch 1;
+        byte_index = @min(input.len, byte_index + width);
+    }
+    return input[0..byte_index];
+}
+
+fn trimFloatZeros(input: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, input, '.') orelse return input;
+    var end = input.len;
+    while (end > dot + 1 and input[end - 1] == '0') end -= 1;
+    if (end == dot + 1) end = dot;
+    return input[0..end];
+}
+
+fn roundDecimalTieEven(value: f64, precision: usize) f64 {
+    if (!std.math.isFinite(value) or precision > 15) return value;
+    const scale = std.math.pow(f64, 10, @floatFromInt(precision));
+    const magnitude = @abs(value) * scale;
+    if (!std.math.isFinite(magnitude)) return value;
+    const whole = @floor(magnitude);
+    if (magnitude - whole != 0.5 or @rem(whole, 2.0) != 0) return value;
+    const bits: u64 = @bitCast(value);
+    return @bitCast(if (value < 0) bits + 1 else bits - 1);
+}
+
 fn compareOrder(order: std.math.Order, operation: u8) bool {
     return switch (operation) {
         2 => order == .lt,
@@ -3550,7 +4621,16 @@ fn compareNumericOrder(order: number.Comparison, operation: u8) bool {
     };
 }
 
+fn isAlign(character: u8) bool {
+    return character == '<' or character == '>' or character == '^';
+}
+
 fn builtinNative(name: []const u8) ?functions.Native {
+    if (std.mem.eql(u8, name, "str")) return .str_constructor;
+    if (std.mem.eql(u8, name, "format")) return .format_builtin;
+    if (std.mem.eql(u8, name, "sorted")) return .sorted;
+    if (std.mem.eql(u8, name, "map")) return .map;
+    if (std.mem.eql(u8, name, "filter")) return .filter;
     if (std.mem.eql(u8, name, "dict")) return .dict;
     if (std.mem.eql(u8, name, "set")) return .set;
     if (std.mem.eql(u8, name, "hash")) return .hash;
@@ -3603,6 +4683,7 @@ fn attributeNative(receiver: Value, name: []const u8) ?functions.Native {
         if (std.mem.eql(u8, name, "sort")) return .list_sort;
     }
     if (string.fromHeader(header) != null) {
+        if (std.mem.eql(u8, name, "format")) return .str_format;
         if (std.mem.eql(u8, name, "find")) return .str_find;
         if (std.mem.eql(u8, name, "index")) return .str_index;
         if (std.mem.eql(u8, name, "split")) return .str_split;

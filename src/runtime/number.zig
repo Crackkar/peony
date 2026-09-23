@@ -103,6 +103,22 @@ pub fn formatInteger(heap: *Heap, value: Value) ?exceptions.Result([]u8) {
     return .{ .value = big.integer.toString(heap.allocator, 10, .lower) catch return .{ .python_exception = .{ .kind = .memory_error, .message = "session memory limit exceeded" } } };
 }
 
+pub fn formatIntegerBase(heap: *Heap, value: Value, base: u8, case: std.fmt.Case) ?exceptions.Result([]u8) {
+    if (!isInteger(value) or base < 2 or base > 36) return null;
+    if (smallInteger(value)) |integer| {
+        const text = switch (base) {
+            2 => std.fmt.allocPrint(heap.allocator, "{b}", .{integer}),
+            8 => std.fmt.allocPrint(heap.allocator, "{o}", .{integer}),
+            10 => std.fmt.allocPrint(heap.allocator, "{d}", .{integer}),
+            16 => if (case == .upper) std.fmt.allocPrint(heap.allocator, "{X}", .{integer}) else std.fmt.allocPrint(heap.allocator, "{x}", .{integer}),
+            else => return null,
+        } catch return .{ .python_exception = .{ .kind = .memory_error, .message = "session memory limit exceeded" } };
+        return .{ .value = text };
+    }
+    const big = bigInteger(value) orelse return null;
+    return .{ .value = big.integer.toString(heap.allocator, base, case) catch return .{ .python_exception = .{ .kind = .memory_error, .message = "session memory limit exceeded" } } };
+}
+
 pub fn toFloat(heap: *Heap, value: Value) FloatResult {
     _ = heap;
     if (value.asFloat()) |float_value| return .{ .value = float_value };

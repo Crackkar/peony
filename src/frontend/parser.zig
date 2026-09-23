@@ -596,9 +596,7 @@ const Parser = struct {
         const token = self.current();
         if (token.kind == .integer) return self.leaf(.integer_literal, token);
         if (token.kind == .float) return self.leaf(.float_literal, token);
-        if (token.kind == .string) return self.leaf(.string_literal, token);
-        if (token.kind == .bytes) return self.leaf(.bytes_literal, token);
-        if (token.kind == .formatted_string) return self.failUnsupported(.later_commit, "f-string interior parsing is not implemented in this commit");
+        if (token.kind == .string or token.kind == .bytes or token.kind == .formatted_string) return self.parseAdjacentStrings(token);
         if (token.kind == .identifier) {
             const text = self.tokenText(token);
             if (std.mem.eql(u8, text, "None")) return self.leaf(.none_literal, token);
@@ -644,6 +642,164 @@ const Parser = struct {
         return self.addNode(.lambda_expression, .{ .start = start.start, .end = self.node(body).span.end }, "lambda", 0, children.items);
     }
 
+    fn parseAdjacentStrings(self: *Parser, first: Token) ParseError!NodeId {
+        var pieces: std.ArrayList(NodeId) = .empty;
+        var saw_formatted = false;
+        var saw_bytes = first.kind == .bytes;
+        var saw_text = first.kind != .bytes;
+        var current_token = first;
+        while (true) {
+            const piece = switch (current_token.kind) {
+                .formatted_string => blk: {
+                    saw_formatted = true;
+                    break :blk try self.parseFormattedString(current_token);
+                },
+                .bytes => try self.leaf(.bytes_literal, current_token),
+                .string => try self.leaf(.string_literal, current_token),
+                else => return self.failAtToken(current_token, "expected a string literal"),
+            };
+            try pieces.append(self.allocator, piece);
+            const next = self.current();
+            if (next.kind != .string and next.kind != .bytes and next.kind != .formatted_string) break;
+            if ((next.kind == .bytes and saw_text) or (next.kind != .bytes and saw_bytes)) return self.failAtToken(next, "cannot mix bytes and nonbytes literals");
+            saw_bytes = saw_bytes or next.kind == .bytes;
+            saw_text = saw_text or next.kind != .bytes;
+            current_token = next;
+        }
+        if (pieces.items.len == 1) return pieces.items[0];
+        return self.addNode(if (saw_formatted) .formatted_string_literal else .string_concatenation, .{ .start = first.start, .end = self.node(pieces.items[pieces.items.len - 1]).span.end }, "", @intFromBool(saw_bytes), pieces.items);
+    }
+
+    fn parseFormattedString(self: *Parser, token: Token) ParseError!NodeId {
+        _ = self.advance();
+        const spelling = self.tokenText(token);
+        var quote_at: usize = 0;
+        while (quote_at < spelling.len and spelling[quote_at] != '\'' and spelling[quote_at] != '"') : (quote_at += 1) {}
+        if (quote_at == spelling.len) return self.failAtToken(token, "invalid formatted string literal");
+        const quote = spelling[quote_at];
+        const triple = quote_at + 2 < spelling.len and spelling[quote_at + 1] == quote and spelling[quote_at + 2] == quote;
+        const delimiter_len: usize = if (triple) 3 else 1;
+        if (spelling.len < quote_at + 2 * delimiter_len) return self.failAtToken(token, "unterminated formatted string literal");
+        const content_start = quote_at + delimiter_len;
+        const content_end = spelling.len - delimiter_len;
+        const content = spelling[content_start..content_end];
+        const raw_prefix = std.mem.indexOfAny(u8, spelling[0..quote_at], "rR") != null;
+        var children: std.ArrayList(NodeId) = .empty;
+        var cursor: usize = 0;
+        var literal_start: usize = 0;
+        while (cursor < content.len) {
+            if (content[cursor] == '{' and cursor + 1 < content.len and content[cursor + 1] == '{') {
+                cursor += 2;
+                continue;
+            }
+            if (content[cursor] == '}') {
+                if (cursor + 1 < content.len and content[cursor + 1] == '}') {
+                    cursor += 2;
+                    continue;
+                }
+                return self.failAtToken(token, "single '}' is not allowed in formatted string literal");
+            }
+            if (content[cursor] != '{') {
+                cursor += utf8Length(content[cursor]);
+                continue;
+            }
+            if (cursor > literal_start) try children.append(self.allocator, try self.fstringLiteral(content[literal_start..cursor], quote, triple, raw_prefix, token.start + content_start + literal_start));
+            const field_start = cursor + 1;
+            const field_end = findFstringFieldEnd(content, field_start) orelse return self.failAtToken(token, "unterminated replacement field in formatted string");
+            const field = content[field_start..field_end];
+            var nesting: usize = 0;
+            var separator: ?usize = null;
+            var conversion: u8 = 0;
+            var conversion_at: ?usize = null;
+            var index: usize = 0;
+            while (index < field.len) : (index += 1) {
+                const ch = field[index];
+                if (ch == '\'' or ch == '"') {
+                    index = skipQuotedFstring(field, index, ch) - 1;
+                    continue;
+                }
+                if (ch == '(' or ch == '[' or ch == '{') {
+                    nesting += 1;
+                } else if ((ch == ')' or ch == ']' or ch == '}') and nesting != 0) {
+                    nesting -= 1;
+                } else if (nesting == 0 and ch == '!' and conversion_at == null and index + 1 < field.len and std.mem.indexOfScalar(u8, "sra", field[index + 1]) != null and (index + 2 == field.len or field[index + 2] == ':')) {
+                    conversion_at = index;
+                    conversion = field[index + 1];
+                } else if (nesting == 0 and ch == ':' and separator == null) {
+                    separator = index;
+                    break;
+                }
+            }
+            const expression_end = if (conversion_at) |converted| if (separator) |colon| @min(converted, colon) else converted else separator orelse field.len;
+            const expression_source = field[0..expression_end];
+            const expression_text = std.mem.trim(u8, expression_source, " \t\r\n");
+            if (expression_text.len == 0) return self.failAtToken(token, "empty replacement field in formatted string");
+            const trim_offset = @intFromPtr(expression_text.ptr) - @intFromPtr(expression_source.ptr);
+            const expression = try self.parseEmbeddedExpression(expression_text, token.start + content_start + field_start + trim_offset);
+            const spec = if (separator) |colon| field[colon + 1 ..] else "";
+            if (std.mem.indexOfScalar(u8, spec, '{') != null) return self.failUnsupported(.later_commit, "nested f-string format specifications are not supported");
+            const metadata = try self.allocator.alloc(u8, spec.len + 2);
+            metadata[0] = conversion;
+            metadata[1] = 0;
+            @memcpy(metadata[2..], spec);
+            const field_node = try self.addNode(.formatted_value, .{ .start = token.start + content_start + field_start, .end = token.start + content_start + field_end }, metadata, 0, &.{expression});
+            try children.append(self.allocator, field_node);
+            cursor = field_end + 1;
+            literal_start = cursor;
+        }
+        if (literal_start < content.len) try children.append(self.allocator, try self.fstringLiteral(content[literal_start..], quote, triple, raw_prefix, token.start + content_start + literal_start));
+        return self.addNode(.formatted_string_literal, tokenSpan(token), "", 0, children.items);
+    }
+
+    fn fstringLiteral(self: *Parser, content: []const u8, quote: u8, triple: bool, raw: bool, absolute_start: usize) ParseError!NodeId {
+        var literal = std.ArrayList(u8).empty;
+        const width: usize = if (triple) 3 else 1;
+        if (raw) try literal.append(self.allocator, 'r');
+        try literal.appendNTimes(self.allocator, quote, width);
+        var cursor: usize = 0;
+        while (cursor < content.len) {
+            if (cursor + 1 < content.len and content[cursor] == '{' and content[cursor + 1] == '{') {
+                try literal.append(self.allocator, '{');
+                cursor += 2;
+            } else if (cursor + 1 < content.len and content[cursor] == '}' and content[cursor + 1] == '}') {
+                try literal.append(self.allocator, '}');
+                cursor += 2;
+            } else {
+                try literal.append(self.allocator, content[cursor]);
+                cursor += 1;
+            }
+        }
+        try literal.appendNTimes(self.allocator, quote, width);
+        const text = try literal.toOwnedSlice(self.allocator);
+        return self.addNode(.string_literal, .{ .start = absolute_start, .end = absolute_start + content.len }, text, 0, &.{});
+    }
+
+    fn parseEmbeddedExpression(self: *Parser, source: []const u8, absolute_start: usize) ParseError!NodeId {
+        const tokenized = try lexer.tokenize(self.allocator, source);
+        const tokens = switch (tokenized) {
+            .tokens => |items| items,
+            .failure => |diagnostic| return self.failSpan(diagnostic.message, .{ .start = absolute_start + diagnostic.start, .end = absolute_start + diagnostic.end }),
+        };
+        var nested = Parser.init(self.allocator, source, tokens);
+        const root = nested.parseExpression(0) catch |err| {
+            if (err == error.ParseAbort) {
+                const diagnostic = nested.failure.?;
+                return self.failSpan(diagnostic.message, .{ .start = absolute_start + diagnostic.span.start, .end = absolute_start + diagnostic.span.end });
+            }
+            return error.OutOfMemory;
+        };
+        while (nested.at(.newline)) _ = nested.advance();
+        if (!nested.at(.endmarker)) return self.failSpan("unexpected text in formatted string expression", .{ .start = absolute_start + nested.current().start, .end = absolute_start + nested.current().end });
+        const remap = try self.allocator.alloc(NodeId, nested.nodes.items.len);
+        for (nested.nodes.items, 0..) |node_value, old_index| {
+            const child_ids = nested.childrenOf(@intCast(old_index));
+            const mapped = try self.allocator.alloc(NodeId, child_ids.len);
+            for (child_ids, 0..) |child, index| mapped[index] = remap[@intCast(child)];
+            remap[old_index] = try self.addNode(node_value.kind, .{ .start = absolute_start + node_value.span.start, .end = absolute_start + node_value.span.end }, node_value.text, node_value.flags, mapped);
+        }
+        return remap[@intCast(root)];
+    }
+
     fn parseParenthesized(self: *Parser) ParseError!NodeId {
         const opening = self.advance();
         if (self.atText(")")) {
@@ -651,7 +807,7 @@ const Parser = struct {
             return self.addNode(.tuple_display, .{ .start = opening.start, .end = closing.end }, "", 0, &.{});
         }
         const first = try self.parseExpression(0);
-        if (self.atText("for")) return self.failUnsupported(.later_commit, "comprehensions are not parsed in this commit");
+        if (self.atText("for")) return self.parseComprehension(first, opening.start, ast_module.comprehension_flags.generator, ")");
         if (!self.atText(",")) {
             const closing = try self.expectText(")", "expected ')' after expression");
             self.nodes.items[@intCast(first)].span = .{ .start = opening.start, .end = closing.end };
@@ -677,8 +833,12 @@ const Parser = struct {
             return self.addNode(.list_display, .{ .start = opening.start, .end = closing.end }, "", 0, &.{});
         }
         while (true) {
-            try items.append(self.allocator, try self.parseExpression(0));
-            if (self.atText("for")) return self.failUnsupported(.later_commit, "comprehensions are not parsed in this commit");
+            const first = try self.parseExpression(0);
+            try items.append(self.allocator, first);
+            if (self.atText("for")) {
+                if (items.items.len != 1) return self.failAtCurrent("invalid list comprehension display");
+                return self.parseComprehension(first, opening.start, ast_module.comprehension_flags.list, "]");
+            }
             if (!self.atText(",")) break;
             _ = self.advance();
             if (self.atText("]")) break;
@@ -705,15 +865,22 @@ const Parser = struct {
                 try items.append(self.allocator, unpack);
             } else {
             const key = try self.parseExpression(0);
-            if (self.atText("for")) return self.failUnsupported(.later_commit, "comprehensions are not parsed in this commit");
             if (self.atText(":")) {
                 if (!is_dict and items.items.len != 0) return self.failAtCurrent("cannot mix dictionary and set entries");
                 is_dict = true;
                 _ = self.advance();
                 const value = try self.parseExpression(0);
+                if (self.atText("for")) {
+                    const pair = try self.addNode(.tuple_display, .{ .start = self.node(key).span.start, .end = self.node(value).span.end }, "", 0, &.{ key, value });
+                    return self.parseComprehension(pair, opening.start, ast_module.comprehension_flags.dict, "}");
+                }
                 try items.appendSlice(self.allocator, &.{ key, value });
             } else {
                 if (is_dict) return self.failAtCurrent("cannot mix dictionary and set entries");
+                if (self.atText("for")) {
+                    if (items.items.len != 0) return self.failAtCurrent("invalid set comprehension display");
+                    return self.parseComprehension(key, opening.start, ast_module.comprehension_flags.set, "}");
+                }
                 try items.append(self.allocator, key);
             }
             }
@@ -723,6 +890,42 @@ const Parser = struct {
         }
         const closing = try self.expectText("}", "expected '}' after display");
         return self.addNode(if (is_dict) .dict_display else .set_display, .{ .start = opening.start, .end = closing.end }, "", 0, items.items);
+    }
+
+    fn parseComprehension(self: *Parser, result: NodeId, opening: usize, kind: u32, closing_text: []const u8) ParseError!NodeId {
+        var children: std.ArrayList(NodeId) = .empty;
+        while (self.atText("for")) {
+            const for_token = self.advance();
+            const target = try self.parseComprehensionTarget();
+            if (!self.atText("in")) return self.failAtCurrent("expected 'in' in comprehension clause");
+            _ = self.advance();
+            const iterable = try self.parseExpression(11);
+            var clause_children: std.ArrayList(NodeId) = .empty;
+            try clause_children.appendSlice(self.allocator, &.{ target, iterable });
+            while (self.atText("if")) {
+                _ = self.advance();
+                try clause_children.append(self.allocator, try self.parseExpression(11));
+            }
+            const clause_end = self.node(clause_children.items[clause_children.items.len - 1]).span.end;
+            const clause = try self.addNode(.comprehension_clause, .{ .start = for_token.start, .end = clause_end }, "", 0, clause_children.items);
+            try children.append(self.allocator, clause);
+        }
+        try children.append(self.allocator, result);
+        const closing = try self.expectText(closing_text, if (kind == ast_module.comprehension_flags.list) "expected ']' after comprehension" else if (kind == ast_module.comprehension_flags.dict or kind == ast_module.comprehension_flags.set) "expected '}' after comprehension" else "expected ')' after generator expression");
+        return self.addNode(.comprehension_expression, .{ .start = opening, .end = closing.end }, "", kind, children.items);
+    }
+
+    fn parseComprehensionTarget(self: *Parser) ParseError!NodeId {
+        const first = try self.parseExpression(140);
+        if (!self.atText(",")) return first;
+        var items: std.ArrayList(NodeId) = .empty;
+        try items.append(self.allocator, first);
+        while (self.atText(",")) {
+            _ = self.advance();
+            if (self.atText("in")) break;
+            try items.append(self.allocator, try self.parseExpression(140));
+        }
+        return self.addNode(.tuple_display, .{ .start = self.node(first).span.start, .end = self.node(items.items[items.items.len - 1]).span.end }, "", 0, items.items);
     }
 
     fn parseCallArguments(self: *Parser) ParseError![]const NodeId {
@@ -982,6 +1185,38 @@ const Parser = struct {
 };
 
 const TargetMode = enum { assignment, delete, augmented, annotated, named };
+
+fn skipQuotedFstring(source: []const u8, start: usize, quote: u8) usize {
+    var index = start + 1;
+    while (index < source.len) : (index += 1) {
+        if (source[index] == '\\') {
+            index += 1;
+            continue;
+        }
+        if (source[index] == quote) return index + 1;
+    }
+    return source.len;
+}
+
+fn findFstringFieldEnd(source: []const u8, start: usize) ?usize {
+    var braces: usize = 0;
+    var index = start;
+    while (index < source.len) {
+        const ch = source[index];
+        if (ch == '\'' or ch == '"') {
+            index = skipQuotedFstring(source, index, ch);
+            continue;
+        }
+        if (ch == '{') {
+            braces += 1;
+        } else if (ch == '}') {
+            if (braces == 0) return index;
+            braces -= 1;
+        }
+        index += 1;
+    }
+    return null;
+}
 
 fn tokenSpan(token: Token) Span {
     return .{ .start = token.start, .end = token.end };

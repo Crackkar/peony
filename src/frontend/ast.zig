@@ -37,6 +37,8 @@ pub const Kind = enum {
     string_literal,
     bytes_literal,
     formatted_string_literal,
+    formatted_value,
+    string_concatenation,
     none_literal,
     bool_literal,
     tuple_display,
@@ -72,6 +74,13 @@ pub const parameter_flags = struct {
 
 pub const function_flags = struct {
     pub const has_return_annotation: u32 = 1 << 0;
+};
+
+pub const comprehension_flags = struct {
+    pub const list: u32 = 1;
+    pub const set: u32 = 2;
+    pub const dict: u32 = 3;
+    pub const generator: u32 = 4;
 };
 
 /// Children occupy one contiguous range in Ast.children. Names, literal spellings,

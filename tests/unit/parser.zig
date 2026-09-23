@@ -208,8 +208,10 @@ pub fn testSuiteErrors() !void {
 }
 
 pub fn testUnsupportedFeatures() !void {
-    try expectUnsupported("items = [x for x in values]\n", .later_commit, "comprehension");
-    try expectUnsupported("message = f'{name}'\n", .later_commit, "f-string");
+    var comp_ast = try expectAst("items = [x for x in values]\n");
+    comp_ast.deinit();
+    var fstring_ast = try expectAst("message = f'{name}'\n");
+    fstring_ast.deinit();
     try expectUnsupported("try:\n    pass\n", .later_commit, "try");
     try expectUnsupported("async def f():\n    pass\n", .excluded, "async");
     try expectUnsupported("result = (yield from values)\n", .excluded, "yield from");

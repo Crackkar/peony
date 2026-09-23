@@ -150,6 +150,7 @@ const Compiler = struct {
     unpack_sites: std.ArrayList(bytecode.UnpackSite) = .empty,
     sequence_sites: std.ArrayList(bytecode.SequenceSite) = .empty,
     slice_sites: std.ArrayList(bytecode.SliceSite) = .empty,
+    format_sites: std.ArrayList(bytecode.FormatSite) = .empty,
     nested_codes: std.ArrayList(*Code) = .empty,
     local_names: std.ArrayList([]const u8) = .empty,
     cell_names: std.ArrayList([]const u8) = .empty,
@@ -313,6 +314,7 @@ const Compiler = struct {
         self.code.unpack_sites = try self.unpack_sites.toOwnedSlice(self.allocator);
         self.code.sequence_sites = try self.sequence_sites.toOwnedSlice(self.allocator);
         self.code.slice_sites = try self.slice_sites.toOwnedSlice(self.allocator);
+        self.code.format_sites = try self.format_sites.toOwnedSlice(self.allocator);
         self.code.nested_codes = try self.nested_codes.toOwnedSlice(self.allocator);
         self.code.positions = try self.positions.toOwnedSlice(self.allocator);
         return self.code;
@@ -342,6 +344,8 @@ const Compiler = struct {
         self.unpack_sites.deinit(self.allocator);
         self.sequence_sites.deinit(self.allocator);
         self.slice_sites.deinit(self.allocator);
+        for (self.format_sites.items) |site| self.allocator.free(site.spec);
+        self.format_sites.deinit(self.allocator);
         self.nested_codes.deinit(self.allocator);
         self.positions.deinit(self.allocator);
         if (@intFromPtr(self.code) != 0) self.code.deinit(self.heap);
@@ -755,6 +759,11 @@ const Compiler = struct {
             .comparison_chain => return self.compileComparisonChain(node_id),
             .conditional_expression => return self.compileConditional(node_id),
             .call => return self.compileCall(node_id),
+            .lambda_expression => return self.compileLambda(node_id),
+            .named_expression => return self.compileNamedExpression(node_id),
+            .string_concatenation => return self.compileStringConcatenation(node_id),
+            .comprehension_expression => return self.compileComprehension(node_id),
+            .formatted_string_literal => return self.compileFormattedString(node_id),
             .list_display => return self.compileSequence(node_id, false),
             .tuple_display => return self.compileSequence(node_id, true),
             .set_display => return self.compileMappingDisplay(node_id, true),
@@ -767,6 +776,309 @@ const Compiler = struct {
             },
             else => return self.failUnsupported(node.span, expressionUnsupportedMessage(node.kind)),
         }
+    }
+
+    fn compileNamedExpression(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len != 2 or self.ast.node(children[0]).kind != .name) return self.failUnsupported(node.span, "assignment expression shape is unsupported");
+        const value = try self.compileExpression(children[1]);
+        const target = self.ast.node(children[0]);
+        const binding = self.analysis.bindingOf(children[0]) orelse return self.failUnsupported(target.span, "assignment expression binding metadata is missing");
+        try self.compileStoreName(value, target.text, binding, target.span);
+        return value;
+    }
+
+    fn compileLambda(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len == 0) return self.failUnsupported(node.span, "lambda expression shape is unsupported");
+        const parameter_ids = children[0 .. children.len - 1];
+        const body_id = children[children.len - 1];
+        const lambda_scope = self.analysis.scopeForNode(node_id) orelse return self.failUnsupported(node.span, "lambda scope metadata is missing");
+        const nested_code = try self.compileNestedLambda(lambda_scope, body_id, parameter_ids, node.span);
+        const nested_index = std.math.cast(u32, self.nested_codes.items.len) orelse return self.failUnsupported(node.span, "too many nested code objects");
+        self.nested_codes.append(self.allocator, nested_code) catch {
+            nested_code.deinit(self.heap);
+            return error.OutOfMemory;
+        };
+        const destination = try self.acquire(node.span);
+        var held: std.ArrayList(u16) = .empty;
+        defer held.deinit(self.scratch_allocator);
+        var defaults: std.ArrayList(u16) = .empty;
+        defer defaults.deinit(self.scratch_allocator);
+        for (parameter_ids) |parameter_id| {
+            const parameter = self.ast.node(parameter_id);
+            if (parameter.flags & ast_module.parameter_flags.has_default == 0) continue;
+            const parameter_children = self.ast.children(parameter_id);
+            const default_index: usize = if (parameter.flags & ast_module.parameter_flags.has_annotation != 0) 1 else 0;
+            const value = try self.compileExpression(parameter_children[default_index]);
+            try held.append(self.scratch_allocator, value);
+            try defaults.append(self.scratch_allocator, value);
+        }
+        const value_start = std.math.cast(u32, self.argument_registers.items.len) orelse return self.failUnsupported(node.span, "too many lambda defaults");
+        try self.argument_registers.appendSlice(self.allocator, defaults.items);
+        const site_index = std.math.cast(u32, self.function_sites.items.len) orelse return self.failUnsupported(node.span, "too many function definition sites");
+        try self.function_sites.append(self.allocator, .{
+            .code_index = nested_index,
+            .value_start = value_start,
+            .default_count = std.math.cast(u16, defaults.items.len) orelse return self.failUnsupported(node.span, "too many lambda defaults"),
+            .annotation_count = 0,
+            .has_return_annotation = false,
+        });
+        try self.emitIndex(.make_function, destination, site_index, 0, node.span);
+        while (held.items.len != 0) self.temps.release(held.pop().?);
+        return destination;
+    }
+
+    fn compileNestedLambda(self: *Compiler, scope_id: scope_module.ScopeId, body_id: NodeId, parameters: []const NodeId, span: Span) CompileError!*Code {
+        var nested = Compiler.initNested(self, scope_id, "<lambda>") catch return error.OutOfMemory;
+        var keep_code = false;
+        defer if (!keep_code) nested.discardCode();
+        nested.appendParameterMetadata(parameters) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        const value = nested.compileExpression(body_id) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        nested.emit(.return_value, value, 0, 0, 0, span) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        nested.temps.release(value);
+        const code = nested.finishCode() catch return error.OutOfMemory;
+        keep_code = true;
+        return code;
+    }
+
+    fn compileStringConcatenation(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len == 0) return self.failUnsupported(node.span, "empty adjacent string sequence");
+        const result = try self.compileExpression(children[0]);
+        for (children[1..]) |child_id| {
+            const right = self.compileExpression(child_id) catch |err| {
+                self.temps.release(result);
+                return err;
+            };
+            try self.emit(.binary, result, right, 0, @intFromEnum(BinaryOperation.add), self.ast.node(child_id).span);
+            self.temps.release(right);
+        }
+        return result;
+    }
+
+    fn compileFormattedString(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len == 0) return self.loadConstant(try self.createStringConstant("", node.span), node.span);
+        var result: ?u16 = null;
+        for (children) |child_id| {
+            const child = self.ast.node(child_id);
+            var value: u16 = undefined;
+            if (child.kind == .formatted_value) {
+                const fields = self.ast.children(child_id);
+                if (fields.len != 1 or child.text.len < 2) return self.failUnsupported(child.span, "formatted value shape is unsupported");
+                value = try self.acquire(child.span);
+                const expression = self.compileExpression(fields[0]) catch |err| {
+                    self.temps.release(value);
+                    return err;
+                };
+                const spec = child.text[2..];
+                const owned_spec = self.allocator.dupe(u8, spec) catch {
+                    self.temps.release(expression);
+                    self.temps.release(value);
+                    return error.OutOfMemory;
+                };
+                const site_index = std.math.cast(u32, self.format_sites.items.len) orelse {
+                    self.allocator.free(owned_spec);
+                    self.temps.release(expression);
+                    self.temps.release(value);
+                    return self.failUnsupported(child.span, "too many format specifications");
+                };
+                self.format_sites.append(self.allocator, .{ .spec = owned_spec }) catch {
+                    self.allocator.free(owned_spec);
+                    self.temps.release(expression);
+                    self.temps.release(value);
+                    return error.OutOfMemory;
+                };
+                const conversion: u8 = switch (child.text[0]) {
+                    0 => 0,
+                    's' => 1,
+                    'r' => 2,
+                    'a' => 3,
+                    else => {
+                        self.temps.release(expression);
+                        self.temps.release(value);
+                        return self.failSyntax(child.span, "invalid formatted string conversion");
+                    },
+                };
+                if (site_index > std.math.maxInt(u16)) {
+                    self.temps.release(expression);
+                    self.temps.release(value);
+                    return self.failUnsupported(child.span, "too many format specifications");
+                }
+                try self.emit(.format_value, value, expression, site_index, conversion, child.span);
+                self.temps.release(expression);
+            } else {
+                value = try self.compileExpression(child_id);
+            }
+            if (result) |accumulated| {
+                try self.emit(.binary, accumulated, value, 0, @intFromEnum(BinaryOperation.add), child.span);
+                self.temps.release(value);
+            } else result = value;
+        }
+        return result.?;
+    }
+
+    fn createStringConstant(self: *Compiler, text: []const u8, span: Span) CompileError!Value {
+        return switch (string.create(self.heap, text)) {
+            .value => |selected| Value.object(&selected.header),
+            .python_exception => |exception| {
+                self.pending_exception = exception;
+                _ = span;
+                return error.PythonFault;
+            },
+            .engine_error => return error.PythonFault,
+        };
+    }
+
+    fn compileComprehension(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len < 2) return self.failUnsupported(node.span, "comprehension shape is unsupported");
+        const kind = node.flags;
+        const first_clause = self.ast.children(children[0]);
+        if (first_clause.len < 2) return self.failUnsupported(node.span, "comprehension clause shape is unsupported");
+        const outer_source = try self.compileExpression(first_clause[1]);
+        try self.emit(.get_iterator, outer_source, outer_source, 0, 0, self.ast.node(first_clause[1]).span);
+
+        const comp_scope = self.analysis.scopeForNode(node_id) orelse return self.failUnsupported(node.span, "comprehension scope metadata is missing");
+        const nested_code = try self.compileNestedComprehension(comp_scope, node_id, outer_source, kind);
+        const nested_index = std.math.cast(u32, self.nested_codes.items.len) orelse return self.failUnsupported(node.span, "too many nested code objects");
+        self.nested_codes.append(self.allocator, nested_code) catch {
+            nested_code.deinit(self.heap);
+            return error.OutOfMemory;
+        };
+        const function_site = std.math.cast(u32, self.function_sites.items.len) orelse return self.failUnsupported(node.span, "too many function definition sites");
+        try self.function_sites.append(self.allocator, .{ .code_index = nested_index, .value_start = 0, .default_count = 0, .annotation_count = 0, .has_return_annotation = false });
+        const function_register = try self.acquire(node.span);
+        try self.emitIndex(.make_function, function_register, function_site, 0, node.span);
+        if (kind == ast_module.comprehension_flags.generator) {
+            try self.emit(.make_generator, outer_source, function_register, outer_source, 0, node.span);
+            self.temps.release(function_register);
+            return outer_source;
+        }
+        const call_arg_start = std.math.cast(u32, self.call_arguments.items.len) orelse return self.failUnsupported(node.span, "too many call operands");
+        try self.call_arguments.append(self.allocator, .{ .register = outer_source });
+        const call_site = std.math.cast(u32, self.call_sites.items.len) orelse return self.failUnsupported(node.span, "too many call sites");
+        try self.call_sites.append(self.allocator, .{ .argument_start = call_arg_start, .argument_count = 1 });
+        try self.emitIndex(.call, function_register, call_site, 0, node.span);
+        try self.emit(.move, outer_source, function_register, 0, 0, node.span);
+        self.temps.release(function_register);
+        return outer_source;
+    }
+
+    fn compileNestedComprehension(self: *Compiler, scope_id: scope_module.ScopeId, node_id: NodeId, _: u16, kind: u32) CompileError!*Code {
+        const node = self.ast.node(node_id);
+        var nested = Compiler.initNested(self, scope_id, if (kind == ast_module.comprehension_flags.list) "<listcomp>" else if (kind == ast_module.comprehension_flags.set) "<setcomp>" else if (kind == ast_module.comprehension_flags.generator) "<genexpr>" else "<dictcomp>") catch return error.OutOfMemory;
+        var keep_code = false;
+        defer if (!keep_code) nested.discardCode();
+        const outer_name = "\x00peony-outer-iterator";
+        const owned_local = nested.allocator.dupe(u8, outer_name) catch return error.OutOfMemory;
+        nested.local_names.append(nested.allocator, owned_local) catch {
+            nested.allocator.free(owned_local);
+            return error.OutOfMemory;
+        };
+        const owned_parameter = nested.allocator.dupe(u8, outer_name) catch return error.OutOfMemory;
+        nested.parameter_names.append(nested.allocator, owned_parameter) catch {
+            nested.allocator.free(owned_parameter);
+            return error.OutOfMemory;
+        };
+        try nested.parameter_flags.append(nested.allocator, 0);
+        nested.code.signature = .{ .positional_count = 1 };
+
+        const result_register = try nested.acquire(node.span);
+        if (kind == ast_module.comprehension_flags.list) {
+            const site = std.math.cast(u32, nested.sequence_sites.items.len) orelse return nested.failUnsupported(node.span, "too many sequence displays");
+            try nested.sequence_sites.append(nested.allocator, .{ .argument_start = 0, .argument_count = 0, .is_tuple = false });
+            try nested.emitIndex(.make_sequence, result_register, site, 0, node.span);
+        } else if (kind == ast_module.comprehension_flags.generator) {
+            try nested.emit(.load_none, result_register, 0, 0, 0, node.span);
+        } else {
+            try nested.emit(.make_mapping, result_register, 0, 0, @intFromBool(kind == ast_module.comprehension_flags.set), node.span);
+        }
+        try nested.compileComprehensionClause(node_id, 0, outer_name, kind, result_register);
+        try nested.emit(.return_value, result_register, 0, 0, 0, node.span);
+        nested.temps.release(result_register);
+        const code = nested.finishCode() catch return error.OutOfMemory;
+        keep_code = true;
+        return code;
+    }
+
+    fn compileComprehensionClause(self: *Compiler, node_id: NodeId, clause_index: usize, outer_name: []const u8, kind: u32, result_register: u16) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const clause_id = children[clause_index];
+        const clause = self.ast.children(clause_id);
+        if (clause.len < 2) return self.failUnsupported(self.ast.node(clause_id).span, "comprehension clause shape is unsupported");
+        const iterator_register = try self.acquire(self.ast.node(clause_id).span);
+        if (clause_index == 0) {
+            const local_index = try self.internName(outer_name);
+            try self.emitIndex(.load_local, iterator_register, local_index, @intFromEnum(bytecode.LocalBinding.local), self.ast.node(clause_id).span);
+        } else {
+            const source = try self.compileExpression(clause[1]);
+            try self.emit(.get_iterator, iterator_register, source, 0, 0, self.ast.node(clause[1]).span);
+            self.temps.release(source);
+        }
+        const item_register = try self.acquire(self.ast.node(clause[0]).span);
+        const has_item = try self.acquire(self.ast.node(clause[0]).span);
+        const loop_start = try self.currentTarget(self.ast.node(clause_id).span);
+        try self.emit(.for_next, item_register, iterator_register, has_item, 0, self.ast.node(clause_id).span);
+        const exhausted = try self.emitJump(.jump_if_false, has_item, 0, self.ast.node(clause_id).span);
+        try self.compileStoreTarget(clause[0], item_register);
+        var filter_jumps: std.ArrayList(u32) = .empty;
+        for (clause[2..]) |filter| {
+            const condition = try self.compileExpression(filter);
+            try filter_jumps.append(self.scratch_allocator, try self.emitJump(.jump_if_false, condition, 0, self.ast.node(filter).span));
+            self.temps.release(condition);
+        }
+        if (clause_index + 1 < children.len - 1) {
+            try self.compileComprehensionClause(node_id, clause_index + 1, outer_name, kind, result_register);
+        } else {
+            const result_id = children[children.len - 1];
+            if (kind == ast_module.comprehension_flags.dict) {
+                const pair = self.ast.children(result_id);
+                if (self.ast.node(result_id).kind != .tuple_display or pair.len != 2) return self.failUnsupported(self.ast.node(result_id).span, "dictionary comprehension result shape is unsupported");
+                const key = try self.compileExpression(pair[0]);
+                const value = self.compileExpression(pair[1]) catch |err| {
+                    self.temps.release(key);
+                    return err;
+                };
+                try self.emit(.mapping_set, result_register, key, value, 0, self.ast.node(result_id).span);
+                self.temps.release(value);
+                self.temps.release(key);
+            } else {
+                const value = try self.compileExpression(result_id);
+                if (kind == ast_module.comprehension_flags.list) {
+                    try self.emit(.list_append_value, result_register, value, 0, 0, self.ast.node(result_id).span);
+                } else if (kind == ast_module.comprehension_flags.generator) {
+                    try self.emit(.yield_value, value, 0, 0, 0, self.ast.node(result_id).span);
+                } else try self.emit(.mapping_set, result_register, value, 0, 1, self.ast.node(result_id).span);
+                self.temps.release(value);
+            }
+        }
+        for (filter_jumps.items) |jump_index| try self.patchJump(jump_index, loop_start);
+        _ = try self.emitJump(.jump, 0, loop_start, self.ast.node(clause_id).span);
+        const end_target = try self.currentTarget(node.span);
+        try self.patchJump(exhausted, end_target);
+        self.temps.release(has_item);
+        self.temps.release(item_register);
+        self.temps.release(iterator_register);
     }
 
     fn compileUnary(self: *Compiler, node_id: NodeId) CompileError!u16 {

@@ -277,6 +277,7 @@ const Builder = struct {
         if (children.len == 0) return;
         const body_id = children[children.len - 1];
         const lambda_scope = try self.addScope(.function, lambda_id, body_id, parent_scope);
+        self.node_scopes[@intCast(lambda_id)] = lambda_scope;
         for (children[0 .. children.len - 1]) |child| {
             const parameter = self.ast.node(child);
             if (parameter.kind == .parameter) {

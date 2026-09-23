@@ -292,11 +292,13 @@ const Lexer = struct {
         const quote = self.source[quote_pos];
         const prefix = self.source[start..quote_pos];
         const category = stringPrefixCategory(prefix) orelse return self.makeDiagnostic(.syntax_error, "invalid string prefix", start, quote_pos + 1, start_line, start_column);
+        const formatted = category == .formatted_string;
         const triple = quote_pos + 2 < self.source.len and self.source[quote_pos + 1] == quote and self.source[quote_pos + 2] == quote;
         while (self.pos < quote_pos) self.advanceAscii();
         const delim_len: usize = if (triple) 3 else 1;
         self.advanceAsciiN(delim_len);
         var escaped = false;
+        var replacement_depth: usize = 0;
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
             if (c == '\n' or c == '\r') {
@@ -311,6 +313,38 @@ const Lexer = struct {
                 continue;
             }
             if (category == .bytes and c >= 0x80) return self.makeDiagnostic(.syntax_error, "bytes literals may contain only ASCII source characters", self.pos, self.pos + utf8Len(c), self.line, self.column);
+            if (formatted and replacement_depth != 0 and !escaped and (c == '\'' or c == '"')) {
+                const expression_quote = c;
+                const expression_triple = self.pos + 2 < self.source.len and self.source[self.pos + 1] == expression_quote and self.source[self.pos + 2] == expression_quote;
+                self.advanceAsciiN(if (expression_triple) 3 else 1);
+                while (self.pos < self.source.len) {
+                    const inner = self.source[self.pos];
+                    if (inner == '\\') {
+                        self.advanceAscii();
+                        if (self.pos < self.source.len) self.advanceCodepoint();
+                        continue;
+                    }
+                    if (inner == expression_quote) {
+                        if (!expression_triple) {
+                            self.advanceAscii();
+                            break;
+                        }
+                        if (self.pos + 2 < self.source.len and self.source[self.pos + 1] == expression_quote and self.source[self.pos + 2] == expression_quote) {
+                            self.advanceAsciiN(3);
+                            break;
+                        }
+                    }
+                    self.advanceCodepoint();
+                }
+                continue;
+            }
+            if (formatted and !escaped) {
+                if (c == '{' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{' and replacement_depth == 0) {
+                    self.advanceAsciiN(2);
+                    continue;
+                }
+                if (c == '{') replacement_depth += 1 else if (c == '}' and replacement_depth != 0) replacement_depth -= 1;
+            }
             if (escaped) {
                 escaped = false;
                 self.advanceCodepoint();

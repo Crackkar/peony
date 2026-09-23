@@ -234,7 +234,7 @@ pub fn testFunctionConstructionMemoryErrorAndRecovery() !void {
     try std.testing.expectEqualStrings("recovered\n", runtime.stdout());
 }
 
-pub fn testDictionaryUnpackingRemainsExplicitlyUnsupported() !void {
+pub fn testEmptyDoubleStarExpansion() !void {
     try expectOutput("print(1, **{})\n", "1\n");
 }
 

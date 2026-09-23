@@ -152,6 +152,20 @@ pub fn build(b: *std.Build) void {
     mapping_test_module.addImport("runtime_dict", native_runtime.dict);
     mapping_test_module.addImport("runtime_value", native_runtime.value);
     mapping_test_module.addImport("runtime_string", native_runtime.string);
+    const comprehension_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/comprehensions.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    comprehension_test_module.addImport("runtime_vm", runtime_vm_module);
+    comprehension_test_module.addImport("runtime_exception", native_runtime.exception);
+    const formatting_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/formatting.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    formatting_test_module.addImport("runtime_vm", runtime_vm_module);
+    formatting_test_module.addImport("runtime_exception", native_runtime.exception);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -186,6 +200,8 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("functions_tests", functions_test_module);
     unit_test_root.addImport("sequence_tests", sequence_test_module);
     unit_test_root.addImport("mapping_tests", mapping_test_module);
+    unit_test_root.addImport("comprehension_tests", comprehension_test_module);
+    unit_test_root.addImport("formatting_tests", formatting_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");

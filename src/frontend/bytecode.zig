@@ -38,6 +38,10 @@ pub const Opcode = enum(u8) {
     mapping_set,
     mapping_update,
     materialize_dstar,
+    list_append_value,
+    format_value,
+    make_generator,
+    yield_value,
 };
 
 /// Fixed 64-bit register instruction. The least-significant byte is the opcode;
@@ -105,6 +109,10 @@ pub const Instruction = struct {
             33 => .mapping_set,
             34 => .mapping_update,
             35 => .materialize_dstar,
+            36 => .list_append_value,
+            37 => .format_value,
+            38 => .make_generator,
+            39 => .yield_value,
             else => null,
         };
     }
@@ -198,6 +206,10 @@ pub const SliceSite = struct {
     step: u16,
 };
 
+pub const FormatSite = struct {
+    spec: []const u8,
+};
+
 pub const code_flags = struct {
     pub const function: u32 = 1 << 0;
 };
@@ -221,6 +233,7 @@ pub const Code = struct {
     unpack_sites: []UnpackSite = &.{},
     sequence_sites: []SequenceSite = &.{},
     slice_sites: []SliceSite = &.{},
+    format_sites: []FormatSite = &.{},
     nested_codes: []*Code = &.{},
     positions: []SourcePosition = &.{},
     filename: []const u8 = "",
@@ -256,6 +269,8 @@ pub const Code = struct {
         self.allocator.free(self.unpack_sites);
         self.allocator.free(self.sequence_sites);
         self.allocator.free(self.slice_sites);
+        for (self.format_sites) |site| self.allocator.free(site.spec);
+        self.allocator.free(self.format_sites);
         self.allocator.free(self.nested_codes);
         self.allocator.free(self.positions);
         self.allocator.free(self.filename);

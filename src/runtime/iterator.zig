@@ -11,7 +11,7 @@ const exceptions = @import("runtime_exception");
 
 const Heap = gc.Heap;
 const Value = value_module.Value;
-const IteratorMode = enum { basic, enumerate, zip, reversed };
+const IteratorMode = enum { basic, enumerate, zip, reversed, map, filter, generator };
 
 const IteratorInitial = struct {
     mode: IteratorMode = .basic,
@@ -25,6 +25,7 @@ const IteratorInitial = struct {
     reverse_source: Value = Value.noneValue(),
     reverse_index: usize = 0,
     mapping_iterator: ?*dict_module.DictIterator = null,
+    callback: Value = Value.noneValue(),
 };
 
 pub const Range = struct {
@@ -52,6 +53,13 @@ pub const Iterator = struct {
     reverse_source: Value = Value.noneValue(),
     reverse_index: usize = 0,
     mapping_iterator: ?*dict_module.DictIterator = null,
+    callback: Value = Value.noneValue(),
+    started: bool = false,
+    generator_frame: ?*anyopaque = null,
+    generator_roots: []gc.Root = &.{},
+    generator_done: bool = false,
+    generator_yielded: ?Value = null,
+    generator_frame_destroy: ?*const fn (*anyopaque, std.mem.Allocator) void = null,
 };
 
 pub const NextResult = union(enum) {
@@ -87,6 +95,9 @@ fn traceIterator(header: *gc.Header, tracer: *gc.Tracer) void {
     tracer.visit(iterator.enumerate_index.asObject());
     for (iterator.enumerate_values) |value| tracer.visit(value.asObject());
     tracer.visit(iterator.reverse_source.asObject());
+    tracer.visit(iterator.callback.asObject());
+    if (iterator.generator_yielded) |value| tracer.visit(value.asObject());
+    for (iterator.generator_roots) |root| tracer.visit(root.object);
 }
 
 fn destroyIterator(header: *gc.Header, allocator: std.mem.Allocator) void {
@@ -95,6 +106,11 @@ fn destroyIterator(header: *gc.Header, allocator: std.mem.Allocator) void {
     if (iterator.values.len != 0) allocator.free(iterator.values);
     iterator.children = &.{};
     iterator.values = &.{};
+    if (iterator.generator_frame) |frame| {
+        if (iterator.generator_frame_destroy) |destroy| destroy(frame, allocator);
+    }
+    iterator.generator_frame = null;
+    iterator.generator_roots = &.{};
 }
 
 pub fn rangeFromHeader(header: *gc.Header) ?*Range {
@@ -514,6 +530,72 @@ pub fn createReversed(heap: *Heap, value: Value) exceptions.Result(*Iterator) {
     return createInitialized(heap, .{ .mode = .reversed, .reverse_source = value, .reverse_index = length });
 }
 
+pub fn createMapFilter(heap: *Heap, is_filter: bool, callback: Value, sources: []const Value) exceptions.Result(*Iterator) {
+    if (sources.len == 0 or (is_filter and sources.len != 1)) return pythonError(*Iterator, .type_error, "invalid map or filter iterable count");
+    const children = heap.allocator.alloc(?*Iterator, sources.len) catch return pythonError(*Iterator, .memory_error, "session memory limit exceeded");
+    @memset(children, null);
+    const values = heap.allocator.alloc(Value, sources.len) catch {
+        heap.allocator.free(children);
+        return pythonError(*Iterator, .memory_error, "session memory limit exceeded");
+    };
+    var arrays_owned = true;
+    defer if (arrays_owned) {
+        heap.allocator.free(values);
+        heap.allocator.free(children);
+    };
+    @memset(values, Value.noneValue());
+    const root_count = sources.len * 2 + 1;
+    const roots = heap.allocator.alloc(gc.Root, root_count) catch return pythonError(*Iterator, .memory_error, "session memory limit exceeded");
+    defer heap.allocator.free(roots);
+    @memset(roots, .{ .object = null });
+    roots[0].object = callback.asObject();
+    for (sources, 0..) |source, index| roots[index + 1].object = source.asObject();
+    var frame = gc.RootFrame{};
+    frame.push(&heap.roots);
+    for (roots) |*root| frame.add(root);
+    defer frame.pop();
+    for (sources, 0..) |source, index| {
+        const source_result = createIterator(heap, source);
+        const source_iterator = switch (source_result) {
+            .value => |selected| selected,
+            .python_exception => |exception| return .{ .python_exception = exception },
+            .engine_error => |failure| return .{ .engine_error = failure },
+        };
+        children[index] = source_iterator;
+        roots[sources.len + 1 + index].object = &source_iterator.header;
+    }
+    const created = createInitialized(heap, .{ .mode = if (is_filter) .filter else .map, .inner = children[0], .callback = callback });
+    const result = switch (created) {
+        .value => |selected| selected,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    result.children = children;
+    result.values = values;
+    arrays_owned = false;
+    return .{ .value = result };
+}
+
+pub fn createGenerator(heap: *Heap, callback: Value, outer: Value) exceptions.Result(*Iterator) {
+    const header = outer.asObject() orelse return pythonError(*Iterator, .type_error, "generator outer expression is not an iterator");
+    const source_iterator = iteratorFromHeader(header) orelse return pythonError(*Iterator, .type_error, "generator outer expression is not an iterator");
+    var roots = [_]gc.Root{ .{ .object = callback.asObject() }, .{ .object = &source_iterator.header } };
+    var frame = gc.RootFrame{};
+    frame.push(&heap.roots);
+    for (&roots) |*root| frame.add(root);
+    defer frame.pop();
+    return createInitialized(heap, .{ .mode = .generator, .inner = source_iterator, .callback = callback });
+}
+
+pub fn deferredKind(selected: *const Iterator) ?enum { map, filter, generator } {
+    return switch (selected.mode) {
+        .map => .map,
+        .filter => .filter,
+        .generator => .generator,
+        else => null,
+    };
+}
+
 fn createInitialized(heap: *Heap, initial: IteratorInitial) exceptions.Result(*Iterator) {
     const iterator = heap.createObject(Iterator, &iterator_kind) catch return pythonError(*Iterator, .memory_error, "session memory limit exceeded");
     const header = iterator.header;
@@ -530,6 +612,7 @@ fn createInitialized(heap: *Heap, initial: IteratorInitial) exceptions.Result(*I
         .reverse_source = initial.reverse_source,
         .reverse_index = initial.reverse_index,
         .mapping_iterator = initial.mapping_iterator,
+        .callback = initial.callback,
     };
     return .{ .value = iterator };
 }
@@ -539,7 +622,7 @@ pub fn next(heap: *Heap, iterator: *Iterator) NextResult {
         .enumerate => return nextEnumerate(heap, iterator),
         .zip => return nextZip(heap, iterator),
         .reversed => return nextReversed(heap, iterator),
-        .basic => {},
+        .basic, .map, .filter, .generator => {},
     }
     if (iterator.range) |range| return nextRange(heap, iterator, range);
     if (iterator.mapping_iterator) |mapping_iterator| return switch (dict_module.next(heap, mapping_iterator)) {
