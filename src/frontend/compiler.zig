@@ -16,6 +16,7 @@ const Kind = ast_module.Kind;
 const Span = ast_module.Span;
 const Value = value_module.Value;
 const Code = bytecode.Code;
+const Binding = scope_module.Binding;
 
 pub const DiagnosticKind = enum { syntax_error, unsupported };
 
@@ -71,6 +72,11 @@ pub fn compile(heap: *gc.Heap, source: []const u8, filename: []const u8) Compile
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
     var builder = Compiler.init(heap, &ast, &analysis, filename, scratch_arena.allocator());
+    if (builder.pending_exception) |exception| return .{ .python_exception = exception };
+    var root_cursor: usize = 0;
+    builder.root_owner = builder.code;
+    builder.root_cursor = &root_cursor;
+    builder.scope_id = analysis.scopeForNode(ast.root);
     return builder.run();
 }
 
@@ -127,11 +133,23 @@ const Compiler = struct {
     allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
     code: *Code,
+    scope_id: ?scope_module.ScopeId = null,
+    root_owner: ?*Code = null,
+    root_cursor: ?*usize = null,
     temps: TempAllocator = TempAllocator.init(0),
     instructions: std.ArrayList(bytecode.Instruction) = .empty,
     constants: std.ArrayList(Value) = .empty,
     names: std.ArrayList([]const u8) = .empty,
     argument_registers: std.ArrayList(u16) = .empty,
+    call_arguments: std.ArrayList(bytecode.CallArgument) = .empty,
+    call_sites: std.ArrayList(bytecode.CallSite) = .empty,
+    function_sites: std.ArrayList(bytecode.FunctionSite) = .empty,
+    nested_codes: std.ArrayList(*Code) = .empty,
+    local_names: std.ArrayList([]const u8) = .empty,
+    cell_names: std.ArrayList([]const u8) = .empty,
+    free_names: std.ArrayList([]const u8) = .empty,
+    parameter_names: std.ArrayList([]const u8) = .empty,
+    parameter_flags: std.ArrayList(u32) = .empty,
     positions: std.ArrayList(bytecode.SourcePosition) = .empty,
     diagnostic: ?Diagnostic = null,
     pending_exception: ?exceptions.PythonException = null,
@@ -170,6 +188,83 @@ const Compiler = struct {
         return .{ .heap = heap, .ast = ast, .analysis = analysis, .allocator = allocator, .scratch_allocator = scratch_allocator, .code = code };
     }
 
+    fn initNested(parent: *Compiler, scope_id: scope_module.ScopeId, display_name: []const u8) std.mem.Allocator.Error!Compiler {
+        const allocator = parent.heap.allocator;
+        const code = allocator.create(Code) catch return error.OutOfMemory;
+        code.* = .{ .allocator = allocator, .flags = bytecode.code_flags.function };
+        code.filename = allocator.dupe(u8, parent.code.filename) catch {
+            allocator.destroy(code);
+            return error.OutOfMemory;
+        };
+        code.display_name = allocator.dupe(u8, display_name) catch {
+            allocator.free(code.filename);
+            allocator.destroy(code);
+            return error.OutOfMemory;
+        };
+
+        var nested = Compiler{
+            .heap = parent.heap,
+            .ast = parent.ast,
+            .analysis = parent.analysis,
+            .allocator = allocator,
+            .scratch_allocator = parent.scratch_allocator,
+            .code = code,
+            .scope_id = scope_id,
+            .root_owner = parent.root_owner,
+            .root_cursor = parent.root_cursor,
+        };
+        for (parent.analysis.scope(scope_id).symbols) |symbol| {
+            const target: ?*std.ArrayList([]const u8) = switch (symbol.binding) {
+                .local => &nested.local_names,
+                .cell => &nested.cell_names,
+                .free => &nested.free_names,
+                .global_explicit, .global_implicit, .class_local => null,
+            };
+            if (target) |names| {
+                const owned = allocator.dupe(u8, symbol.name) catch {
+                    nested.discardCode();
+                    return error.OutOfMemory;
+                };
+                names.append(allocator, owned) catch {
+                    allocator.free(owned);
+                    nested.discardCode();
+                    return error.OutOfMemory;
+                };
+            }
+        }
+        return nested;
+    }
+
+    fn appendParameterMetadata(self: *Compiler, parameters: []const NodeId) CompileError!void {
+        var positional_count: u32 = 0;
+        var positional_only_count: u32 = 0;
+        var keyword_only_count: u32 = 0;
+        for (parameters) |parameter_id| {
+            const parameter = self.ast.node(parameter_id);
+            if (parameter.kind != .parameter) return self.failUnsupported(parameter.span, "function parameter shape is unsupported");
+            if (parameter.flags & (ast_module.parameter_flags.var_positional | ast_module.parameter_flags.var_keyword) != 0) {
+                return self.failUnsupported(parameter.span, "variadic function binding requires tuple and dictionary support");
+            }
+            const parameter_name = self.allocator.dupe(u8, parameter.text) catch return error.OutOfMemory;
+            self.parameter_names.append(self.allocator, parameter_name) catch {
+                self.allocator.free(parameter_name);
+                return error.OutOfMemory;
+            };
+            try self.parameter_flags.append(self.allocator, parameter.flags);
+            if (parameter.flags & ast_module.parameter_flags.keyword_only != 0) {
+                keyword_only_count += 1;
+            } else {
+                positional_count += 1;
+                if (parameter.flags & ast_module.parameter_flags.positional_only != 0) positional_only_count += 1;
+            }
+        }
+        self.code.signature = .{
+            .positional_count = std.math.cast(u16, positional_count) orelse return self.failUnsupported(if (parameters.len != 0) self.ast.node(parameters[0]).span else self.ast.node(self.ast.root).span, "too many function parameters"),
+            .positional_only_count = std.math.cast(u16, positional_only_count) orelse return error.Unsupported,
+            .keyword_only_count = std.math.cast(u16, keyword_only_count) orelse return error.Unsupported,
+        };
+    }
+
     fn run(self: *Compiler) CompileOutcome {
         if (self.pending_exception) |exception| return .{ .python_exception = exception };
 
@@ -183,36 +278,52 @@ const Compiler = struct {
             return memoryOutcome();
         };
 
+        const completed = self.finishCode() catch {
+            self.discardCode();
+            return memoryOutcome();
+        };
+        return .{ .ready = completed };
+    }
+
+    fn finishCode(self: *Compiler) std.mem.Allocator.Error!*Code {
         self.code.register_count = self.temps.high_water;
-        self.code.instructions = self.instructions.toOwnedSlice(self.allocator) catch {
-            self.discardCode();
-            return memoryOutcome();
-        };
-        self.code.constants = self.constants.toOwnedSlice(self.allocator) catch {
-            self.discardCode();
-            return memoryOutcome();
-        };
-        self.code.names = self.names.toOwnedSlice(self.allocator) catch {
-            self.discardCode();
-            return memoryOutcome();
-        };
-        self.code.argument_registers = self.argument_registers.toOwnedSlice(self.allocator) catch {
-            self.discardCode();
-            return memoryOutcome();
-        };
-        self.code.positions = self.positions.toOwnedSlice(self.allocator) catch {
-            self.discardCode();
-            return memoryOutcome();
-        };
-        return .{ .ready = self.code };
+        self.code.instructions = try self.instructions.toOwnedSlice(self.allocator);
+        self.code.constants = try self.constants.toOwnedSlice(self.allocator);
+        self.code.names = try self.names.toOwnedSlice(self.allocator);
+        self.code.local_names = try self.local_names.toOwnedSlice(self.allocator);
+        self.code.cell_names = try self.cell_names.toOwnedSlice(self.allocator);
+        self.code.free_names = try self.free_names.toOwnedSlice(self.allocator);
+        self.code.parameter_names = try self.parameter_names.toOwnedSlice(self.allocator);
+        self.code.parameter_flags = try self.parameter_flags.toOwnedSlice(self.allocator);
+        self.code.argument_registers = try self.argument_registers.toOwnedSlice(self.allocator);
+        self.code.call_arguments = try self.call_arguments.toOwnedSlice(self.allocator);
+        self.code.call_sites = try self.call_sites.toOwnedSlice(self.allocator);
+        self.code.function_sites = try self.function_sites.toOwnedSlice(self.allocator);
+        self.code.nested_codes = try self.nested_codes.toOwnedSlice(self.allocator);
+        self.code.positions = try self.positions.toOwnedSlice(self.allocator);
+        return self.code;
     }
 
     fn discardCode(self: *Compiler) void {
+        for (self.nested_codes.items) |child| child.deinit(self.heap);
         for (self.names.items) |name| self.allocator.free(name);
+        for (self.local_names.items) |name| self.allocator.free(name);
+        for (self.cell_names.items) |name| self.allocator.free(name);
+        for (self.free_names.items) |name| self.allocator.free(name);
+        for (self.parameter_names.items) |name| self.allocator.free(name);
         self.instructions.deinit(self.allocator);
         self.constants.deinit(self.allocator);
         self.names.deinit(self.allocator);
+        self.local_names.deinit(self.allocator);
+        self.cell_names.deinit(self.allocator);
+        self.free_names.deinit(self.allocator);
+        self.parameter_names.deinit(self.allocator);
+        self.parameter_flags.deinit(self.allocator);
         self.argument_registers.deinit(self.allocator);
+        self.call_arguments.deinit(self.allocator);
+        self.call_sites.deinit(self.allocator);
+        self.function_sites.deinit(self.allocator);
+        self.nested_codes.deinit(self.allocator);
         self.positions.deinit(self.allocator);
         if (@intFromPtr(self.code) != 0) self.code.deinit(self.heap);
     }
@@ -221,7 +332,9 @@ const Compiler = struct {
         const root = self.ast.node(self.ast.root);
         if (root.kind != .module) return self.failUnsupported(root.span, "module code is required");
         for (self.ast.children(self.ast.root)) |statement| try self.compileStatement(statement);
-        try self.emit(.return_value, 0, 0, 0, 0, root.span);
+        const none = try self.loadConstant(Value.noneValue(), root.span);
+        try self.emit(.return_value, none, 0, 0, 0, root.span);
+        self.temps.release(none);
     }
 
     fn compileStatement(self: *Compiler, node_id: NodeId) CompileError!void {
@@ -229,6 +342,9 @@ const Compiler = struct {
         switch (node.kind) {
             .pass_statement => {},
             .block => try self.compileBlock(node_id),
+            .function_definition => try self.compileFunctionDefinition(node_id),
+            .return_statement => try self.compileReturn(node_id),
+            .global_statement, .nonlocal_statement => {},
             .expression_statement => {
                 if (self.ast.children(node_id).len != 1) return self.failUnsupported(node.span, "expression statement shape is unsupported");
                 const result = try self.compileExpression(self.ast.children(node_id)[0]);
@@ -247,6 +363,119 @@ const Compiler = struct {
 
     fn compileBlock(self: *Compiler, node_id: NodeId) CompileError!void {
         for (self.ast.children(node_id)) |statement| try self.compileStatement(statement);
+    }
+
+    fn compileReturn(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        if (self.code.flags & bytecode.code_flags.function == 0) return self.failUnsupported(node.span, "return is only supported inside a function");
+        const children = self.ast.children(node_id);
+        const result = if (children.len == 0) try self.loadConstant(Value.noneValue(), node.span) else try self.compileExpression(children[0]);
+        try self.emit(.return_value, result, 0, 0, 0, node.span);
+        self.temps.release(result);
+    }
+
+    fn compileFunctionDefinition(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len == 0) return self.failUnsupported(node.span, "function definition shape is unsupported");
+        const body_id = children[children.len - 1];
+        const has_return_annotation = node.flags & ast_module.function_flags.has_return_annotation != 0;
+        const return_annotation_id: ?NodeId = if (has_return_annotation) children[children.len - 2] else null;
+        const parameter_end = children.len - 1 - @as(usize, @intFromBool(has_return_annotation));
+        const parameter_ids = children[0..parameter_end];
+        const function_scope = self.analysis.scopeForNode(body_id) orelse return self.failUnsupported(node.span, "function scope metadata is missing");
+        const nested_code = try self.compileNestedFunction(function_scope, node.text, body_id, parameter_ids, node.span);
+        const nested_index = std.math.cast(u32, self.nested_codes.items.len) orelse return self.failUnsupported(node.span, "too many nested code objects");
+        self.nested_codes.append(self.allocator, nested_code) catch {
+            nested_code.deinit(self.heap);
+            return error.OutOfMemory;
+        };
+
+        var held: std.ArrayList(u16) = .empty;
+        defer held.deinit(self.scratch_allocator);
+        var values: std.ArrayList(u16) = .empty;
+        defer values.deinit(self.scratch_allocator);
+        var default_count: u32 = 0;
+        var annotation_count: u32 = 0;
+
+        // CPython evaluates every default before any parameter annotation.
+        for (parameter_ids) |parameter_id| {
+            const parameter = self.ast.node(parameter_id);
+            if (parameter.flags & ast_module.parameter_flags.has_default == 0) continue;
+            const children_of_parameter = self.ast.children(parameter_id);
+            const default_index: usize = if (parameter.flags & ast_module.parameter_flags.has_annotation != 0) 1 else 0;
+            const result = try self.compileExpression(children_of_parameter[default_index]);
+            try held.append(self.scratch_allocator, result);
+            try values.append(self.scratch_allocator, result);
+            default_count += 1;
+        }
+        for (parameter_ids) |parameter_id| {
+            const parameter = self.ast.node(parameter_id);
+            if (parameter.flags & ast_module.parameter_flags.has_annotation == 0) continue;
+            const annotation = try self.compileExpression(self.ast.children(parameter_id)[0]);
+            try held.append(self.scratch_allocator, annotation);
+            try values.append(self.scratch_allocator, annotation);
+            annotation_count += 1;
+        }
+        if (return_annotation_id) |annotation_id| {
+            const annotation = try self.compileExpression(annotation_id);
+            try held.append(self.scratch_allocator, annotation);
+            try values.append(self.scratch_allocator, annotation);
+        }
+
+        const value_start = std.math.cast(u32, self.argument_registers.items.len) orelse return self.failUnsupported(node.span, "code object has too many function values");
+        try self.argument_registers.appendSlice(self.allocator, values.items);
+        const site_index = std.math.cast(u32, self.function_sites.items.len) orelse return self.failUnsupported(node.span, "too many function definition sites");
+        try self.function_sites.append(self.allocator, .{
+            .code_index = nested_index,
+            .value_start = value_start,
+            .default_count = std.math.cast(u16, default_count) orelse return self.failUnsupported(node.span, "too many default values"),
+            .annotation_count = std.math.cast(u16, annotation_count) orelse return self.failUnsupported(node.span, "too many annotations"),
+            .has_return_annotation = has_return_annotation,
+        });
+        const destination = try self.acquire(node.span);
+        try self.emitIndex(.make_function, destination, site_index, 0, node.span);
+        const binding = self.analysis.symbol(self.scope_id orelse 0, node.text) orelse return self.failUnsupported(node.span, "function name binding metadata is missing");
+        try self.compileStoreName(destination, node.text, binding.binding, node.span);
+        self.temps.release(destination);
+        while (held.items.len != 0) self.temps.release(held.pop().?);
+    }
+
+    fn compileNestedFunction(
+        self: *Compiler,
+        scope_id: scope_module.ScopeId,
+        display_name: []const u8,
+        body_id: NodeId,
+        parameter_ids: []const NodeId,
+        span: Span,
+    ) CompileError!*Code {
+        var nested = Compiler.initNested(self, scope_id, display_name) catch return error.OutOfMemory;
+        var keep_code = false;
+        defer if (!keep_code) nested.discardCode();
+        nested.appendParameterMetadata(parameter_ids) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        nested.compileStatement(body_id) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        const none = nested.loadConstant(Value.noneValue(), span) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        nested.emit(.return_value, none, 0, 0, 0, span) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        nested.temps.release(none);
+        const code = nested.finishCode() catch return error.OutOfMemory;
+        keep_code = true;
+        return code;
     }
 
     fn compileIf(self: *Compiler, node_id: NodeId) CompileError!void {
@@ -304,11 +533,11 @@ const Compiler = struct {
         try self.emit(.get_iterator, iterator_register, source, 0, 0, iterable_node.span);
         const item_register = try self.acquire(target_node.span);
         const has_item_register = try self.acquire(target_node.span);
-        const name_index = try self.internName(target_node.text);
         const loop_start = try self.currentTarget(node.span);
         try self.emit(.for_next, item_register, iterator_register, has_item_register, 0, node.span);
         const exhausted = try self.emitJump(.jump_if_false, has_item_register, 0, node.span);
-        try self.emitIndex(.store_global, item_register, name_index, 0, target_node.span);
+        const target_binding = self.analysis.bindingOf(children[0]) orelse .global_implicit;
+        try self.compileStoreName(item_register, target_node.text, target_binding, target_node.span);
 
         try self.loop_stack.append(self.scratch_allocator, .{ .continue_target = loop_start });
         try self.compileStatement(children[2]);
@@ -345,16 +574,16 @@ const Compiler = struct {
         if (target.kind != .name) return self.failUnsupported(target.span, "attribute and subscript augmented assignment are not implemented yet");
         if (node.text.len < 2 or node.text[node.text.len - 1] != '=') return self.failUnsupported(node.span, "augmented operator is unsupported");
         const operation = binaryOperation(node.text[0 .. node.text.len - 1]) orelse return self.failUnsupported(node.span, "this augmented operator is not implemented yet");
-        const name_index = try self.internName(target.text);
+        const binding = self.analysis.bindingOf(children[0]) orelse .global_implicit;
         const left = try self.acquire(target.span);
-        try self.emitIndex(.load_global, left, name_index, 0, target.span);
+        try self.compileLoadName(left, target.text, binding, target.span);
         const right = self.compileExpression(children[1]) catch |err| {
             self.temps.release(left);
             return err;
         };
         try self.emit(.binary, left, right, 0, @intFromEnum(operation), node.span);
         self.temps.release(right);
-        try self.emitIndex(.store_global, left, name_index, 0, node.span);
+        try self.compileStoreName(left, target.text, binding, node.span);
         self.temps.release(left);
     }
 
@@ -368,10 +597,28 @@ const Compiler = struct {
                 self.temps.release(value);
                 return self.failUnsupported(target.span, "attribute, subscript, and unpacking assignment are not implemented yet");
             }
-            const name_index = try self.internName(target.text);
-            try self.emitIndex(.store_global, value, name_index, 0, target.span);
+            const binding = self.analysis.bindingOf(target_id) orelse .global_implicit;
+            try self.compileStoreName(value, target.text, binding, target.span);
         }
         self.temps.release(value);
+    }
+
+    fn compileLoadName(self: *Compiler, destination: u16, name: []const u8, binding: Binding, span: Span) CompileError!void {
+        const name_index = try self.internName(name);
+        switch (binding) {
+            .local, .cell, .free => try self.emitIndex(.load_local, destination, name_index, localBindingFlag(binding), span),
+            .global_explicit, .global_implicit => try self.emitIndex(.load_global, destination, name_index, 0, span),
+            .class_local => return self.failUnsupported(span, "class namespace execution is not implemented yet"),
+        }
+    }
+
+    fn compileStoreName(self: *Compiler, source: u16, name: []const u8, binding: Binding, span: Span) CompileError!void {
+        const name_index = try self.internName(name);
+        switch (binding) {
+            .local, .cell, .free => try self.emitIndex(.store_local, source, name_index, localBindingFlag(binding), span),
+            .global_explicit, .global_implicit => try self.emitIndex(.store_global, source, name_index, 0, span),
+            .class_local => return self.failUnsupported(span, "class namespace execution is not implemented yet"),
+        }
     }
 
     fn compileExpression(self: *Compiler, node_id: NodeId) CompileError!u16 {
@@ -400,9 +647,9 @@ const Compiler = struct {
             .none_literal => return self.loadConstant(Value.noneValue(), node.span),
             .bool_literal => return self.loadConstant(if (std.mem.eql(u8, node.text, "True")) Value.trueValue() else Value.falseValue(), node.span),
             .name => {
-                const name_index = try self.internName(node.text);
                 const register = try self.acquire(node.span);
-                try self.emitIndex(.load_global, register, name_index, 0, node.span);
+                const binding = self.analysis.bindingOf(node_id) orelse .global_implicit;
+                try self.compileLoadName(register, node.text, binding, node.span);
                 return register;
             },
             .unary_expression => return self.compileUnary(node_id),
@@ -518,65 +765,39 @@ const Compiler = struct {
         const node = self.ast.node(node_id);
         const children = self.ast.children(node_id);
         if (children.len == 0) return self.failUnsupported(node.span, "call shape is unsupported");
-        const callee = self.ast.node(children[0]);
-        if (callee.kind == .name and std.mem.eql(u8, callee.text, "range")) return self.compileRangeCall(node_id);
-        if (callee.kind != .name or !std.mem.eql(u8, callee.text, "print")) {
-            return self.failUnsupported(callee.span, "only direct calls to the builtin print are implemented in this commit");
-        }
-
         const count = children.len - 1;
-        if (count > std.math.maxInt(u16)) return self.failUnsupported(node.span, "print has more than 65,535 positional arguments");
-        const held = self.scratch_allocator.alloc(u16, count) catch return error.OutOfMemory;
-        var held_count: usize = 0;
-        errdefer while (held_count > 0) {
-            held_count -= 1;
-            self.temps.release(held[held_count]);
+        if (count > std.math.maxInt(u16)) return self.failUnsupported(node.span, "call has more than 65,535 arguments");
+        const initial_temps = self.temps.next;
+        errdefer self.temps.next = initial_temps;
+        const callee = try self.compileExpression(children[0]);
+        const held = self.scratch_allocator.alloc(u16, count) catch {
+            return error.OutOfMemory;
         };
+        var held_count: usize = 0;
 
         for (children[1..]) |argument_id| {
             const argument = self.ast.node(argument_id);
-            if (argument.kind == .keyword_argument) return self.failUnsupported(argument.span, "print keyword arguments are not implemented yet");
-            const register = try self.compileExpression(argument_id);
+            if (argument.kind == .starred) return self.failUnsupported(argument.span, "call unpacking requires tuple and mapping support");
+            const value_node = if (argument.kind == .keyword_argument) self.ast.children(argument_id)[0] else argument_id;
+            const register = try self.compileExpression(value_node);
             held[held_count] = register;
             held_count += 1;
         }
-        const argument_start = self.argument_registers.items.len;
-        const start32 = std.math.cast(u32, argument_start) orelse return self.failUnsupported(node.span, "code object has too many call operands");
-        try self.argument_registers.appendSlice(self.allocator, held[0..held_count]);
-        try self.emitIndex(.print, @intCast(count), start32, 0, node.span);
-        while (held_count > 0) {
-            held_count -= 1;
-            self.temps.release(held[held_count]);
-        }
-        return self.loadConstant(Value.noneValue(), node.span);
-    }
 
-    fn compileRangeCall(self: *Compiler, node_id: NodeId) CompileError!u16 {
-        const node = self.ast.node(node_id);
-        const children = self.ast.children(node_id);
-        const count = children.len - 1;
-        if (count > std.math.maxInt(u8)) return self.failUnsupported(node.span, "range has too many positional arguments");
-        const result = try self.acquire(node.span);
-        const held = self.scratch_allocator.alloc(u16, count) catch return error.OutOfMemory;
-        var held_count: usize = 0;
-        errdefer while (held_count > 0) {
-            held_count -= 1;
-            self.temps.release(held[held_count]);
-        };
-        for (children[1..]) |argument_id| {
+        const argument_start = std.math.cast(u32, self.call_arguments.items.len) orelse return self.failUnsupported(node.span, "code object has too many call operands");
+        for (children[1..], 0..) |argument_id, index| {
             const argument = self.ast.node(argument_id);
-            if (argument.kind == .keyword_argument) return self.failUnsupported(argument.span, "range keyword arguments are not implemented yet");
-            held[held_count] = try self.compileExpression(argument_id);
-            held_count += 1;
+            const keyword_name = if (argument.kind == .keyword_argument) try self.internName(argument.text) else std.math.maxInt(u32);
+            try self.call_arguments.append(self.allocator, .{ .register = held[index], .keyword_name = keyword_name });
         }
-        const start = std.math.cast(u32, self.argument_registers.items.len) orelse return self.failUnsupported(node.span, "code object has too many range operands");
-        try self.argument_registers.appendSlice(self.allocator, held[0..held_count]);
-        try self.emitIndex(.make_range, result, start, @intCast(count), node.span);
+        const site_index = std.math.cast(u32, self.call_sites.items.len) orelse return self.failUnsupported(node.span, "too many call sites");
+        try self.call_sites.append(self.allocator, .{ .argument_start = argument_start, .argument_count = @intCast(count) });
+        try self.emitIndex(.call, callee, site_index, 0, node.span);
         while (held_count > 0) {
             held_count -= 1;
             self.temps.release(held[held_count]);
         }
-        return result;
+        return callee;
     }
 
     fn parseFloat(self: *Compiler, spelling: []const u8, span: Span) CompileError!f64 {
@@ -623,8 +844,11 @@ const Compiler = struct {
 
     fn loadConstant(self: *Compiler, value: Value, span: Span) CompileError!u16 {
         const constant_index = std.math.cast(u32, self.constants.items.len) orelse return self.failUnsupported(span, "code object has too many constants");
-        if (constant_index >= self.code.root_slots.len) return self.failUnsupported(span, "code object constant bound exceeded");
-        self.code.root_slots[constant_index].object = value.asObject();
+        const owner = self.root_owner orelse self.code;
+        const cursor = self.root_cursor orelse return self.failUnsupported(span, "code constant root owner is missing");
+        if (cursor.* >= owner.root_slots.len) return self.failUnsupported(span, "code object constant bound exceeded");
+        owner.root_slots[cursor.*].object = value.asObject();
+        cursor.* += 1;
         try self.constants.append(self.allocator, value);
         const register = try self.acquire(span);
         try self.emitIndex(.load_const, register, constant_index, 0, span);
@@ -769,6 +993,15 @@ fn binaryOperation(spelling: []const u8) ?BinaryOperation {
     if (std.mem.eql(u8, spelling, "<<")) return .shift_left;
     if (std.mem.eql(u8, spelling, ">>")) return .shift_right;
     return null;
+}
+
+fn localBindingFlag(binding: Binding) u8 {
+    return switch (binding) {
+        .local => @intFromEnum(bytecode.LocalBinding.local),
+        .cell => @intFromEnum(bytecode.LocalBinding.cell),
+        .free => @intFromEnum(bytecode.LocalBinding.free),
+        .global_explicit, .global_implicit, .class_local => unreachable,
+    };
 }
 
 fn comparisonOperation(spelling: []const u8) ?u8 {

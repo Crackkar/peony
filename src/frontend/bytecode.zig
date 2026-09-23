@@ -20,6 +20,10 @@ pub const Opcode = enum(u8) {
     make_range,
     get_iterator,
     for_next,
+    load_local,
+    store_local,
+    call,
+    make_function,
 };
 
 /// Fixed 64-bit register instruction. The least-significant byte is the opcode;
@@ -69,6 +73,10 @@ pub const Instruction = struct {
             15 => .make_range,
             16 => .get_iterator,
             17 => .for_next,
+            18 => .load_local,
+            19 => .store_local,
+            20 => .call,
+            21 => .make_function,
             else => null,
         };
     }
@@ -117,6 +125,30 @@ pub const Signature = struct {
     var_keyword: bool = false,
 };
 
+pub const LocalBinding = enum(u8) { local, cell, free };
+
+pub const CallArgument = struct {
+    register: u16,
+    keyword_name: u32 = std.math.maxInt(u32),
+};
+
+pub const CallSite = struct {
+    argument_start: u32,
+    argument_count: u16,
+};
+
+pub const FunctionSite = struct {
+    code_index: u32,
+    value_start: u32,
+    default_count: u16,
+    annotation_count: u16,
+    has_return_annotation: bool,
+};
+
+pub const code_flags = struct {
+    pub const function: u32 = 1 << 0;
+};
+
 pub const Code = struct {
     allocator: std.mem.Allocator,
     instructions: []Instruction = &.{},
@@ -125,7 +157,13 @@ pub const Code = struct {
     local_names: []const []const u8 = &.{},
     cell_names: []const []const u8 = &.{},
     free_names: []const []const u8 = &.{},
+    parameter_names: []const []const u8 = &.{},
+    parameter_flags: []u32 = &.{},
     argument_registers: []u16 = &.{},
+    call_arguments: []CallArgument = &.{},
+    call_sites: []CallSite = &.{},
+    function_sites: []FunctionSite = &.{},
+    nested_codes: []*Code = &.{},
     positions: []SourcePosition = &.{},
     filename: []const u8 = "",
     display_name: []const u8 = "<module>",
@@ -136,6 +174,8 @@ pub const Code = struct {
     root_slots: []gc.Root = &.{},
 
     pub fn deinit(self: *Code, heap: *gc.Heap) void {
+        for (self.nested_codes) |child| child.deinit(heap);
+        for (self.parameter_names) |name| self.allocator.free(name);
         if (self.root_frame.stack != null) self.root_frame.pop();
         for (self.names) |name| self.allocator.free(name);
         for (self.local_names) |name| self.allocator.free(name);
@@ -147,13 +187,18 @@ pub const Code = struct {
         self.allocator.free(self.local_names);
         self.allocator.free(self.cell_names);
         self.allocator.free(self.free_names);
+        self.allocator.free(self.parameter_names);
+        self.allocator.free(self.parameter_flags);
         self.allocator.free(self.argument_registers);
+        self.allocator.free(self.call_arguments);
+        self.allocator.free(self.call_sites);
+        self.allocator.free(self.function_sites);
+        self.allocator.free(self.nested_codes);
         self.allocator.free(self.positions);
         self.allocator.free(self.filename);
         self.allocator.free(self.display_name);
         self.allocator.free(self.root_slots);
         const allocator = self.allocator;
         allocator.destroy(self);
-        _ = heap;
     }
 };

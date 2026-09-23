@@ -6,6 +6,7 @@ const parser_tests = @import("parser_tests");
 const scope_tests = @import("scope_tests");
 const compiler_vm_tests = @import("compiler_vm_tests");
 const control_flow_tests = @import("control_flow_tests");
+const functions_tests = @import("functions_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -174,6 +175,10 @@ test "parser handles calls attributes subscripts slices and displays" {
     try parser_tests.testPostfixesAndDisplays();
 }
 
+test "parser rejects invalid keyword and positional call argument order" {
+    try parser_tests.testCallArgumentOrderingErrors();
+}
+
 test "parser retains function signature markers and defaults" {
     try parser_tests.testFunctionSignature();
 }
@@ -238,6 +243,10 @@ test "VM resolves builtin print and transports Python exceptions" {
     try compiler_vm_tests.testBuiltinFallbackShadowingAndPythonExceptions();
 }
 
+test "UnboundLocalError follows NameError hierarchy" {
+    try compiler_vm_tests.testUnboundLocalErrorHierarchy();
+}
+
 test "corrupt bytecode faults stay outside Python exception flow" {
     try compiler_vm_tests.testInternalBytecodeFaultIsNotAPythonException();
 }
@@ -272,6 +281,54 @@ test "range and iterator values remain rooted across garbage collection" {
 
 test "range membership accepts float probes and roots bigint intermediates" {
     try control_flow_tests.testRangeFloatMembershipAndMembershipRooting();
+}
+
+test "VM calls functions and retains callable builtins" {
+    try functions_tests.testBasicFunctionsReturnsAndCallableValues();
+}
+
+test "VM evaluates function callees and arguments once in order" {
+    try functions_tests.testCallsEvaluateCalleeAndArgumentsOnceLeftToRight();
+}
+
+test "function defaults and annotations run at definition time" {
+    try functions_tests.testDefinitionTimeDefaultsAndAnnotations();
+}
+
+test "function binder supports positional-only and keyword-only parameters" {
+    try functions_tests.testPositionalOnlyKeywordOnlyAndDefaultBinding();
+}
+
+test "function binder errors preserve call-site lines" {
+    try functions_tests.testFunctionBinderErrorsAndCallSiteLines();
+}
+
+test "function scopes distinguish local reads and global writes" {
+    try functions_tests.testWholeBlockLocalsAndExplicitGlobal();
+}
+
+test "closures capture shared mutable and transitive cells" {
+    try functions_tests.testClosuresCaptureMutableCellsAndTransitiveFreeNames();
+}
+
+test "recursive frames and closures survive GC and timeslices" {
+    try functions_tests.testRecursiveFramesSurviveCollectionAndTimeslices();
+}
+
+test "builtin callable survives collection and reset" {
+    try functions_tests.testBuiltinCallableCollectionAndReset();
+}
+
+test "unsupported function default cleans nested code once" {
+    try functions_tests.testUnsupportedFunctionDefaultCleansNestedCodeOnce();
+}
+
+test "function construction cap failure reports MemoryError and recovers" {
+    try functions_tests.testFunctionConstructionMemoryErrorAndRecovery();
+}
+
+test "variadic and call-unpacking function syntax stays explicit" {
+    try functions_tests.testVariadicDefinitionsAndCallUnpackingAreExplicitlyUnsupported();
 }
 
 test "lexer recognizes literal prefixes and triple quotes" {

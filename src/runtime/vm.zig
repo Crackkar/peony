@@ -7,6 +7,9 @@ const number = @import("runtime_number");
 const string = @import("runtime_string");
 const exceptions = @import("runtime_exception");
 const iterator = @import("runtime_iterator");
+const functions = @import("runtime_function");
+const binder = @import("runtime_binder");
+const ast_module = @import("frontend_ast");
 
 const Value = value_module.Value;
 const Code = bytecode.Code;
@@ -35,6 +38,31 @@ const Environment = struct {
     entries: std.ArrayList(GlobalEntry) = .empty,
 };
 
+const Frame = struct {
+    code: *Code,
+    previous: ?*Frame = null,
+    return_destination: ?u16 = null,
+    ip: usize = 0,
+    registers: []Value = &.{},
+    locals: []Value = &.{},
+    local_cells: []?*functions.Cell = &.{},
+    free_cells: []?*functions.Cell = &.{},
+    roots: []gc.Root = &.{},
+    root_frame: gc.RootFrame = .{},
+
+    fn localRootStart(self: *const Frame) usize {
+        return self.registers.len;
+    }
+
+    fn cellRootStart(self: *const Frame) usize {
+        return self.registers.len + self.locals.len;
+    }
+
+    fn freeRootStart(self: *const Frame) usize {
+        return self.cellRootStart() + self.local_cells.len;
+    }
+};
+
 const environment_kind = gc.Kind{
     .trace = traceEnvironment,
     .destroy = destroyEnvironment,
@@ -59,7 +87,11 @@ pub const Runtime = struct {
     environment: *Environment = undefined,
     environment_frame: gc.RootFrame = .{},
     environment_root: gc.Root = .{ .object = null },
+    builtin_frame: gc.RootFrame = .{},
+    print_builtin_root: gc.Root = .{ .object = null },
+    range_builtin_root: gc.Root = .{ .object = null },
     code: ?*Code = null,
+    top_frame: ?*Frame = null,
     registers: []Value = &.{},
     register_roots: []gc.Root = &.{},
     register_frame: gc.RootFrame = .{},
@@ -82,6 +114,31 @@ pub const Runtime = struct {
         self.environment_root.object = &environment.header;
         self.environment_frame.push(&self.heap.roots);
         self.environment_frame.add(&self.environment_root);
+        self.builtin_frame.push(&self.heap.roots);
+        self.builtin_frame.add(&self.print_builtin_root);
+        self.builtin_frame.add(&self.range_builtin_root);
+        const print_builtin = functions.createNative(&self.heap, .print);
+        switch (print_builtin) {
+            .value => |function| self.print_builtin_root.object = &function.header,
+            .python_exception => {
+                self.builtin_frame.pop();
+                self.environment_frame.pop();
+                self.heap.deinit();
+                self.* = .{};
+                return error.OutOfMemory;
+            },
+        }
+        const range_builtin = functions.createNative(&self.heap, .range);
+        switch (range_builtin) {
+            .value => |function| self.range_builtin_root.object = &function.header,
+            .python_exception => {
+                self.builtin_frame.pop();
+                self.environment_frame.pop();
+                self.heap.deinit();
+                self.* = .{};
+                return error.OutOfMemory;
+            },
+        }
         self.initialized = true;
     }
 
@@ -89,6 +146,7 @@ pub const Runtime = struct {
         if (!self.initialized) return;
         self.resetProgram(false);
         self.stdout_bytes.deinit(self.heap.allocator);
+        if (self.builtin_frame.stack != null) self.builtin_frame.pop();
         if (self.environment_frame.stack != null) self.environment_frame.pop();
         self.heap.deinit();
         std.debug.assert(self.session_allocator.live_bytes == 0);
@@ -101,7 +159,7 @@ pub const Runtime = struct {
         switch (outcome) {
             .ready => |code| {
                 self.code = code;
-                if (self.prepareRegisters(code.register_count)) return .{ .ready = code };
+                if (self.prepareRegisters(code)) return .{ .ready = code };
                 code.deinit(&self.heap);
                 self.code = null;
                 const exception = PythonException{ .kind = .memory_error, .message = "session memory limit exceeded" };
@@ -130,24 +188,32 @@ pub const Runtime = struct {
             self.resetProgram(false);
             return .cancelled;
         }
-        const code = self.code orelse return .completed;
         if (self.last_exception != null) return .python_exception;
-        if (self.instruction_pointer > code.instructions.len or code.positions.len != code.instructions.len) {
-            _ = self.engineFault();
-            return .engine_error;
-        }
+        if (self.top_frame == null) return .completed;
 
         const quantum = if (requested_quantum == 0) default_quantum else requested_quantum;
         var executed: u32 = 0;
-        while (executed < quantum and self.instruction_pointer < code.instructions.len) : (executed += 1) {
-            const current = code.positions[self.instruction_pointer];
-            const instruction = code.instructions[self.instruction_pointer];
-            self.instruction_pointer += 1;
+        while (executed < quantum) : (executed += 1) {
+            const frame = self.top_frame orelse return .completed;
+            if (frame.ip >= frame.code.instructions.len or frame.code.positions.len != frame.code.instructions.len) {
+                _ = self.engineFault();
+                self.unwindFrames();
+                return .engine_error;
+            }
+            const current = frame.code.positions[frame.ip];
+            const instruction = frame.code.instructions[frame.ip];
+            frame.ip += 1;
+            self.activateFrame(frame);
             if (!self.execute(instruction, current.line, current.column)) {
+                self.unwindFrames();
                 return if (self.engine_failed) .engine_error else .python_exception;
             }
+            if (self.top_frame == frame) {
+                frame.ip = self.instruction_pointer;
+            }
+            if (self.top_frame == null) return .completed;
         }
-        return if (self.instruction_pointer >= code.instructions.len) .completed else .timeslice;
+        return if (self.top_frame == null) .completed else .timeslice;
     }
 
     pub fn cancel(self: *Runtime) void {
@@ -174,30 +240,13 @@ pub const Runtime = struct {
         return self.error_text_owned orelse self.error_text_static;
     }
 
-    fn prepareRegisters(self: *Runtime, count: u32) bool {
-        const length: usize = @intCast(count);
-        self.registers = self.heap.allocator.alloc(Value, length) catch return false;
-        self.register_roots = self.heap.allocator.alloc(gc.Root, length) catch {
-            self.heap.allocator.free(self.registers);
-            self.registers = &.{};
-            return false;
-        };
-        @memset(self.registers, Value.unboundValue());
-        @memset(self.register_roots, .{ .object = null });
-        self.register_frame.push(&self.heap.roots);
-        for (self.register_roots, 0..) |*root, index| {
-            self.register_frame.add(root);
-            _ = index;
-        }
+    fn prepareRegisters(self: *Runtime, code: *Code) bool {
+        _ = self.allocateFrame(code, null) catch return false;
         return true;
     }
 
     fn resetProgram(self: *Runtime, clear_output: bool) void {
-        if (self.register_frame.stack != null) self.register_frame.pop();
-        if (self.register_roots.len != 0) self.heap.allocator.free(self.register_roots);
-        if (self.registers.len != 0) self.heap.allocator.free(self.registers);
-        self.register_roots = &.{};
-        self.registers = &.{};
+        self.unwindFrames();
 
         self.clearGlobals();
         if (self.code) |code| {
@@ -213,13 +262,366 @@ pub const Runtime = struct {
         _ = self.heap.collect();
     }
 
+    fn allocateFrame(self: *Runtime, code: *Code, return_destination: ?u16) error{OutOfMemory}!*Frame {
+        const allocator = self.heap.allocator;
+        const frame = allocator.create(Frame) catch return error.OutOfMemory;
+        frame.* = .{ .code = code, .return_destination = return_destination };
+        errdefer self.freeFrameStorage(frame);
+        frame.registers = try allocator.alloc(Value, @intCast(code.register_count));
+        @memset(frame.registers, Value.unboundValue());
+        frame.locals = try allocator.alloc(Value, code.local_names.len);
+        @memset(frame.locals, Value.unboundValue());
+        frame.local_cells = try allocator.alloc(?*functions.Cell, code.cell_names.len);
+        @memset(frame.local_cells, null);
+        frame.free_cells = try allocator.alloc(?*functions.Cell, code.free_names.len);
+        @memset(frame.free_cells, null);
+        const first_roots = std.math.add(usize, frame.registers.len, frame.locals.len) catch return error.OutOfMemory;
+        const root_count = std.math.add(usize, first_roots, frame.local_cells.len + frame.free_cells.len) catch return error.OutOfMemory;
+        frame.roots = try allocator.alloc(gc.Root, root_count);
+        @memset(frame.roots, .{ .object = null });
+        frame.root_frame.push(&self.heap.roots);
+        for (frame.roots) |*root| frame.root_frame.add(root);
+        frame.previous = self.top_frame;
+        self.top_frame = frame;
+        self.activateFrame(frame);
+        return frame;
+    }
+
+    fn freeFrameStorage(self: *Runtime, frame: *Frame) void {
+        const allocator = self.heap.allocator;
+        if (frame.roots.len != 0) allocator.free(frame.roots);
+        if (frame.free_cells.len != 0) allocator.free(frame.free_cells);
+        if (frame.local_cells.len != 0) allocator.free(frame.local_cells);
+        if (frame.locals.len != 0) allocator.free(frame.locals);
+        if (frame.registers.len != 0) allocator.free(frame.registers);
+        allocator.destroy(frame);
+    }
+
+    fn activateFrame(self: *Runtime, frame: *Frame) void {
+        self.registers = frame.registers;
+        self.register_roots = frame.roots[0..frame.registers.len];
+        self.instruction_pointer = frame.ip;
+    }
+
+    fn popFrame(self: *Runtime) ?*Frame {
+        const frame = self.top_frame orelse return null;
+        if (frame.root_frame.stack != null) frame.root_frame.pop();
+        self.top_frame = frame.previous;
+        const previous = self.top_frame;
+        if (previous) |active| {
+            self.activateFrame(active);
+        } else {
+            self.registers = &.{};
+            self.register_roots = &.{};
+            self.instruction_pointer = 0;
+        }
+        return frame;
+    }
+
+    fn unwindFrames(self: *Runtime) void {
+        while (self.popFrame()) |frame| self.freeFrameStorage(frame);
+    }
+
+    fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        const code = self.activeCode() orelse return self.engineFault();
+        const site_index: usize = instruction.index32();
+        if (site_index >= code.call_sites.len) return self.engineFault();
+        const site = code.call_sites[site_index];
+        const start: usize = site.argument_start;
+        const count: usize = site.argument_count;
+        if (start > code.call_arguments.len or count > code.call_arguments.len - start) return self.engineFault();
+
+        const allocator = self.heap.allocator;
+        const positional = allocator.alloc(Value, count) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer allocator.free(positional);
+        const keywords = allocator.alloc(binder.Keyword, count) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer allocator.free(keywords);
+        var positional_count: usize = 0;
+        var keyword_count: usize = 0;
+        for (code.call_arguments[start..][0..count]) |argument| {
+            if (!self.validRegister(argument.register)) return self.engineFault();
+            const value = self.registers[argument.register];
+            if (argument.keyword_name == std.math.maxInt(u32)) {
+                positional[positional_count] = value;
+                positional_count += 1;
+            } else {
+                const name = self.codeName(argument.keyword_name) orelse return self.engineFault();
+                keywords[keyword_count] = .{ .name = name, .value = value };
+                keyword_count += 1;
+            }
+        }
+        const callee = self.registers[instruction.a()];
+        const header = callee.asObject() orelse {
+            self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
+            return false;
+        };
+        const function = functions.functionFromHeader(header) orelse {
+            self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
+            return false;
+        };
+        if (function.native) |native| return self.executeNativeCall(instruction.a(), native, positional[0..positional_count], keywords[0..keyword_count], line, column);
+
+        const function_code = function.code orelse return self.engineFault();
+        const bound = binder.bindFunction(
+            allocator,
+            function_code.parameter_names,
+            function_code.parameter_flags,
+            function.defaults,
+            positional[0..positional_count],
+            keywords[0..keyword_count],
+        ) catch |err| {
+            self.setBinderException(err, line, column);
+            return false;
+        };
+        defer allocator.free(bound);
+        const frame = self.allocateFrame(function_code, instruction.a()) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        if (function.cells.len != function_code.free_names.len) return self.engineFault();
+        for (function.cells, 0..) |cell, index| {
+            frame.free_cells[index] = cell;
+            frame.roots[frame.freeRootStart() + index].object = &cell.header;
+        }
+        for (function_code.cell_names, 0..) |name, index| {
+            const cell = functions.createCell(&self.heap, Value.unboundValue()) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            };
+            frame.local_cells[index] = cell;
+            frame.roots[frame.cellRootStart() + index].object = &cell.header;
+            _ = name;
+        }
+        for (function_code.parameter_names, 0..) |name, index| {
+            if (!self.storeFrameLocal(frame, name, bound[index])) return self.engineFault();
+        }
+        return true;
+    }
+
+    fn executeNativeCall(
+        self: *Runtime,
+        destination: u16,
+        native: functions.Native,
+        positional: []const Value,
+        keywords: []const binder.Keyword,
+        line: u32,
+        column: u32,
+    ) bool {
+        switch (native) {
+            .print => {
+                const arguments = binder.bindPrint(positional, keywords) catch |err| {
+                    self.setBinderException(err, line, column);
+                    return false;
+                };
+                var separator: []const u8 = " ";
+                var ending: []const u8 = "\n";
+                if (arguments.separator) |value| {
+                    if (value.tag() != .none) {
+                        const header = value.asObject() orelse {
+                            self.setException(.{ .kind = .type_error, .message = "sep must be None or a string" }, line, column, null);
+                            return false;
+                        };
+                        const text = string.fromHeader(header) orelse {
+                            self.setException(.{ .kind = .type_error, .message = "sep must be None or a string" }, line, column, null);
+                            return false;
+                        };
+                        separator = string.content(text);
+                    }
+                }
+                if (arguments.ending) |value| {
+                    if (value.tag() != .none) {
+                        const header = value.asObject() orelse {
+                            self.setException(.{ .kind = .type_error, .message = "end must be None or a string" }, line, column, null);
+                            return false;
+                        };
+                        const text = string.fromHeader(header) orelse {
+                            self.setException(.{ .kind = .type_error, .message = "end must be None or a string" }, line, column, null);
+                            return false;
+                        };
+                        ending = string.content(text);
+                    }
+                }
+                if (!self.executePrintValues(arguments.values, separator, ending, line, column)) return false;
+                self.setRegister(destination, Value.noneValue());
+                return true;
+            },
+            .range => {
+                const arguments = binder.bindRange(positional, keywords) catch |err| {
+                    self.setBinderException(err, line, column);
+                    return false;
+                };
+                switch (iterator.createRange(&self.heap, &arguments)) {
+                    .value => |range| self.setRegister(destination, Value.object(&range.header)),
+                    .python_exception => |exception| {
+                        self.setException(exception, line, column, null);
+                        return false;
+                    },
+                    .engine_error => return self.engineFault(),
+                }
+                return true;
+            },
+        }
+    }
+
+    fn executeMakeFunction(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        const code = self.activeCode() orelse return self.engineFault();
+        const site_index: usize = instruction.index32();
+        if (site_index >= code.function_sites.len) return self.engineFault();
+        const site = code.function_sites[site_index];
+        const nested_index: usize = site.code_index;
+        if (nested_index >= code.nested_codes.len) return self.engineFault();
+        const nested_code = code.nested_codes[nested_index];
+        const start: usize = site.value_start;
+        const default_count: usize = site.default_count;
+        const annotation_count: usize = site.annotation_count + @as(usize, @intFromBool(site.has_return_annotation));
+        const value_count = default_count + annotation_count;
+        if (start > code.argument_registers.len or value_count > code.argument_registers.len - start) return self.engineFault();
+        const allocator = self.heap.allocator;
+        const defaults = allocator.alloc(Value, nested_code.parameter_names.len) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer allocator.free(defaults);
+        @memset(defaults, Value.unboundValue());
+        var default_index: usize = 0;
+        for (nested_code.parameter_flags, 0..) |flags, parameter_index| {
+            if (flags & ast_module.parameter_flags.has_default == 0) continue;
+            if (default_index >= default_count) return self.engineFault();
+            const register = code.argument_registers[start + default_index];
+            if (!self.validRegister(register)) return self.engineFault();
+            defaults[parameter_index] = self.registers[register];
+            default_index += 1;
+        }
+        if (default_index != default_count) return self.engineFault();
+        const annotations = allocator.alloc(Value, annotation_count) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer allocator.free(annotations);
+        for (annotations, 0..) |*annotation, index| {
+            const register = code.argument_registers[start + default_count + index];
+            if (!self.validRegister(register)) return self.engineFault();
+            annotation.* = self.registers[register];
+        }
+        const captured = allocator.alloc(*functions.Cell, nested_code.free_names.len) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer allocator.free(captured);
+        for (nested_code.free_names, 0..) |name, index| {
+            captured[index] = self.findCell(name) orelse return self.engineFault();
+        }
+        switch (functions.createPython(&self.heap, nested_code, &self.environment.header, captured, defaults, annotations)) {
+            .value => |function| self.setRegister(instruction.a(), Value.object(&function.header)),
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+        }
+        return true;
+    }
+
+    fn setBinderException(self: *Runtime, err: anyerror, line: u32, column: u32) void {
+        const message: []const u8 = if (err == error.TooManyPositional) "too many positional arguments" else if (err == error.MissingArgument) "missing required argument" else if (err == error.MultipleValues) "multiple values for an argument" else if (err == error.PositionalOnlyAsKeyword) "positional-only argument passed as a keyword" else if (err == error.UnexpectedKeyword) "unexpected keyword argument" else if (err == error.OutOfMemory) "session memory limit exceeded" else "invalid call arguments";
+        const kind: PythonExceptionKind = if (err == error.OutOfMemory) .memory_error else .type_error;
+        self.setException(.{ .kind = kind, .message = message }, line, column, null);
+    }
+
+    fn storeFrameLocal(self: *Runtime, frame: *Frame, name: []const u8, value: Value) bool {
+        if (indexOfName(frame.code.cell_names, name)) |index| {
+            const cell = frame.local_cells[index] orelse return false;
+            cell.value = value;
+            return true;
+        }
+        const index = indexOfName(frame.code.local_names, name) orelse return false;
+        frame.locals[index] = value;
+        frame.roots[frame.localRootStart() + index].object = value.asObject();
+        _ = self;
+        return true;
+    }
+
+    fn findCell(self: *Runtime, name: []const u8) ?*functions.Cell {
+        const frame = self.top_frame orelse return null;
+        if (indexOfName(frame.code.cell_names, name)) |index| return frame.local_cells[index];
+        if (indexOfName(frame.code.free_names, name)) |index| return frame.free_cells[index];
+        return null;
+    }
+
+    fn loadLocal(self: *Runtime, destination: u16, name: []const u8, binding: u8, line: u32, column: u32) bool {
+        const frame = self.top_frame orelse return self.engineFault();
+        const kind: bytecode.LocalBinding = switch (binding) {
+            0 => .local,
+            1 => .cell,
+            2 => .free,
+            else => return self.engineFault(),
+        };
+        const value = switch (kind) {
+            .local => blk: {
+                const index = indexOfName(frame.code.local_names, name) orelse return self.engineFault();
+                break :blk frame.locals[index];
+            },
+            .cell => blk: {
+                const index = indexOfName(frame.code.cell_names, name) orelse return self.engineFault();
+                const cell = frame.local_cells[index] orelse return self.engineFault();
+                break :blk cell.value;
+            },
+            .free => blk: {
+                const index = indexOfName(frame.code.free_names, name) orelse return self.engineFault();
+                const cell = frame.free_cells[index] orelse return self.engineFault();
+                break :blk cell.value;
+            },
+        };
+        if (value.tag() == .unbound or value.tag() == .deleted) {
+            const kind_error: PythonExceptionKind = if (kind == .free) .name_error else .unbound_local_error;
+            self.setException(.{ .kind = kind_error, .message = "local variable is not bound" }, line, column, null);
+            return false;
+        }
+        self.setRegister(destination, value);
+        return true;
+    }
+
+    fn storeLocal(self: *Runtime, source: u16, name: []const u8, binding: u8) bool {
+        const frame = self.top_frame orelse return self.engineFault();
+        const kind: bytecode.LocalBinding = switch (binding) {
+            0 => .local,
+            1 => .cell,
+            2 => .free,
+            else => return self.engineFault(),
+        };
+        const value = self.registers[source];
+        switch (kind) {
+            .local => {
+                const index = indexOfName(frame.code.local_names, name) orelse return self.engineFault();
+                frame.locals[index] = value;
+                frame.roots[frame.localRootStart() + index].object = value.asObject();
+            },
+            .cell => {
+                const index = indexOfName(frame.code.cell_names, name) orelse return self.engineFault();
+                const cell = frame.local_cells[index] orelse return self.engineFault();
+                cell.value = value;
+            },
+            .free => {
+                const index = indexOfName(frame.code.free_names, name) orelse return self.engineFault();
+                const cell = frame.free_cells[index] orelse return self.engineFault();
+                cell.value = value;
+            },
+        }
+        return true;
+    }
+
     fn clearGlobals(self: *Runtime) void {
         for (self.environment.entries.items) |entry| self.heap.allocator.free(entry.name);
         self.environment.entries.clearRetainingCapacity();
     }
 
     fn execute(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
-        const code = self.code orelse return false;
+        const code = self.activeCode() orelse return false;
         const op = instruction.opcodeTag() orelse return self.engineFault();
         switch (op) {
             .load_const => {
@@ -235,7 +637,7 @@ pub const Runtime = struct {
             .load_global => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
                 const name = self.codeName(instruction.index32()) orelse return self.engineFault();
-                if (self.globalValue(name)) |value| {
+                if (self.globalValue(name) orelse self.builtinValue(name)) |value| {
                     self.setRegister(instruction.a(), value);
                 } else {
                     self.setException(.{ .kind = .name_error, .message = "name is not defined" }, line, column, name);
@@ -249,6 +651,16 @@ pub const Runtime = struct {
                     self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
                     return false;
                 }
+            },
+            .load_local => {
+                if (!self.validRegister(instruction.a())) return self.engineFault();
+                const name = self.codeName(instruction.index32()) orelse return self.engineFault();
+                if (!self.loadLocal(instruction.a(), name, instruction.flags(), line, column)) return false;
+            },
+            .store_local => {
+                if (!self.validRegister(instruction.a())) return self.engineFault();
+                const name = self.codeName(instruction.index32()) orelse return self.engineFault();
+                if (!self.storeLocal(instruction.a(), name, instruction.flags())) return false;
             },
             .move => {
                 if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
@@ -287,7 +699,25 @@ pub const Runtime = struct {
                 for (code.argument_registers[start..][0..count]) |register| if (!self.validRegister(register)) return self.engineFault();
                 if (!self.executePrint(code.argument_registers[start..][0..count], line, column)) return false;
             },
-            .return_value => {},
+            .return_value => {
+                if (!self.validRegister(instruction.a())) return self.engineFault();
+                const result = self.registers[instruction.a()];
+                const frame = self.popFrame() orelse return self.engineFault();
+                const return_destination = frame.return_destination;
+                self.freeFrameStorage(frame);
+                if (self.top_frame) |caller| {
+                    const destination = return_destination orelse return self.engineFault();
+                    if (!self.validRegister(destination)) return self.engineFault();
+                    self.setRegister(destination, result);
+                    _ = caller;
+                } else if (return_destination != null) return self.engineFault();
+            },
+            .call => {
+                if (!self.validRegister(instruction.a()) or !self.executeCall(instruction, line, column)) return false;
+            },
+            .make_function => {
+                if (!self.validRegister(instruction.a()) or !self.executeMakeFunction(instruction, line, column)) return false;
+            },
             .jump => {
                 if (!self.validJump(instruction.index32())) return self.engineFault();
                 self.instruction_pointer = instruction.index32();
@@ -365,6 +795,29 @@ pub const Runtime = struct {
     }
 
     fn executeBinary(self: *Runtime, destination: u16, left: Value, right: Value, operation: u8, line: u32, column: u32) bool {
+        if (operation == 0) {
+            const left_header = left.asObject() orelse null;
+            const right_header = right.asObject() orelse null;
+            if (left_header) |left_object| {
+                if (right_header) |right_object| {
+                    if (string.fromHeader(left_object)) |left_text| {
+                        if (string.fromHeader(right_object)) |right_text| {
+                            return switch (string.concat(&self.heap, left_text, right_text)) {
+                                .value => |joined| blk: {
+                                    self.setRegister(destination, Value.object(&joined.header));
+                                    break :blk true;
+                                },
+                                .python_exception => |exception| blk: {
+                                    self.setException(exception, line, column, null);
+                                    break :blk false;
+                                },
+                                .engine_error => self.engineFault(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
         const result = switch (operation) {
             0 => number.add(&self.heap, left, right),
             1 => number.subtract(&self.heap, left, right),
@@ -424,6 +877,24 @@ pub const Runtime = struct {
         }
         if (!self.appendOutput("\n")) {
                     self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        }
+        return true;
+    }
+
+    fn executePrintValues(self: *Runtime, values: []const Value, separator: []const u8, ending: []const u8, line: u32, column: u32) bool {
+        for (values, 0..) |value, index| {
+            if (index != 0 and !self.appendOutput(separator)) {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            }
+            if (!self.appendValue(value, line, column)) {
+                if (self.last_exception == null) self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            }
+        }
+        if (!self.appendOutput(ending)) {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return false;
         }
         return true;
@@ -623,12 +1094,12 @@ pub const Runtime = struct {
     }
 
     fn validJump(self: *const Runtime, target: u32) bool {
-        const code = self.code orelse return false;
+        const code = self.activeCode() orelse return false;
         return @as(usize, target) <= code.instructions.len;
     }
 
     fn codeName(self: *const Runtime, index: u32) ?[]const u8 {
-        const code = self.code orelse return null;
+        const code = self.activeCode() orelse return null;
         const position: usize = @intCast(index);
         if (position >= code.names.len) return null;
         return code.names[position];
@@ -637,6 +1108,17 @@ pub const Runtime = struct {
     fn globalValue(self: *const Runtime, name: []const u8) ?Value {
         for (self.environment.entries.items) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
         return null;
+    }
+
+    fn builtinValue(self: *const Runtime, name: []const u8) ?Value {
+        if (std.mem.eql(u8, name, "print")) return if (self.print_builtin_root.object) |header| Value.object(header) else null;
+        if (std.mem.eql(u8, name, "range")) return if (self.range_builtin_root.object) |header| Value.object(header) else null;
+        return null;
+    }
+
+    fn activeCode(self: *const Runtime) ?*Code {
+        const frame = self.top_frame orelse return null;
+        return frame.code;
     }
 
     fn storeGlobal(self: *Runtime, name: []const u8, value: Value) bool {
@@ -676,7 +1158,7 @@ pub const Runtime = struct {
     }
 
     fn currentFilename(self: *const Runtime) []const u8 {
-        if (self.code) |code| return code.filename;
+        if (self.activeCode()) |code| return code.filename;
         return "<module>";
     }
 
@@ -704,6 +1186,7 @@ fn exceptionName(kind: PythonExceptionKind) []const u8 {
         .exception => "Exception",
         .memory_error => "MemoryError",
         .name_error => "NameError",
+        .unbound_local_error => "UnboundLocalError",
         .zero_division_error => "ZeroDivisionError",
         .value_error => "ValueError",
         .overflow_error => "OverflowError",
@@ -711,6 +1194,11 @@ fn exceptionName(kind: PythonExceptionKind) []const u8 {
         .index_error => "IndexError",
         .unicode_decode_error => "UnicodeDecodeError",
     };
+}
+
+fn indexOfName(names: []const []const u8, name: []const u8) ?usize {
+    for (names, 0..) |candidate, index| if (std.mem.eql(u8, candidate, name)) return index;
+    return null;
 }
 
 fn compareOrder(order: std.math.Order, operation: u8) bool {

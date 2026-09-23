@@ -112,6 +112,15 @@ pub fn testPostfixesAndDisplays() !void {
     try expectError("{1: 2, 3}\n", .syntax_error, "cannot mix dictionary and set entries");
 }
 
+pub fn testCallArgumentOrderingErrors() !void {
+    try expectError("f(a=1, 2)\n", .syntax_error, "positional argument follows keyword argument");
+    try expectError("f(a=1, a=2)\n", .syntax_error, "keyword argument repeated");
+
+    // Iterable unpacking remains deferred to a later runtime commit, but its syntax is valid.
+    var unpacked = try expectAst("f(a=1, *xs)\n");
+    defer unpacked.deinit();
+}
+
 pub fn testFunctionSignature() !void {
     const source = "def f(a, b=1, /, c: int=2, *args, d, **kwargs):\n    return a\n";
     var ast = try expectAst(source);

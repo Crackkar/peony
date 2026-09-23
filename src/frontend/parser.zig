@@ -718,6 +718,9 @@ const Parser = struct {
 
     fn parseCallArguments(self: *Parser) ParseError![]const NodeId {
         var arguments: std.ArrayList(NodeId) = .empty;
+        var explicit_keyword_names: std.ArrayList([]const u8) = .empty;
+        defer explicit_keyword_names.deinit(self.allocator);
+        var saw_explicit_keyword = false;
         if (self.atText(")")) return arguments.toOwnedSlice(self.allocator);
         while (true) {
             var argument: NodeId = undefined;
@@ -727,10 +730,17 @@ const Parser = struct {
                 argument = try self.addNode(.starred, .{ .start = marker.start, .end = self.node(value).span.end }, self.tokenText(marker), 0, &.{value});
             } else if (self.at(.identifier) and self.peekText(1, "=")) {
                 const name = self.advance();
+                const keyword_name = self.tokenText(name);
+                for (explicit_keyword_names.items) |previous| {
+                    if (std.mem.eql(u8, previous, keyword_name)) return self.failAtToken(name, "keyword argument repeated");
+                }
+                try explicit_keyword_names.append(self.allocator, keyword_name);
+                saw_explicit_keyword = true;
                 _ = self.advance();
                 const value = try self.parseExpression(0);
-                argument = try self.addNode(.keyword_argument, .{ .start = name.start, .end = self.node(value).span.end }, self.tokenText(name), 0, &.{value});
+                argument = try self.addNode(.keyword_argument, .{ .start = name.start, .end = self.node(value).span.end }, keyword_name, 0, &.{value});
             } else {
+                if (saw_explicit_keyword) return self.failAtCurrent("positional argument follows keyword argument");
                 argument = try self.parseExpression(0);
                 if (self.atText("for")) return self.failUnsupported(.later_commit, "generator expressions are not parsed in this commit");
             }

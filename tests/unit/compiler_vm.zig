@@ -119,6 +119,12 @@ pub fn testInternalBytecodeFaultIsNotAPythonException() !void {
     try std.testing.expect(runtime.pythonException() == null);
 }
 
+pub fn testUnboundLocalErrorHierarchy() !void {
+    try std.testing.expect(exceptions.isSubclass(.unbound_local_error, .name_error));
+    try std.testing.expect(exceptions.isSubclass(.unbound_local_error, .exception));
+    try std.testing.expect(exceptions.isSubclass(.unbound_local_error, .base_exception));
+}
+
 pub fn testUnsupportedSyntaxAndMemoryLimitTransport() !void {
     {
         var runtime: runtime_vm.Runtime = undefined;

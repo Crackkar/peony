@@ -67,6 +67,8 @@ pub fn build(b: *std.Build) void {
     });
     bytecode_module.addImport("runtime_gc", native_runtime.gc);
     bytecode_module.addImport("runtime_value", native_runtime.value);
+    const native_function_module = createRuntimeFunctionModule(b, target, optimize, native_runtime, bytecode_module);
+    const native_binder_module = createRuntimeBinderModule(b, target, optimize, native_runtime);
     const compiler_module = b.createModule(.{
         .root_source_file = b.path("src/frontend/compiler.zig"),
         .target = target,
@@ -89,12 +91,15 @@ pub fn build(b: *std.Build) void {
     });
     runtime_vm_module.addImport("frontend_bytecode", bytecode_module);
     runtime_vm_module.addImport("frontend_compiler", compiler_module);
+    runtime_vm_module.addImport("frontend_ast", frontend_modules.ast);
     runtime_vm_module.addImport("runtime_gc", native_runtime.gc);
     runtime_vm_module.addImport("runtime_value", native_runtime.value);
     runtime_vm_module.addImport("runtime_number", native_runtime.number);
     runtime_vm_module.addImport("runtime_string", native_runtime.string);
     runtime_vm_module.addImport("runtime_exception", native_runtime.exception);
     runtime_vm_module.addImport("runtime_iterator", native_iterator_module);
+    runtime_vm_module.addImport("runtime_function", native_function_module);
+    runtime_vm_module.addImport("runtime_binder", native_binder_module);
     const compiler_vm_test_module = b.createModule(.{
         .root_source_file = b.path("tests/unit/compiler_vm.zig"),
         .target = target,
@@ -111,6 +116,12 @@ pub fn build(b: *std.Build) void {
     });
     control_flow_test_module.addImport("runtime_vm", runtime_vm_module);
     control_flow_test_module.addImport("runtime_exception", native_runtime.exception);
+    const functions_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/functions.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    functions_test_module.addImport("runtime_vm", runtime_vm_module);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -142,6 +153,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("scope_tests", scope_test_module);
     unit_test_root.addImport("compiler_vm_tests", compiler_vm_test_module);
     unit_test_root.addImport("control_flow_tests", control_flow_test_module);
+    unit_test_root.addImport("functions_tests", functions_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -275,6 +287,8 @@ fn createExecutionVmModule(
     });
     bytecode_module.addImport("runtime_gc", runtime.gc);
     bytecode_module.addImport("runtime_value", runtime.value);
+    const function_module = createRuntimeFunctionModule(b, target, optimize, runtime, bytecode_module);
+    const binder_module = createRuntimeBinderModule(b, target, optimize, runtime);
     const compiler_module = b.createModule(.{
         .root_source_file = b.path("src/frontend/compiler.zig"),
         .target = target,
@@ -297,13 +311,50 @@ fn createExecutionVmModule(
     });
     vm_module.addImport("frontend_bytecode", bytecode_module);
     vm_module.addImport("frontend_compiler", compiler_module);
+    vm_module.addImport("frontend_ast", frontend.ast);
     vm_module.addImport("runtime_gc", runtime.gc);
     vm_module.addImport("runtime_value", runtime.value);
     vm_module.addImport("runtime_number", runtime.number);
     vm_module.addImport("runtime_string", runtime.string);
     vm_module.addImport("runtime_exception", runtime.exception);
     vm_module.addImport("runtime_iterator", iterator_module);
+    vm_module.addImport("runtime_function", function_module);
+    vm_module.addImport("runtime_binder", binder_module);
     return vm_module;
+}
+
+fn createRuntimeFunctionModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    runtime: RuntimeModules,
+    bytecode: *std.Build.Module,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/function.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("runtime_gc", runtime.gc);
+    module.addImport("runtime_value", runtime.value);
+    module.addImport("runtime_exception", runtime.exception);
+    module.addImport("frontend_bytecode", bytecode);
+    return module;
+}
+
+fn createRuntimeBinderModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    runtime: RuntimeModules,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/binder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("runtime_value", runtime.value);
+    return module;
 }
 
 fn createRuntimeIteratorModule(
