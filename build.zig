@@ -54,6 +54,14 @@ pub fn build(b: *std.Build) void {
     string_bytes_test_module.addImport("runtime_string", native_runtime.string);
     string_bytes_test_module.addImport("runtime_bytes", native_runtime.bytes);
     string_bytes_test_module.addImport("runtime_unicode", native_runtime.unicode);
+    const lexer_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/lexer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const frontend_modules = createFrontendModules(b, target, optimize);
+    lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
+    lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const unit_test_root = b.createModule(.{
         .root_source_file = b.path("tests/unit/root.zig"),
         .target = target,
@@ -63,6 +71,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("runtime_gc_tests", gc_test_module);
     unit_test_root.addImport("value_number_tests", value_number_test_module);
     unit_test_root.addImport("string_bytes_tests", string_bytes_test_module);
+    unit_test_root.addImport("lexer_tests", lexer_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -98,6 +107,30 @@ pub fn build(b: *std.Build) void {
     addProbe(b, wasm_target, "bigint", "peony_probe_bigint");
     addProbe(b, wasm_target, "json", "peony_probe_json");
     addProbe(b, wasm_target, "unicode15", "peony_probe_unicode15");
+}
+
+const FrontendModules = struct {
+    token: *std.Build.Module,
+    lexer: *std.Build.Module,
+};
+
+fn createFrontendModules(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) FrontendModules {
+    const token_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/token.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const lexer_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/lexer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lexer_module.addImport("frontend_token", token_module);
+    return .{ .token = token_module, .lexer = lexer_module };
 }
 
 fn addProbe(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, probe_symbol: []const u8) void {

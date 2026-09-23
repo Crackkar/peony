@@ -1,6 +1,7 @@
 const gc_tests = @import("runtime_gc_tests");
 const value_tests = @import("value_number_tests");
 const string_tests = @import("string_bytes_tests");
+const lexer_tests = @import("lexer_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -112,4 +113,52 @@ test "invalid UTF-8 bytes decode as UnicodeDecodeError" {
 
 test "string and bytes storage obey the session cap and GC" {
     try string_tests.testStringBytesAccounting();
+}
+
+test "lexer classifies tokens and records byte spans and physical locations" {
+    try lexer_tests.testTokenSpans();
+}
+
+test "lexer normalizes newline forms and preserves physical lines" {
+    try lexer_tests.testNewlineForms();
+}
+
+test "lexer skips blank comments and separates simple statements" {
+    try lexer_tests.testCommentsAndSemicolons();
+}
+
+test "lexer expands tab stops and diagnoses ambiguous indentation" {
+    try lexer_tests.testIndentationAndTabError();
+}
+
+test "lexer diagnoses unmatched dedent" {
+    try lexer_tests.testUnmatchedDedent();
+}
+
+test "lexer handles implicit and explicit line continuation" {
+    try lexer_tests.testContinuations();
+}
+
+test "lexer recognizes numeric forms and rejects malformed or complex literals" {
+    try lexer_tests.testNumbers();
+}
+
+test "lexer recognizes walrus and not-equal as single operators" {
+    try lexer_tests.testOperators();
+}
+
+test "lexer recognizes literal prefixes and triple quotes" {
+    try lexer_tests.testStringLiterals();
+}
+
+test "lexer accepts UTF-8 cookies and rejects unsupported encodings" {
+    try lexer_tests.testEncodingCookies();
+}
+
+test "lexer accepts Unicode string data and rejects Unicode identifiers" {
+    try lexer_tests.testUnicodeSource();
+}
+
+test "Python soft keywords remain identifiers" {
+    try lexer_tests.testSoftKeywords();
 }
