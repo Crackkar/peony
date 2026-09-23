@@ -34,6 +34,10 @@ pub const Opcode = enum(u8) {
     delete_global,
     unpack,
     materialize_star,
+    make_mapping,
+    mapping_set,
+    mapping_update,
+    materialize_dstar,
 };
 
 /// Fixed 64-bit register instruction. The least-significant byte is the opcode;
@@ -97,6 +101,10 @@ pub const Instruction = struct {
             29 => .delete_global,
             30 => .unpack,
             31 => .materialize_star,
+            32 => .make_mapping,
+            33 => .mapping_set,
+            34 => .mapping_update,
+            35 => .materialize_dstar,
             else => null,
         };
     }
@@ -151,11 +159,17 @@ pub const CallArgument = struct {
     register: u16,
     keyword_name: u32 = std.math.maxInt(u32),
     starred: bool = false,
+    double_starred: bool = false,
 };
 
 pub const CallSite = struct {
     argument_start: u32,
     argument_count: u16,
+};
+
+pub const DstarSite = struct {
+    previous_start: u32,
+    previous_count: u16,
 };
 
 pub const FunctionSite = struct {
@@ -201,6 +215,8 @@ pub const Code = struct {
     argument_registers: []u16 = &.{},
     call_arguments: []CallArgument = &.{},
     call_sites: []CallSite = &.{},
+    dstar_previous_arguments: []CallArgument = &.{},
+    dstar_sites: []DstarSite = &.{},
     function_sites: []FunctionSite = &.{},
     unpack_sites: []UnpackSite = &.{},
     sequence_sites: []SequenceSite = &.{},
@@ -234,6 +250,8 @@ pub const Code = struct {
         self.allocator.free(self.argument_registers);
         self.allocator.free(self.call_arguments);
         self.allocator.free(self.call_sites);
+        self.allocator.free(self.dstar_previous_arguments);
+        self.allocator.free(self.dstar_sites);
         self.allocator.free(self.function_sites);
         self.allocator.free(self.unpack_sites);
         self.allocator.free(self.sequence_sites);

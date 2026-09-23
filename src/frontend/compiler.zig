@@ -144,6 +144,8 @@ const Compiler = struct {
     argument_registers: std.ArrayList(u16) = .empty,
     call_arguments: std.ArrayList(bytecode.CallArgument) = .empty,
     call_sites: std.ArrayList(bytecode.CallSite) = .empty,
+    dstar_previous_arguments: std.ArrayList(bytecode.CallArgument) = .empty,
+    dstar_sites: std.ArrayList(bytecode.DstarSite) = .empty,
     function_sites: std.ArrayList(bytecode.FunctionSite) = .empty,
     unpack_sites: std.ArrayList(bytecode.UnpackSite) = .empty,
     sequence_sites: std.ArrayList(bytecode.SequenceSite) = .empty,
@@ -244,11 +246,12 @@ const Compiler = struct {
         var positional_only_count: u32 = 0;
         var keyword_only_count: u32 = 0;
         var has_var_positional = false;
+        var has_var_keyword = false;
         for (parameters) |parameter_id| {
             const parameter = self.ast.node(parameter_id);
             if (parameter.kind != .parameter) return self.failUnsupported(parameter.span, "function parameter shape is unsupported");
-            if (parameter.flags & ast_module.parameter_flags.var_keyword != 0) return self.failUnsupported(parameter.span, "**kwargs requires dictionary support");
             if (parameter.flags & ast_module.parameter_flags.var_positional != 0) has_var_positional = true;
+            if (parameter.flags & ast_module.parameter_flags.var_keyword != 0) has_var_keyword = true;
             const parameter_name = self.allocator.dupe(u8, parameter.text) catch return error.OutOfMemory;
             self.parameter_names.append(self.allocator, parameter_name) catch {
                 self.allocator.free(parameter_name);
@@ -267,6 +270,7 @@ const Compiler = struct {
             .positional_only_count = std.math.cast(u16, positional_only_count) orelse return error.Unsupported,
             .keyword_only_count = std.math.cast(u16, keyword_only_count) orelse return error.Unsupported,
             .var_positional = has_var_positional,
+            .var_keyword = has_var_keyword,
         };
     }
 
@@ -303,6 +307,8 @@ const Compiler = struct {
         self.code.argument_registers = try self.argument_registers.toOwnedSlice(self.allocator);
         self.code.call_arguments = try self.call_arguments.toOwnedSlice(self.allocator);
         self.code.call_sites = try self.call_sites.toOwnedSlice(self.allocator);
+        self.code.dstar_previous_arguments = try self.dstar_previous_arguments.toOwnedSlice(self.allocator);
+        self.code.dstar_sites = try self.dstar_sites.toOwnedSlice(self.allocator);
         self.code.function_sites = try self.function_sites.toOwnedSlice(self.allocator);
         self.code.unpack_sites = try self.unpack_sites.toOwnedSlice(self.allocator);
         self.code.sequence_sites = try self.sequence_sites.toOwnedSlice(self.allocator);
@@ -330,6 +336,8 @@ const Compiler = struct {
         self.argument_registers.deinit(self.allocator);
         self.call_arguments.deinit(self.allocator);
         self.call_sites.deinit(self.allocator);
+        self.dstar_previous_arguments.deinit(self.allocator);
+        self.dstar_sites.deinit(self.allocator);
         self.function_sites.deinit(self.allocator);
         self.unpack_sites.deinit(self.allocator);
         self.sequence_sites.deinit(self.allocator);
@@ -749,6 +757,8 @@ const Compiler = struct {
             .call => return self.compileCall(node_id),
             .list_display => return self.compileSequence(node_id, false),
             .tuple_display => return self.compileSequence(node_id, true),
+            .set_display => return self.compileMappingDisplay(node_id, true),
+            .dict_display => return self.compileMappingDisplay(node_id, false),
             .attribute => return self.compileAttribute(node_id),
             .subscript => return self.compileSubscript(node_id),
             .bytes_literal => {
@@ -881,6 +891,43 @@ const Compiler = struct {
         return result;
     }
 
+    fn compileMappingDisplay(self: *Compiler, node_id: NodeId, is_set: bool) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const result = try self.acquire(node.span);
+        try self.emit(.make_mapping, result, 0, 0, @intFromBool(is_set), node.span);
+        var index: usize = 0;
+        while (index < children.len) {
+            const child = self.ast.node(children[index]);
+            if (!is_set and child.kind == .starred and std.mem.eql(u8, child.text, "**")) {
+                const values = self.ast.children(children[index]);
+                if (values.len != 1) return self.failUnsupported(child.span, "dictionary unpacking shape is unsupported");
+                const source = try self.compileExpression(values[0]);
+                try self.emit(.mapping_update, result, source, 0, 1, child.span);
+                self.temps.release(source);
+                index += 1;
+                continue;
+            }
+            const key = try self.compileExpression(children[index]);
+            if (is_set) {
+                try self.emit(.mapping_set, result, key, 0, 1, child.span);
+                self.temps.release(key);
+                index += 1;
+                continue;
+            }
+            if (index + 1 >= children.len) return self.failUnsupported(child.span, "dictionary entry has no value");
+            const value = self.compileExpression(children[index + 1]) catch |err| {
+                self.temps.release(key);
+                return err;
+            };
+            try self.emit(.mapping_set, result, key, value, 0, child.span);
+            self.temps.release(value);
+            self.temps.release(key);
+            index += 2;
+        }
+        return result;
+    }
+
     fn compileAttribute(self: *Compiler, node_id: NodeId) CompileError!u16 {
         const node = self.ast.node(node_id);
         const children = self.ast.children(node_id);
@@ -943,33 +990,53 @@ const Compiler = struct {
         const initial_temps = self.temps.next;
         errdefer self.temps.next = initial_temps;
         const callee = try self.compileExpression(children[0]);
-        const held = self.scratch_allocator.alloc(u16, count) catch {
+        const held = self.scratch_allocator.alloc(bytecode.CallArgument, count) catch {
             return error.OutOfMemory;
         };
         var held_count: usize = 0;
 
         for (children[1..]) |argument_id| {
             const argument = self.ast.node(argument_id);
-            if (argument.kind == .starred and std.mem.eql(u8, argument.text, "**")) return self.failUnsupported(argument.span, "** call unpacking requires mapping support");
             const value_node = if (argument.kind == .keyword_argument or argument.kind == .starred) self.ast.children(argument_id)[0] else argument_id;
             const register = try self.compileExpression(value_node);
-            if (argument.kind == .starred) try self.emit(.materialize_star, register, 0, 0, 0, argument.span);
-            held[held_count] = register;
+            const keyword_name = if (argument.kind == .keyword_argument) try self.internName(argument.text) else std.math.maxInt(u32);
+            const call_argument = bytecode.CallArgument{
+                .register = register,
+                .keyword_name = keyword_name,
+                .starred = argument.kind == .starred and std.mem.eql(u8, argument.text, "*"),
+                .double_starred = argument.kind == .starred and std.mem.eql(u8, argument.text, "**"),
+            };
+            if (argument.kind == .starred) {
+                const is_double = std.mem.eql(u8, argument.text, "**");
+                if (is_double) {
+                    const previous_start = std.math.cast(u32, self.dstar_previous_arguments.items.len) orelse return self.failUnsupported(argument.span, "too many double-star call operands");
+                    var previous_count: usize = 0;
+                    for (held[0..held_count]) |previous| {
+                        if (previous.double_starred or previous.keyword_name != std.math.maxInt(u32)) {
+                            try self.dstar_previous_arguments.append(self.allocator, previous);
+                            previous_count += 1;
+                        }
+                    }
+                    const previous_count_u16 = std.math.cast(u16, previous_count) orelse return self.failUnsupported(argument.span, "too many prior call keywords");
+                    const dstar_site_index = std.math.cast(u32, self.dstar_sites.items.len) orelse return self.failUnsupported(argument.span, "too many double-star call sites");
+                    try self.dstar_sites.append(self.allocator, .{ .previous_start = previous_start, .previous_count = previous_count_u16 });
+                    try self.emitIndex(.materialize_dstar, register, dstar_site_index, 0, argument.span);
+                } else {
+                    try self.emit(.materialize_star, register, 0, 0, 0, argument.span);
+                }
+            }
+            held[held_count] = call_argument;
             held_count += 1;
         }
 
         const argument_start = std.math.cast(u32, self.call_arguments.items.len) orelse return self.failUnsupported(node.span, "code object has too many call operands");
-        for (children[1..], 0..) |argument_id, index| {
-            const argument = self.ast.node(argument_id);
-            const keyword_name = if (argument.kind == .keyword_argument) try self.internName(argument.text) else std.math.maxInt(u32);
-            try self.call_arguments.append(self.allocator, .{ .register = held[index], .keyword_name = keyword_name, .starred = argument.kind == .starred });
-        }
+        try self.call_arguments.appendSlice(self.allocator, held[0..held_count]);
         const site_index = std.math.cast(u32, self.call_sites.items.len) orelse return self.failUnsupported(node.span, "too many call sites");
         try self.call_sites.append(self.allocator, .{ .argument_start = argument_start, .argument_count = @intCast(count) });
         try self.emitIndex(.call, callee, site_index, 0, node.span);
         while (held_count > 0) {
             held_count -= 1;
-            self.temps.release(held[held_count]);
+            self.temps.release(held[held_count].register);
         }
         return callee;
     }

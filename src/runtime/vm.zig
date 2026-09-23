@@ -7,6 +7,8 @@ const number = @import("runtime_number");
 const string = @import("runtime_string");
 const byte_module = @import("runtime_bytes");
 const sequence = @import("runtime_sequence");
+const dict_module = @import("runtime_dict");
+const hash_module = @import("runtime_hash");
 const slice = @import("runtime_slice");
 const exceptions = @import("runtime_exception");
 const iterator = @import("runtime_iterator");
@@ -16,6 +18,8 @@ const ast_module = @import("frontend_ast");
 
 const Value = value_module.Value;
 const Code = bytecode.Code;
+
+var session_hash_nonce: u64 = 0;
 
 pub const CompileOutcome = compiler.CompileOutcome;
 pub const PythonException = exceptions.PythonException;
@@ -102,6 +106,7 @@ pub const Runtime = struct {
     stdout_bytes: std.ArrayList(u8) = .empty,
     repr_path: std.ArrayList(*gc.Header) = .empty,
     value_equality_depth: usize = 0,
+    hash_seed: u64 = 0,
     last_exception: ?PythonException = null,
     error_text_owned: ?[]u8 = null,
     error_text_static: []const u8 = "",
@@ -111,6 +116,8 @@ pub const Runtime = struct {
 
     pub fn init(self: *Runtime, backing: std.mem.Allocator, max_bytes: usize) std.mem.Allocator.Error!void {
         self.* = .{};
+        session_hash_nonce +%= 1;
+        self.hash_seed = hash_module.mixSessionSeed(session_hash_nonce, @intFromPtr(self));
         self.session_allocator = gc.SessionAllocator.init(backing, max_bytes);
         self.heap.init(&self.session_allocator, .{});
         const environment = try self.heap.createObject(Environment, &environment_kind);
@@ -357,7 +364,18 @@ pub const Runtime = struct {
         var call_roots_active = true;
         defer if (call_roots_active) call_root_frame.pop();
 
-        const keywords = allocator.alloc(binder.Keyword, count) catch {
+        var keyword_capacity = count;
+        for (code.call_arguments[start..][0..count]) |argument| {
+            if (!argument.double_starred) continue;
+            if (!self.validRegister(argument.register)) return self.engineFault();
+            const mapping_header = self.registers[argument.register].asObject() orelse return self.engineFault();
+            const mapping = dict_module.dictFromHeader(mapping_header) orelse return self.engineFault();
+            keyword_capacity = std.math.add(usize, keyword_capacity, mapping.size) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            };
+        }
+        const keywords = allocator.alloc(binder.Keyword, keyword_capacity) catch {
             self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return false;
         };
@@ -366,7 +384,16 @@ pub const Runtime = struct {
         for (code.call_arguments[start..][0..count]) |argument| {
             if (!self.validRegister(argument.register)) return self.engineFault();
             const value = self.registers[argument.register];
-            if (argument.keyword_name == std.math.maxInt(u32)) {
+            if (argument.double_starred) {
+                const mapping_header = value.asObject() orelse return self.engineFault();
+                const mapping = dict_module.dictFromHeader(mapping_header) orelse return self.engineFault();
+                for (mapping.entries.items) |entry| {
+                    if (!entry.alive) continue;
+                    const key_header = entry.key.asObject() orelse return self.nativeTypeError(line, column, "keywords must be strings");
+                    const key = string.fromHeader(key_header) orelse return self.nativeTypeError(line, column, "keywords must be strings");
+                    if (!self.appendCallKeyword(keywords, &keyword_count, string.content(key), entry.value, line, column)) return false;
+                }
+            } else if (argument.keyword_name == std.math.maxInt(u32)) {
                 if (argument.starred) {
                     const expanded = switch (iterator.createIterator(&self.heap, value)) {
                         .value => |selected| selected,
@@ -412,8 +439,7 @@ pub const Runtime = struct {
                 }
             } else {
                 const name = self.codeName(argument.keyword_name) orelse return self.engineFault();
-                keywords[keyword_count] = .{ .name = name, .value = value };
-                keyword_count += 1;
+                if (!self.appendCallKeyword(keywords, &keyword_count, name, value, line, column)) return false;
             }
         }
         const positional = positional_object.items.items;
@@ -429,7 +455,7 @@ pub const Runtime = struct {
         if (function.native) |native| return self.executeNativeCall(instruction.a(), native, function.bound_self, positional, keywords[0..keyword_count], line, column);
 
         const function_code = function.code orelse return self.engineFault();
-        const bound = binder.bindFunction(
+        const binding = binder.bindFunction(
             &self.heap,
             allocator,
             function_code.parameter_names,
@@ -441,10 +467,36 @@ pub const Runtime = struct {
             self.setBinderException(err, line, column);
             return false;
         };
+        const bound = binding.values;
         defer allocator.free(bound);
+        defer if (binding.extra_keywords.len != 0) allocator.free(binding.extra_keywords);
         for (function_code.parameter_flags, 0..) |flags, index| {
             if (flags & binder.parameter_flags_module.var_positional != 0) {
                 call_roots[1].object = bound[index].asObject();
+            }
+            if (flags & binder.parameter_flags_module.var_keyword != 0) {
+                const created = dict_module.create(&self.heap, false);
+                const mapping = switch (created) {
+                    .value => |selected| selected,
+                    .python_exception => |exception| {
+                        self.setException(exception, line, column, null);
+                        return false;
+                    },
+                    .engine_error => return self.engineFault(),
+                };
+                call_roots[2].object = &mapping.header;
+                for (binding.extra_keywords) |keyword| {
+                    const key = switch (string.create(&self.heap, keyword.name)) {
+                        .value => |selected| Value.object(&selected.header),
+                        .python_exception => |exception| {
+                            self.setException(exception, line, column, null);
+                            return false;
+                        },
+                        .engine_error => return self.engineFault(),
+                    };
+                    if (!self.setMappingValue(mapping, key, keyword.value, line, column)) return false;
+                }
+                bound[index] = Value.object(&mapping.header);
             }
         }
         const bound_roots = allocator.alloc(gc.Root, bound.len) catch {
@@ -504,6 +556,19 @@ pub const Runtime = struct {
         }
         bound_root_frame.pop();
         bound_roots_active = false;
+        return true;
+    }
+
+    fn appendCallKeyword(self: *Runtime, keywords: []binder.Keyword, count: *usize, name: []const u8, value: Value, line: u32, column: u32) bool {
+        for (keywords[0..count.*]) |previous| {
+            if (std.mem.eql(u8, previous.name, name)) {
+                self.setException(.{ .kind = .type_error, .message = "got multiple values for keyword argument" }, line, column, null);
+                return false;
+            }
+        }
+        if (count.* >= keywords.len) return self.engineFault();
+        keywords[count.*] = .{ .name = name, .value = value };
+        count.* += 1;
         return true;
     }
 
@@ -697,6 +762,17 @@ pub const Runtime = struct {
         column: u32,
     ) bool {
         switch (native) {
+            .hash => {
+                if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
+                const key_hash = self.pythonHash(positional[0], line, column) orelse return false;
+                const signed: i64 = @bitCast(key_hash);
+                const value = number.fromInt(&self.heap, signed);
+                return self.storeValueResult(destination, value, line, column);
+            },
+            .dict, .set => return self.executeMappingConstructor(destination, native == .set, positional, keywords, line, column),
+            .dict_get, .dict_keys, .dict_values, .dict_items, .dict_pop, .dict_setdefault, .dict_update, .dict_clear, .dict_copy,
+            .set_add, .set_remove, .set_discard, .set_pop, .set_update, .set_clear, .set_copy,
+            => return self.executeMappingMethod(destination, native, bound_self, positional, keywords, line, column),
             .list_append, .list_extend, .list_insert, .list_pop, .list_remove, .list_clear, .list_index, .list_count, .list_reverse, .list_copy, .list_sort => {
                 const header = bound_self.asObject() orelse return self.engineFault();
                 const list = sequence.listFromHeader(header) orelse return self.engineFault();
@@ -799,6 +875,13 @@ pub const Runtime = struct {
                 if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
                 const value = positional[0];
                 if (sequence.length(value)) |length_value| return self.setSmallInt(destination, length_value, line, column);
+                if (dict_module.sizeOf(value)) |mapping_length| {
+                    const length_value = std.math.cast(i64, mapping_length) orelse {
+                        self.setException(.{ .kind = .overflow_error, .message = "Python int too large to convert to C ssize_t" }, line, column, null);
+                        return false;
+                    };
+                    return self.setSmallInt(destination, length_value, line, column);
+                }
                 if (value.asObject()) |header| {
                     if (string.fromHeader(header)) |text| return self.setSmallInt(destination, string.length(text), line, column);
                     if (byte_module.fromHeader(header)) |data| return self.setSmallInt(destination, data.data.len, line, column);
@@ -870,6 +953,312 @@ pub const Runtime = struct {
             },
             else => return self.engineFault(),
         }
+    }
+
+    fn executeMappingConstructor(self: *Runtime, destination: u16, is_set: bool, positional: []const Value, keywords: []const binder.Keyword, line: u32, column: u32) bool {
+        if (positional.len > 1 or (is_set and keywords.len != 0)) return self.nativeArity(line, column);
+        const created = dict_module.create(&self.heap, is_set);
+        const mapping = switch (created) {
+            .value => |selected| selected,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        var root = gc.Root{ .object = &mapping.header };
+        var roots = gc.RootFrame{};
+        roots.push(&self.heap.roots);
+        roots.add(&root);
+        defer roots.pop();
+        if (positional.len == 1) {
+            if (is_set) {
+                if (!self.updateSetFromIterable(mapping, positional[0], line, column)) return false;
+            } else if (!self.updateDictFromValue(mapping, positional[0], line, column)) return false;
+        }
+        if (!is_set) for (keywords) |keyword| {
+            const key = switch (string.create(&self.heap, keyword.name)) {
+                .value => |selected| Value.object(&selected.header),
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            if (!self.setMappingValue(mapping, key, keyword.value, line, column)) return false;
+        };
+        self.setRegister(destination, Value.object(&mapping.header));
+        return true;
+    }
+
+    fn updateDictFromValue(self: *Runtime, mapping: *dict_module.Dict, source_value: Value, line: u32, column: u32) bool {
+        if (source_value.asObject()) |source_header| if (dict_module.dictFromHeader(source_header)) |source| {
+            if (!source.is_set) {
+                for (source.entries.items) |entry| {
+                    if (entry.alive and !self.setMappingValueWithHash(mapping, entry.key, entry.value, entry.hash, line, column)) return false;
+                }
+                return true;
+            }
+        };
+        var roots: [7]gc.Root = [_]gc.Root{.{ .object = null }} ** 7;
+        roots[0].object = &mapping.header;
+        roots[1].object = source_value.asObject();
+        var root_frame = gc.RootFrame{};
+        root_frame.push(&self.heap.roots);
+        for (&roots) |*root| root_frame.add(root);
+        defer root_frame.pop();
+        const created_iterator = iterator.createIterator(&self.heap, source_value);
+        const source_iterator = switch (created_iterator) {
+            .value => |selected| selected,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        roots[2].object = &source_iterator.header;
+        while (true) {
+            const next_pair = iterator.next(&self.heap, source_iterator);
+            const pair = switch (next_pair) {
+                .item => |selected| selected,
+                .done => break,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            roots[3].object = pair.asObject();
+            const pair_iterator_result = iterator.createIterator(&self.heap, pair);
+            const pair_iterator = switch (pair_iterator_result) {
+                .value => |selected| selected,
+                .python_exception => {
+                    self.setException(.{ .kind = .value_error, .message = "dictionary update sequence element is not a pair" }, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            roots[4].object = &pair_iterator.header;
+            const first = iterator.next(&self.heap, pair_iterator);
+            roots[5].object = switch (first) {
+                .item => |value| value.asObject(),
+                .done => {
+                    self.setException(.{ .kind = .value_error, .message = "dictionary update sequence element has length 0; 2 is required" }, line, column, null);
+                    return false;
+                },
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            const first_value = switch (first) {
+                .item => |value| value,
+                else => unreachable,
+            };
+            const second = iterator.next(&self.heap, pair_iterator);
+            roots[6].object = switch (second) {
+                .item => |value| value.asObject(),
+                .done => {
+                    self.setException(.{ .kind = .value_error, .message = "dictionary update sequence element has length 1; 2 is required" }, line, column, null);
+                    return false;
+                },
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            const second_value = switch (second) {
+                .item => |value| value,
+                else => unreachable,
+            };
+            switch (iterator.next(&self.heap, pair_iterator)) {
+                .done => {},
+                .item => {
+                    self.setException(.{ .kind = .value_error, .message = "dictionary update sequence element has length greater than 2" }, line, column, null);
+                    return false;
+                },
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            }
+            if (!self.setMappingValue(mapping, first_value, second_value, line, column)) return false;
+        }
+        return true;
+    }
+
+    fn updateSetFromIterable(self: *Runtime, target: *dict_module.Dict, source: Value, line: u32, column: u32) bool {
+        var roots: [4]gc.Root = .{ .{ .object = &target.header }, .{ .object = source.asObject() }, .{ .object = null }, .{ .object = null } };
+        var root_frame = gc.RootFrame{};
+        root_frame.push(&self.heap.roots);
+        for (&roots) |*root| root_frame.add(root);
+        defer root_frame.pop();
+        const created_iterator = iterator.createIterator(&self.heap, source);
+        const source_iterator = switch (created_iterator) {
+            .value => |selected| selected,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        roots[2].object = &source_iterator.header;
+        while (true) switch (iterator.next(&self.heap, source_iterator)) {
+            .item => |item| {
+                roots[3].object = item.asObject();
+                if (!self.setMappingValue(target, item, Value.noneValue(), line, column)) return false;
+            },
+            .done => return true,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+    }
+
+    fn executeMappingMethod(self: *Runtime, destination: u16, native: functions.Native, bound_self: Value, positional: []const Value, keywords: []const binder.Keyword, line: u32, column: u32) bool {
+        const header = bound_self.asObject() orelse return self.engineFault();
+        const mapping = dict_module.dictFromHeader(header) orelse return self.engineFault();
+        if (mapping.is_set != (native == .set_add or native == .set_remove or native == .set_discard or native == .set_pop or native == .set_update or native == .set_clear or native == .set_copy)) return self.engineFault();
+        if (native == .dict_update) {
+            if (positional.len > 1) return self.nativeArity(line, column);
+            if (positional.len == 1 and !self.updateDictFromValue(mapping, positional[0], line, column)) return false;
+            for (keywords) |keyword| {
+                const key = switch (string.create(&self.heap, keyword.name)) {
+                    .value => |selected| Value.object(&selected.header),
+                    .python_exception => |exception| {
+                        self.setException(exception, line, column, null);
+                        return false;
+                    },
+                    .engine_error => return self.engineFault(),
+                };
+                if (!self.setMappingValue(mapping, key, keyword.value, line, column)) return false;
+            }
+            self.setRegister(destination, Value.noneValue());
+            return true;
+        }
+        if (native == .set_update) {
+            if (keywords.len != 0) return self.nativeTypeError(line, column, "set.update does not accept keyword arguments");
+            for (positional) |source| if (!self.updateSetFromIterable(mapping, source, line, column)) return false;
+            self.setRegister(destination, Value.noneValue());
+            return true;
+        }
+        if (keywords.len != 0) return self.nativeTypeError(line, column, "mapping method does not accept keyword arguments");
+        switch (native) {
+            .dict_get => {
+                if (positional.len < 1 or positional.len > 2) return self.nativeArity(line, column);
+                const key_hash = self.pythonHash(positional[0], line, column) orelse return false;
+                var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+                return switch (dict_module.get(mapping, positional[0], key_hash, &context, dictKeysEqual)) {
+                    .value => |value| blk: { self.setRegister(destination, value); break :blk true; },
+                    .missing => blk: { self.setRegister(destination, if (positional.len == 2) positional[1] else Value.noneValue()); break :blk true; },
+                    .failed => self.last_exception == null and self.engineFault(),
+                };
+            },
+            .dict_keys, .dict_values, .dict_items => {
+                if (positional.len != 0) return self.nativeArity(line, column);
+                const kind: dict_module.ViewKind = if (native == .dict_keys) .keys else if (native == .dict_values) .values else .items;
+                return switch (dict_module.createView(&self.heap, mapping, kind)) {
+                    .value => |view| blk: { self.setRegister(destination, Value.object(&view.header)); break :blk true; },
+                    .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk false; },
+                    .engine_error => self.engineFault(),
+                };
+            },
+            .dict_pop, .dict_setdefault => {
+                if (positional.len < 1 or positional.len > (if (native == .dict_pop) @as(usize, 2) else 2)) return self.nativeArity(line, column);
+                const key = positional[0];
+                const key_hash = self.pythonHash(key, line, column) orelse return false;
+                var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+                const lookup_result = dict_module.lookup(mapping, key, key_hash, &context, dictKeysEqual);
+                switch (lookup_result) {
+                    .failed => return self.last_exception == null and self.engineFault(),
+                    .found => |index| {
+                        const old_value = mapping.entries.items[index].value;
+                        if (native == .dict_pop) {
+                            _ = dict_module.delete(mapping, key, key_hash, &context, dictKeysEqual);
+                        }
+                        self.setRegister(destination, old_value);
+                        return true;
+                    },
+                    .missing => {
+                        if (native == .dict_pop) {
+                            if (positional.len == 2) {
+                                self.setRegister(destination, positional[1]);
+                                return true;
+                            }
+                            self.setException(.{ .kind = .key_error, .message = "mapping key not found" }, line, column, null);
+                            return false;
+                        }
+                        const value = if (positional.len == 2) positional[1] else Value.noneValue();
+                        if (!self.setMappingValueWithHash(mapping, key, value, key_hash, line, column)) return false;
+                        self.setRegister(destination, value);
+                        return true;
+                    },
+                }
+            },
+            .dict_clear, .set_clear => {
+                if (positional.len != 0) return self.nativeArity(line, column);
+                dict_module.clear(&self.heap, mapping);
+                self.setRegister(destination, Value.noneValue());
+                return true;
+            },
+            .dict_copy, .set_copy => {
+                if (positional.len != 0) return self.nativeArity(line, column);
+                const copied = dict_module.copy(&self.heap, mapping);
+                return self.storeDictResult(destination, copied, line, column);
+            },
+            .set_add => {
+                if (positional.len != 1) return self.nativeArity(line, column);
+                return self.storeVoidResult(destination, self.setMappingResult(mapping, positional[0], line, column), line, column);
+            },
+            .set_remove, .set_discard => {
+                if (positional.len != 1) return self.nativeArity(line, column);
+                const key_hash = self.pythonHash(positional[0], line, column) orelse return false;
+                var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+                return switch (dict_module.delete(mapping, positional[0], key_hash, &context, dictKeysEqual)) {
+                    .found => blk: { self.setRegister(destination, Value.noneValue()); break :blk true; },
+                    .missing => blk: {
+                        if (native == .set_remove) {
+                            self.setException(.{ .kind = .key_error, .message = "element not found" }, line, column, null);
+                            break :blk false;
+                        }
+                        self.setRegister(destination, Value.noneValue());
+                        break :blk true;
+                    },
+                    .failed => self.last_exception == null and self.engineFault(),
+                };
+            },
+            .set_pop => {
+                if (positional.len != 0) return self.nativeArity(line, column);
+                for (mapping.entries.items) |entry| if (entry.alive) {
+                    var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+                    _ = dict_module.delete(mapping, entry.key, entry.hash, &context, dictKeysEqual);
+                    self.setRegister(destination, entry.key);
+                    return true;
+                };
+                self.setException(.{ .kind = .key_error, .message = "pop from an empty set" }, line, column, null);
+                return false;
+            },
+            else => return self.engineFault(),
+        }
+    }
+
+    fn setMappingResult(self: *Runtime, mapping: *dict_module.Dict, key: Value, line: u32, column: u32) exceptions.Result(void) {
+        const key_hash = self.pythonHash(key, line, column) orelse return .{ .python_exception = self.last_exception.? };
+        var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+        return dict_module.set(&self.heap, mapping, key, Value.noneValue(), key_hash, &context, dictKeysEqual);
+    }
+
+    fn storeDictResult(self: *Runtime, destination: u16, result: exceptions.Result(*dict_module.Dict), line: u32, column: u32) bool {
+        return switch (result) {
+            .value => |mapping| blk: { self.setRegister(destination, Value.object(&mapping.header)); break :blk true; },
+            .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk false; },
+            .engine_error => self.engineFault(),
+        };
     }
 
     fn executeStringNative(self: *Runtime, destination: u16, native: functions.Native, text: *string.Str, positional: []const Value, keywords: []const binder.Keyword, line: u32, column: u32) bool {
@@ -1193,6 +1582,22 @@ pub const Runtime = struct {
         }
         self.value_equality_depth += 1;
         defer self.value_equality_depth -= 1;
+        const left_numeric = number.isIntegerValue(left) or left.asFloat() != null;
+        const right_numeric = number.isIntegerValue(right) or right.asFloat() != null;
+        if (left_numeric or right_numeric) {
+            if (!left_numeric or !right_numeric) return false;
+            return switch (number.equal(left, right)) {
+                .value => |equal| equal,
+                .python_exception => |exception| blk: {
+                    self.setException(exception, line, column, null);
+                    break :blk null;
+                },
+                .engine_error => blk: {
+                    _ = self.engineFault();
+                    break :blk null;
+                },
+            };
+        }
         if (left.asObject()) |left_header| {
             if (right.asObject()) |right_header| {
                 if (string.fromHeader(left_header)) |left_text| if (string.fromHeader(right_header)) |right_text| return string.equal(left_text, right_text);
@@ -1213,24 +1618,27 @@ pub const Runtime = struct {
                     }
                     return true;
                 };
+                if (dict_module.dictFromHeader(left_header)) |left_mapping| if (dict_module.dictFromHeader(right_header)) |right_mapping| {
+                    if (left_mapping.is_set != right_mapping.is_set or left_mapping.size != right_mapping.size) return false;
+                    var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+                    for (left_mapping.entries.items) |entry| {
+                        if (!entry.alive) continue;
+                        switch (dict_module.lookup(right_mapping, entry.key, entry.hash, &context, dictKeysEqual)) {
+                            .missing => return false,
+                            .failed => return null,
+                            .found => |index| {
+                                if (left_mapping.is_set) continue;
+                                const item_equal = self.valuesEqual(entry.value, right_mapping.entries.items[index].value, line, column) orelse return null;
+                                if (!item_equal) return false;
+                            },
+                        }
+                    }
+                    return true;
+                };
             }
             return false;
         }
         if (right.asObject() != null) return false;
-        if (number.isIntegerValue(left) or left.asFloat() != null) {
-            if (!(number.isIntegerValue(right) or right.asFloat() != null)) return false;
-            return switch (number.equal(left, right)) {
-                .value => |equal| equal,
-                .python_exception => |exception| blk: {
-                    self.setException(exception, line, column, null);
-                    break :blk null;
-                },
-                .engine_error => blk: {
-                    _ = self.engineFault();
-                    break :blk null;
-                },
-            };
-        }
         return left.tag() == right.tag();
     }
 
@@ -1653,6 +2061,13 @@ pub const Runtime = struct {
                 if (!self.validRegister(instruction.a()) or !self.executeMakeFunction(instruction, line, column)) return false;
             },
             .make_sequence => return self.executeMakeSequence(instruction, line, column),
+            .make_mapping => return self.executeMakeMapping(instruction, line, column),
+            .mapping_set => return self.executeMappingSet(instruction, line, column),
+            .mapping_update => return self.executeMappingUpdate(instruction, line, column),
+            .materialize_dstar => {
+                if (!self.validRegister(instruction.a())) return self.engineFault();
+                return self.executeMaterializeDstar(instruction.a(), instruction.index32(), line, column);
+            },
             .make_slice => return self.executeMakeSlice(instruction, line, column),
             .get_attribute => return self.executeGetAttribute(instruction, line, column),
             .get_item => return self.executeGetItem(instruction, line, column),
@@ -1790,6 +2205,191 @@ pub const Runtime = struct {
         };
     }
 
+    fn executeMakeMapping(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        if (!self.validRegister(instruction.a()) or instruction.flags() > 1) return self.engineFault();
+        return switch (dict_module.create(&self.heap, instruction.flags() == 1)) {
+            .value => |mapping| blk: {
+                self.setRegister(instruction.a(), Value.object(&mapping.header));
+                break :blk true;
+            },
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk false;
+            },
+            .engine_error => self.engineFault(),
+        };
+    }
+
+    fn executeMappingSet(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
+        const header = self.registers[instruction.a()].asObject() orelse return self.engineFault();
+        const mapping = dict_module.dictFromHeader(header) orelse return self.engineFault();
+        const key = self.registers[instruction.b()];
+        const value = if (mapping.is_set) Value.noneValue() else blk: {
+            if (!self.validRegister(instruction.c())) return self.engineFault();
+            break :blk self.registers[instruction.c()];
+        };
+        return self.setMappingValue(mapping, key, value, line, column);
+    }
+
+    fn executeMappingUpdate(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
+        const target_header = self.registers[instruction.a()].asObject() orelse return self.engineFault();
+        const source_header = self.registers[instruction.b()].asObject() orelse {
+            self.setException(.{ .kind = .type_error, .message = "dictionary unpacking requires a mapping" }, line, column, null);
+            return false;
+        };
+        const target = dict_module.dictFromHeader(target_header) orelse return self.engineFault();
+        const source = dict_module.dictFromHeader(source_header) orelse {
+            self.setException(.{ .kind = .type_error, .message = "dictionary unpacking requires a mapping" }, line, column, null);
+            return false;
+        };
+        if (target.is_set or source.is_set) return self.nativeTypeError(line, column, "dictionary unpacking requires dictionaries");
+        for (source.entries.items) |entry| {
+            if (!entry.alive) continue;
+            if (!self.setMappingValueWithHash(target, entry.key, entry.value, entry.hash, line, column)) return false;
+        }
+        return true;
+    }
+
+    fn executeMaterializeDstar(self: *Runtime, register: u16, site_index: u32, line: u32, column: u32) bool {
+        const code = self.activeCode() orelse return self.engineFault();
+        if (site_index >= code.dstar_sites.len) return self.engineFault();
+        const site = code.dstar_sites[site_index];
+        const previous_start: usize = site.previous_start;
+        const previous_count: usize = site.previous_count;
+        if (previous_start > code.dstar_previous_arguments.len or previous_count > code.dstar_previous_arguments.len - previous_start) return self.engineFault();
+        const source_value = self.registers[register];
+        const source_header = source_value.asObject() orelse return self.nativeTypeError(line, column, "argument after ** must be a mapping");
+        const source = dict_module.dictFromHeader(source_header) orelse return self.nativeTypeError(line, column, "argument after ** must be a mapping");
+        if (source.is_set) return self.nativeTypeError(line, column, "argument after ** must be a mapping");
+        var source_root = gc.Root{ .object = &source.header };
+        var snapshot_root = gc.Root{ .object = null };
+        var roots = gc.RootFrame{};
+        roots.push(&self.heap.roots);
+        roots.add(&source_root);
+        roots.add(&snapshot_root);
+        defer roots.pop();
+        const created = dict_module.create(&self.heap, false);
+        const snapshot = switch (created) {
+            .value => |mapping| mapping,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        snapshot_root.object = &snapshot.header;
+        for (source.entries.items) |entry| {
+            if (!entry.alive) continue;
+            if (!self.setMappingValueWithHash(snapshot, entry.key, entry.value, entry.hash, line, column)) return false;
+        }
+        for (code.dstar_previous_arguments[previous_start..][0..previous_count]) |previous| {
+            if (previous.double_starred) {
+                if (!self.validRegister(previous.register)) return self.engineFault();
+                const previous_header = self.registers[previous.register].asObject() orelse return self.engineFault();
+                const previous_mapping = dict_module.dictFromHeader(previous_header) orelse return self.engineFault();
+                for (previous_mapping.entries.items) |entry| {
+                    if (!entry.alive) continue;
+                    const previous_key_header = entry.key.asObject() orelse continue;
+                    const previous_key = string.fromHeader(previous_key_header) orelse continue;
+                    if (self.mappingHasStringKey(snapshot, string.content(previous_key))) return self.duplicateCallKeyword(line, column);
+                }
+            } else if (previous.keyword_name != std.math.maxInt(u32)) {
+                const name = self.codeName(previous.keyword_name) orelse return self.engineFault();
+                if (self.mappingHasStringKey(snapshot, name)) return self.duplicateCallKeyword(line, column);
+            }
+        }
+        self.setRegister(register, Value.object(&snapshot.header));
+        return true;
+    }
+
+    fn mappingHasStringKey(self: *Runtime, mapping: *dict_module.Dict, name: []const u8) bool {
+        _ = self;
+        for (mapping.entries.items) |entry| {
+            if (!entry.alive) continue;
+            const header = entry.key.asObject() orelse continue;
+            const text = string.fromHeader(header) orelse continue;
+            if (std.mem.eql(u8, string.content(text), name)) return true;
+        }
+        return false;
+    }
+
+    fn duplicateCallKeyword(self: *Runtime, line: u32, column: u32) bool {
+        self.setException(.{ .kind = .type_error, .message = "got multiple values for keyword argument" }, line, column, null);
+        return false;
+    }
+
+    fn setMappingValue(self: *Runtime, mapping: *dict_module.Dict, key: Value, value: Value, line: u32, column: u32) bool {
+        const key_hash = self.pythonHash(key, line, column) orelse return false;
+        return self.setMappingValueWithHash(mapping, key, value, key_hash, line, column);
+    }
+
+    fn setMappingValueWithHash(self: *Runtime, mapping: *dict_module.Dict, key: Value, value: Value, key_hash: u64, line: u32, column: u32) bool {
+        var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+        return switch (dict_module.set(&self.heap, mapping, key, value, key_hash, &context, dictKeysEqual)) {
+            .value => true,
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk false;
+            },
+            .engine_error => if (self.last_exception != null) false else self.engineFault(),
+        };
+    }
+
+    fn pythonHash(self: *Runtime, value: Value, line: u32, column: u32) ?u64 {
+        return switch (hash_module.pythonHash(&self.heap, value, self.hash_seed)) {
+            .value => |value_hash| value_hash,
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk null;
+            },
+            .engine_error => blk: {
+                _ = self.engineFault();
+                break :blk null;
+            },
+        };
+    }
+
+    fn mappingContains(self: *Runtime, mapping: *dict_module.Dict, key: Value, line: u32, column: u32) ?bool {
+        const key_hash = self.pythonHash(key, line, column) orelse return null;
+        var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+        return switch (dict_module.lookup(mapping, key, key_hash, &context, dictKeysEqual)) {
+            .found => true,
+            .missing => false,
+            .failed => null,
+        };
+    }
+
+    fn storeSetOperation(self: *Runtime, destination: u16, left: *dict_module.Dict, right: *dict_module.Dict, operation: u8, line: u32, column: u32) bool {
+        const created = dict_module.create(&self.heap, true);
+        const result = switch (created) {
+            .value => |mapping| mapping,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        var root = gc.Root{ .object = &result.header };
+        var roots = gc.RootFrame{};
+        roots.push(&self.heap.roots);
+        roots.add(&root);
+        defer roots.pop();
+        for (left.entries.items) |entry| {
+            if (!entry.alive) continue;
+            const in_right = self.mappingContains(right, entry.key, line, column) orelse return false;
+            const include = if (operation == 1) !in_right else if (operation == 7) in_right else true;
+            if (include and !self.setMappingValueWithHash(result, entry.key, Value.noneValue(), entry.hash, line, column)) return false;
+        }
+        if (operation == 8) for (right.entries.items) |entry| {
+            if (!entry.alive) continue;
+            if (!self.setMappingValueWithHash(result, entry.key, Value.noneValue(), entry.hash, line, column)) return false;
+        };
+        self.setRegister(destination, Value.object(&result.header));
+        return true;
+    }
+
     fn executeMakeSlice(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
         const code = self.activeCode() orelse return self.engineFault();
         const site_index: usize = instruction.index32();
@@ -1867,6 +2467,22 @@ pub const Runtime = struct {
                     break :blk false;
                 },
                 .engine_error => self.engineFault(),
+            };
+        }
+        if (dict_module.dictFromHeader(header)) |mapping| {
+            if (mapping.is_set) return self.nativeTypeError(line, column, "'set' object is not subscriptable");
+            const key_hash = self.pythonHash(index_value, line, column) orelse return false;
+            var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+            return switch (dict_module.get(mapping, index_value, key_hash, &context, dictKeysEqual)) {
+                .value => |value| blk: {
+                    self.setRegister(instruction.a(), value);
+                    break :blk true;
+                },
+                .missing => blk: {
+                    self.setException(.{ .kind = .key_error, .message = "mapping key not found" }, line, column, null);
+                    break :blk false;
+                },
+                .failed => self.last_exception == null and self.engineFault(),
             };
         }
         self.setException(.{ .kind = .type_error, .message = "object is not subscriptable" }, line, column, null);
@@ -2038,6 +2654,10 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .type_error, .message = "object does not support item assignment" }, line, column, null);
             return false;
         };
+        if (dict_module.dictFromHeader(container)) |mapping| {
+            if (mapping.is_set) return self.nativeTypeError(line, column, "'set' object does not support item assignment");
+            return self.setMappingValue(mapping, self.registers[instruction.c()], self.registers[instruction.a()], line, column);
+        }
         const list = sequence.listFromHeader(container) orelse {
             self.setException(.{ .kind = .type_error, .message = "object does not support item assignment" }, line, column, null);
             return false;
@@ -2061,6 +2681,20 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .type_error, .message = "object does not support item deletion" }, line, column, null);
             return false;
         };
+        if (dict_module.dictFromHeader(container)) |mapping| {
+            if (mapping.is_set) return self.nativeTypeError(line, column, "'set' object does not support item deletion");
+            const key = self.registers[instruction.c()];
+            const key_hash = self.pythonHash(key, line, column) orelse return false;
+            var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
+            return switch (dict_module.delete(mapping, key, key_hash, &context, dictKeysEqual)) {
+                .found => true,
+                .missing => blk: {
+                    self.setException(.{ .kind = .key_error, .message = "mapping key not found" }, line, column, null);
+                    break :blk false;
+                },
+                .failed => self.last_exception == null and self.engineFault(),
+            };
+        }
         const list = sequence.listFromHeader(container) orelse {
             self.setException(.{ .kind = .type_error, .message = "object does not support item deletion" }, line, column, null);
             return false;
@@ -2259,6 +2893,15 @@ pub const Runtime = struct {
     }
 
     fn executeBinary(self: *Runtime, destination: u16, left: Value, right: Value, operation: u8, line: u32, column: u32) bool {
+        if (operation == 1 or operation == 7 or operation == 8) {
+            const left_header = left.asObject() orelse null;
+            const right_header = right.asObject() orelse null;
+            if (left_header) |left_object| if (dict_module.dictFromHeader(left_object)) |left_mapping| {
+                if (right_header) |right_object| if (dict_module.dictFromHeader(right_object)) |right_mapping| {
+                    if (left_mapping.is_set and right_mapping.is_set) return self.storeSetOperation(destination, left_mapping, right_mapping, operation, line, column);
+                };
+            };
+        }
         if (operation == 0) {
             const left_header = left.asObject() orelse null;
             const right_header = right.asObject() orelse null;
@@ -2401,6 +3044,8 @@ pub const Runtime = struct {
             if (byte_module.fromHeader(header)) |data| return self.appendQuoted(data.data, true);
             if (sequence.listFromHeader(header)) |list| return self.appendSequence(header, list.items.items, false, line, column);
             if (sequence.tupleFromHeader(header)) |tuple| return self.appendSequence(header, tuple.items, true, line, column);
+            if (dict_module.dictFromHeader(header)) |mapping| return self.appendMapping(header, mapping, line, column);
+            if (dict_module.viewFromHeader(header)) |view| return self.appendMappingView(header, view, line, column);
             if (iterator.rangeFromHeader(header)) |range| return self.appendRange(range, line, column);
             self.setException(.{ .kind = .type_error, .message = "object has no printable representation" }, line, column, null);
             return false;
@@ -2425,6 +3070,62 @@ pub const Runtime = struct {
         }
         if (is_tuple and values.len == 1 and !self.appendOutput(",")) return false;
         return self.appendOutput(if (is_tuple) ")" else "]");
+    }
+
+    fn appendMapping(self: *Runtime, header: *gc.Header, mapping: *dict_module.Dict, line: u32, column: u32) bool {
+        for (self.repr_path.items) |ancestor| {
+            if (ancestor == header) return self.appendOutput("{...}");
+        }
+        if (self.repr_path.items.len >= 128) {
+            self.setException(.{ .kind = .recursion_error, .message = "maximum recursion depth exceeded while getting the repr of an object" }, line, column, null);
+            return false;
+        }
+        if (mapping.is_set and mapping.size == 0) return self.appendOutput("set()");
+        self.repr_path.append(self.heap.allocator, header) catch return false;
+        defer _ = self.repr_path.pop();
+        if (!self.appendOutput("{")) return false;
+        var first = true;
+        for (mapping.entries.items) |entry| {
+            if (!entry.alive) continue;
+            if (!first and !self.appendOutput(", ")) return false;
+            first = false;
+            if (!self.appendValueMode(entry.key, true, line, column)) return false;
+            if (!mapping.is_set) {
+                if (!self.appendOutput(": ") or !self.appendValueMode(entry.value, true, line, column)) return false;
+            }
+        }
+        return self.appendOutput("}");
+    }
+
+    fn appendMappingView(self: *Runtime, header: *gc.Header, view: *dict_module.View, line: u32, column: u32) bool {
+        for (self.repr_path.items) |ancestor| if (ancestor == header) return self.appendOutput("...");
+        if (self.repr_path.items.len >= 128) {
+            self.setException(.{ .kind = .recursion_error, .message = "maximum recursion depth exceeded while getting the repr of an object" }, line, column, null);
+            return false;
+        }
+        self.repr_path.append(self.heap.allocator, header) catch return false;
+        defer _ = self.repr_path.pop();
+        const prefix = switch (view.kind) {
+            .keys => "dict_keys([",
+            .values => "dict_values([",
+            .items => "dict_items([",
+        };
+        if (!self.appendOutput(prefix)) return false;
+        var first = true;
+        for (view.owner.entries.items) |entry| {
+            if (!entry.alive) continue;
+            if (!first and !self.appendOutput(", ")) return false;
+            first = false;
+            switch (view.kind) {
+                .keys => if (!self.appendValueMode(entry.key, true, line, column)) return false,
+                .values => if (!self.appendValueMode(entry.value, true, line, column)) return false,
+                .items => {
+                    if (!self.appendOutput("(")) return false;
+                    if (!self.appendValueMode(entry.key, true, line, column) or !self.appendOutput(", ") or !self.appendValueMode(entry.value, true, line, column) or !self.appendOutput(")")) return false;
+                },
+            }
+        }
+        return self.appendOutput("])");
     }
 
     fn appendQuoted(self: *Runtime, content: []const u8, is_bytes: bool) bool {
@@ -2498,6 +3199,7 @@ pub const Runtime = struct {
             if (sequence.length(value)) |count| return count != 0;
             if (string.fromHeader(header)) |text| return text.data.len != 0;
             if (byte_module.fromHeader(header)) |data| return data.data.len != 0;
+            if (dict_module.sizeOf(value)) |count| return count != 0;
             if (iterator.rangeFromHeader(header)) |range| switch (iterator.truthyRange(range)) {
                 .value => |truth| return truth,
                 .python_exception => |exception| {
@@ -2543,6 +3245,10 @@ pub const Runtime = struct {
                         const equal = byte_module.equal(left_bytes, right_bytes);
                         return if (operation == 0) equal else !equal;
                     };
+                    if (dict_module.dictFromHeader(left_header)) |_| if (dict_module.dictFromHeader(right_header)) |_| {
+                        const equal = self.valuesEqual(left, right, line, column) orelse return null;
+                        return if (operation == 0) equal else !equal;
+                    };
                 }
             }
             return switch (number.equal(left, right)) {
@@ -2586,6 +3292,36 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .type_error, .message = "argument of type is not iterable" }, line, column, null);
             return null;
         };
+        if (dict_module.dictFromHeader(header)) |mapping| return self.mappingContains(mapping, item, line, column);
+        if (dict_module.viewFromHeader(header)) |view| {
+            const mapping_iterator = switch (dict_module.createIterator(&self.heap, view.owner, view.kind)) {
+                .value => |selected| selected,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return null;
+                },
+                .engine_error => {
+                    _ = self.engineFault();
+                    return null;
+                },
+            };
+            var root = gc.Root{ .object = &mapping_iterator.header };
+            var roots = gc.RootFrame{};
+            roots.push(&self.heap.roots);
+            roots.add(&root);
+            defer roots.pop();
+            while (true) switch (dict_module.next(&self.heap, mapping_iterator)) {
+                .item => |candidate| {
+                    const equal = self.valuesEqual(candidate, item, line, column) orelse return null;
+                    if (equal) return true;
+                },
+                .done => return false,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return null;
+                },
+            };
+        }
         if (iterator.rangeFromHeader(header)) |range| return switch (iterator.rangeContains(&self.heap, range, item)) {
             .value => |contains| contains,
             .python_exception => |exception| blk: {
@@ -2757,6 +3493,17 @@ pub const Runtime = struct {
     }
 };
 
+const DictEqualityContext = struct {
+    runtime: *Runtime,
+    line: u32,
+    column: u32,
+};
+
+fn dictKeysEqual(raw_context: *anyopaque, left: Value, right: Value) ?bool {
+    const context: *DictEqualityContext = @ptrCast(@alignCast(raw_context));
+    return context.runtime.valuesEqual(left, right, context.line, context.column);
+}
+
 fn exceptionName(kind: PythonExceptionKind) []const u8 {
     return switch (kind) {
         .base_exception => "BaseException",
@@ -2770,6 +3517,8 @@ fn exceptionName(kind: PythonExceptionKind) []const u8 {
         .recursion_error => "RecursionError",
         .type_error => "TypeError",
         .index_error => "IndexError",
+        .key_error => "KeyError",
+        .runtime_error => "RuntimeError",
         .unicode_decode_error => "UnicodeDecodeError",
         .attribute_error => "AttributeError",
         .stop_iteration => "StopIteration",
@@ -2802,6 +3551,9 @@ fn compareNumericOrder(order: number.Comparison, operation: u8) bool {
 }
 
 fn builtinNative(name: []const u8) ?functions.Native {
+    if (std.mem.eql(u8, name, "dict")) return .dict;
+    if (std.mem.eql(u8, name, "set")) return .set;
+    if (std.mem.eql(u8, name, "hash")) return .hash;
     if (std.mem.eql(u8, name, "len")) return .len;
     if (std.mem.eql(u8, name, "list")) return .list;
     if (std.mem.eql(u8, name, "tuple")) return .tuple;
@@ -2816,6 +3568,27 @@ fn builtinNative(name: []const u8) ?functions.Native {
 
 fn attributeNative(receiver: Value, name: []const u8) ?functions.Native {
     const header = receiver.asObject() orelse return null;
+    if (dict_module.dictFromHeader(header)) |mapping| {
+        if (mapping.is_set) {
+            if (std.mem.eql(u8, name, "add")) return .set_add;
+            if (std.mem.eql(u8, name, "remove")) return .set_remove;
+            if (std.mem.eql(u8, name, "discard")) return .set_discard;
+            if (std.mem.eql(u8, name, "pop")) return .set_pop;
+            if (std.mem.eql(u8, name, "update")) return .set_update;
+            if (std.mem.eql(u8, name, "clear")) return .set_clear;
+            if (std.mem.eql(u8, name, "copy")) return .set_copy;
+        } else {
+            if (std.mem.eql(u8, name, "get")) return .dict_get;
+            if (std.mem.eql(u8, name, "keys")) return .dict_keys;
+            if (std.mem.eql(u8, name, "values")) return .dict_values;
+            if (std.mem.eql(u8, name, "items")) return .dict_items;
+            if (std.mem.eql(u8, name, "pop")) return .dict_pop;
+            if (std.mem.eql(u8, name, "setdefault")) return .dict_setdefault;
+            if (std.mem.eql(u8, name, "update")) return .dict_update;
+            if (std.mem.eql(u8, name, "clear")) return .dict_clear;
+            if (std.mem.eql(u8, name, "copy")) return .dict_copy;
+        }
+    }
     if (sequence.listFromHeader(header) != null) {
         if (std.mem.eql(u8, name, "append")) return .list_append;
         if (std.mem.eql(u8, name, "extend")) return .list_extend;

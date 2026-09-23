@@ -888,7 +888,7 @@ fn hashSigned(value: i64) u64 {
     const wide: i128 = value;
     const magnitude: u128 = @intCast(if (wide < 0) -wide else wide);
     const residue: u64 = @intCast(magnitude % hash_modulus);
-    return if (wide < 0 and residue != 0) hash_modulus - residue else residue;
+    return signedHash(wide < 0, residue);
 }
 
 fn hashBigInt(value: BigIntStorage) u64 {
@@ -900,12 +900,12 @@ fn hashBigInt(value: BigIntStorage) u64 {
         accumulator = (accumulator * limb_base + value.limbs[index]) % hash_modulus;
     }
     const residue: u64 = @intCast(accumulator);
-    return if (!value.isPositive() and residue != 0) hash_modulus - residue else residue;
+    return signedHash(!value.isPositive(), residue);
 }
 
 fn hashFloat(value: f64) u64 {
     if (std.math.isNan(value)) return 0x7ff8_0000_0000_0000;
-    if (std.math.isInf(value)) return if (value < 0) hash_modulus - 314_159 else 314_159;
+    if (std.math.isInf(value)) return signedHash(value < 0, 314_159);
     if (value == 0) return 0;
 
     if (floatIntegerComponents(value)) |integer| return hashFloatInteger(integer);
@@ -915,12 +915,22 @@ fn hashFloat(value: f64) u64 {
     mixed ^= mixed >> 27;
     mixed *%= 0x94d0_49bb_1331_11eb;
     mixed ^= mixed >> 31;
-    return mixed;
+    return normalizeHash(mixed);
 }
 
 fn hashFloatInteger(integer: FloatInteger) u64 {
     const residue: u64 = @intCast((@as(u128, integer.mantissa) % hash_modulus) * powMod(2, integer.shift) % hash_modulus);
-    return if (integer.is_negative and residue != 0) hash_modulus - residue else residue;
+    return signedHash(integer.is_negative, residue);
+}
+
+fn signedHash(is_negative: bool, residue: u64) u64 {
+    const magnitude: i64 = @intCast(residue);
+    const signed = if (is_negative) -magnitude else magnitude;
+    return normalizeHash(@bitCast(if (signed == -1) @as(i64, -2) else signed));
+}
+
+fn normalizeHash(hash_value: u64) u64 {
+    return if (@as(i64, @bitCast(hash_value)) == -1) @bitCast(@as(i64, -2)) else hash_value;
 }
 
 fn powMod(base_value: u64, exponent_value: usize) u64 {

@@ -6,6 +6,7 @@ const string = @import("runtime_string");
 const bytes = @import("runtime_bytes");
 const sequence = @import("runtime_sequence");
 const slice_utils = @import("runtime_slice");
+const dict_module = @import("runtime_dict");
 const exceptions = @import("runtime_exception");
 
 const Heap = gc.Heap;
@@ -23,6 +24,7 @@ const IteratorInitial = struct {
     enumerate_index: Value = Value.noneValue(),
     reverse_source: Value = Value.noneValue(),
     reverse_index: usize = 0,
+    mapping_iterator: ?*dict_module.DictIterator = null,
 };
 
 pub const Range = struct {
@@ -49,6 +51,7 @@ pub const Iterator = struct {
     enumerate_values: [2]Value = .{ Value.noneValue(), Value.noneValue() },
     reverse_source: Value = Value.noneValue(),
     reverse_index: usize = 0,
+    mapping_iterator: ?*dict_module.DictIterator = null,
 };
 
 pub const NextResult = union(enum) {
@@ -78,6 +81,7 @@ fn traceIterator(header: *gc.Header, tracer: *gc.Tracer) void {
     if (iterator.byte_string) |byte_string| tracer.visit(&byte_string.header);
     tracer.visit(iterator.current.asObject());
     if (iterator.inner) |inner| tracer.visit(&inner.header);
+    if (iterator.mapping_iterator) |mapping_iterator| tracer.visit(&mapping_iterator.header);
     for (iterator.children) |child| if (child) |selected| tracer.visit(&selected.header);
     for (iterator.values) |value| tracer.visit(value.asObject());
     tracer.visit(iterator.enumerate_index.asObject());
@@ -402,6 +406,8 @@ pub fn createIterator(heap: *Heap, value: Value) exceptions.Result(*Iterator) {
     var has_sequence = false;
     if (value.asObject()) |header| {
         if (iteratorFromHeader(header)) |existing| return .{ .value = existing };
+        if (dict_module.dictFromHeader(header)) |mapping| return createMappingIterator(heap, mapping, .keys);
+        if (dict_module.viewFromHeader(header)) |view| return createMappingIterator(heap, view.owner, view.kind);
         range = rangeFromHeader(header);
         text = string.fromHeader(header);
         byte_string = bytes.fromHeader(header);
@@ -416,6 +422,21 @@ pub fn createIterator(heap: *Heap, value: Value) exceptions.Result(*Iterator) {
         .sequence_value = if (has_sequence) value else Value.noneValue(),
         .byte_string = byte_string,
     });
+}
+
+fn createMappingIterator(heap: *Heap, owner: *dict_module.Dict, kind: dict_module.ViewKind) exceptions.Result(*Iterator) {
+    const created_mapping_iterator = dict_module.createIterator(heap, owner, kind);
+    const mapping_iterator = switch (created_mapping_iterator) {
+        .value => |selected| selected,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    var root = gc.Root{ .object = &mapping_iterator.header };
+    var roots = gc.RootFrame{};
+    roots.push(&heap.roots);
+    roots.add(&root);
+    defer roots.pop();
+    return createInitialized(heap, .{ .mapping_iterator = mapping_iterator });
 }
 
 pub fn createEnumerate(heap: *Heap, value: Value, start: Value) exceptions.Result(*Iterator) {
@@ -508,6 +529,7 @@ fn createInitialized(heap: *Heap, initial: IteratorInitial) exceptions.Result(*I
         .enumerate_index = initial.enumerate_index,
         .reverse_source = initial.reverse_source,
         .reverse_index = initial.reverse_index,
+        .mapping_iterator = initial.mapping_iterator,
     };
     return .{ .value = iterator };
 }
@@ -520,6 +542,11 @@ pub fn next(heap: *Heap, iterator: *Iterator) NextResult {
         .basic => {},
     }
     if (iterator.range) |range| return nextRange(heap, iterator, range);
+    if (iterator.mapping_iterator) |mapping_iterator| return switch (dict_module.next(heap, mapping_iterator)) {
+        .item => |item| .{ .item = item },
+        .done => .done,
+        .python_exception => |exception| .{ .python_exception = exception },
+    };
     if (iterator.sequence_value.asObject() != null) {
         const length_value = sequence.length(iterator.sequence_value) orelse return .{ .engine_error = .internal_invariant };
         if (iterator.sequence_index >= length_value) return .done;

@@ -696,6 +696,14 @@ const Parser = struct {
         }
         var is_dict = false;
         while (true) {
+            if (self.atOperator("**")) {
+                if (!is_dict and items.items.len != 0) return self.failAtCurrent("cannot mix dictionary and set entries");
+                is_dict = true;
+                const marker = self.advance();
+                const mapping = try self.parseExpression(0);
+                const unpack = try self.addNode(.starred, .{ .start = marker.start, .end = self.node(mapping).span.end }, "**", 0, &.{mapping});
+                try items.append(self.allocator, unpack);
+            } else {
             const key = try self.parseExpression(0);
             if (self.atText("for")) return self.failUnsupported(.later_commit, "comprehensions are not parsed in this commit");
             if (self.atText(":")) {
@@ -707,6 +715,7 @@ const Parser = struct {
             } else {
                 if (is_dict) return self.failAtCurrent("cannot mix dictionary and set entries");
                 try items.append(self.allocator, key);
+            }
             }
             if (!self.atText(",")) break;
             _ = self.advance();

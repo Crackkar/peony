@@ -12,6 +12,8 @@ pub const PythonExceptionKind = enum {
     recursion_error,
     type_error,
     index_error,
+    key_error,
+    runtime_error,
     unicode_decode_error,
 };
 
@@ -39,7 +41,7 @@ pub fn isSubclass(kind: PythonExceptionKind, base: PythonExceptionKind) bool {
     return switch (kind) {
         .base_exception => false,
         .exception => base == .base_exception,
-        .memory_error, .name_error, .attribute_error, .stop_iteration, .zero_division_error, .value_error, .overflow_error, .recursion_error, .type_error, .index_error, .unicode_decode_error => base == .exception,
+        .memory_error, .name_error, .attribute_error, .stop_iteration, .zero_division_error, .value_error, .overflow_error, .recursion_error, .type_error, .index_error, .key_error, .runtime_error, .unicode_decode_error => base == .exception,
         .unbound_local_error => base == .name_error or base == .exception,
     };
 }

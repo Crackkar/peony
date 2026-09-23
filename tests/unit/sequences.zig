@@ -292,12 +292,12 @@ pub fn testUnpackingVariadicCallsAndNameDeletion() !void {
         \\values = [10, 20, 30]
         \\del values[1]
         \\print(values)
+        \\print(1, **{})
         \\del values
     ,
-        "(1, 3, (4,), 5)\na:b\n1 [2, 3] 4\n7 8\n1 [2, 3]\n4 [5]\n[10, 30]\n",
+        "(1, 3, (4,), 5)\na:b\n1 [2, 3] 4\n7 8\n1 [2, 3]\n4 [5]\n[10, 30]\n1\n",
     );
     try expectRuntimeException("def local():\n    item = 1\n    del item\n    return item\nlocal()\n", .unbound_local_error, "sequence.py:4:");
-    try expectUnsupported("print(\"must not execute\")\nprint(1, **{})\n");
 }
 
 pub fn testUnpackCapacityAndKnownRangeSizing() !void {

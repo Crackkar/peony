@@ -8,6 +8,7 @@ const compiler_vm_tests = @import("compiler_vm_tests");
 const control_flow_tests = @import("control_flow_tests");
 const functions_tests = @import("functions_tests");
 const sequence_tests = @import("sequence_tests");
+const mapping_tests = @import("mapping_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -407,6 +408,63 @@ test "function construction cap failure reports MemoryError and recovers" {
 
 test "dictionary unpacking stays explicitly unsupported" {
     try functions_tests.testDictionaryUnpackingRemainsExplicitlyUnsupported();
+}
+
+test "ordered mapping keys preserve Python numeric equality and order" {
+    try mapping_tests.testOrderedDictAndSetNumericKeys();
+}
+
+test "dict methods and views remain live and detect size mutation" {
+    try mapping_tests.testDictMethodsAndLiveViews();
+}
+
+test "set methods and mapping view representations" {
+    try mapping_tests.testSetMethodsAndMappingViewRepresentations();
+}
+
+test "dict view repr is cycle safe" {
+    try mapping_tests.testMappingViewReprIsCycleSafe();
+}
+
+test "colliding numeric dict keys survive tombstones" {
+    try mapping_tests.testMappingCollisionsSurviveTombstones();
+}
+
+test "dict and set constructors, displays and operators" {
+    try mapping_tests.testMappingConstructorsDisplaysAndSetOperators();
+}
+
+test "mapping keyword arguments expand in source order" {
+    try mapping_tests.testKeywordMappingsExpandInSourceOrder();
+    try mapping_tests.testPositionalOnlyNameCanBeCapturedByKwargs();
+}
+
+test "double-star call errors follow Python evaluation order" {
+    try mapping_tests.testDstarErrorsFollowPythonEvaluationOrder();
+}
+
+test "hashing and mapping errors follow Python types" {
+    try mapping_tests.testHashingAndMappingErrors();
+}
+
+test "string and bytes hashes vary across sessions" {
+    try mapping_tests.testStringHashSeedVariesAcrossSessions();
+}
+
+test "dict insertion roots object keys and values across growth" {
+    try mapping_tests.testDictSetRootsObjectKeyAndValueAcrossGrowth();
+}
+
+test "dict resize allocation failure releases partial buffers" {
+    try mapping_tests.testDictResizeAllocationFailureReleasesBuckets();
+}
+
+test "clearing an empty dictionary keeps its iterator valid" {
+    try mapping_tests.testEmptyDictClearDoesNotInvalidateIterator();
+}
+
+test "an exhausted dict iterator stays exhausted after growth" {
+    try mapping_tests.testExhaustedDictIteratorStaysExhaustedAfterGrowth();
 }
 
 test "lexer recognizes literal prefixes and triple quotes" {

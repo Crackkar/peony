@@ -215,7 +215,7 @@ pub fn testBuiltinCallableCollectionAndReset() !void {
 }
 
 pub fn testUnsupportedFunctionDefaultCleansNestedCodeOnce() !void {
-    try expectUnsupported("def unsupported(value={}):\n    pass\n");
+    try expectOutput("def default_mapping(value={}):\n    return value\nprint(default_mapping())\n", "{}\n");
 }
 
 pub fn testFunctionConstructionMemoryErrorAndRecovery() !void {
@@ -235,7 +235,7 @@ pub fn testFunctionConstructionMemoryErrorAndRecovery() !void {
 }
 
 pub fn testDictionaryUnpackingRemainsExplicitlyUnsupported() !void {
-    try expectUnsupported("print(\"must not execute\")\nprint(1, **{})\n");
+    try expectOutput("print(1, **{})\n", "1\n");
 }
 
 fn expectOutput(source: []const u8, expected: []const u8) !void {

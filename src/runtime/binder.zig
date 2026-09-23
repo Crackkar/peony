@@ -18,6 +18,11 @@ pub const BindError = std.mem.Allocator.Error || error{
     PositionalOnlyAsKeyword,
 };
 
+pub const BoundArguments = struct {
+    values: []Value,
+    extra_keywords: []Keyword,
+};
+
 pub const PrintArguments = struct {
     values: []const Value,
     separator: ?Value = null,
@@ -32,21 +37,27 @@ pub fn bindFunction(
     defaults: []const Value,
     positional: []const Value,
     keywords: []const Keyword,
-) BindError![]Value {
+) BindError!BoundArguments {
     std.debug.assert(parameter_names.len == parameter_flags.len and parameter_names.len == defaults.len);
     const bound = try allocator.alloc(Value, parameter_names.len);
     @memset(bound, Value.unboundValue());
     errdefer allocator.free(bound);
+    var extra_keywords: std.ArrayList(Keyword) = .empty;
+    defer extra_keywords.deinit(allocator);
 
     var positional_capacity: usize = 0;
     var var_positional_index: ?usize = null;
+    var var_keyword_index: ?usize = null;
     for (parameter_flags, 0..) |flags, index| {
         if (flags & parameter_flags_module.keyword_only != 0) continue;
         if (flags & parameter_flags_module.var_positional != 0) {
             var_positional_index = index;
             continue;
         }
-        if (flags & parameter_flags_module.var_keyword != 0) continue;
+        if (flags & parameter_flags_module.var_keyword != 0) {
+            var_keyword_index = index;
+            continue;
+        }
         positional_capacity += 1;
     }
     if (positional.len > positional_capacity and var_positional_index == null) return error.TooManyPositional;
@@ -71,19 +82,30 @@ pub fn bindFunction(
                 break;
             }
         }
-        const index = match orelse return error.UnexpectedKeyword;
-        if (parameter_flags[index] & parameter_flags_module.positional_only != 0) return error.PositionalOnlyAsKeyword;
+        const index = match orelse {
+            if (var_keyword_index == null) return error.UnexpectedKeyword;
+            for (extra_keywords.items) |previous| if (std.mem.eql(u8, previous.name, keyword.name)) return error.MultipleValues;
+            try extra_keywords.append(allocator, keyword);
+            continue;
+        };
+        if (parameter_flags[index] & parameter_flags_module.positional_only != 0) {
+            if (var_keyword_index == null) return error.PositionalOnlyAsKeyword;
+            for (extra_keywords.items) |previous| if (std.mem.eql(u8, previous.name, keyword.name)) return error.MultipleValues;
+            try extra_keywords.append(allocator, keyword);
+            continue;
+        }
         if (bound[index].tag() != .unbound) return error.MultipleValues;
         bound[index] = keyword.value;
     }
 
     for (bound, 0..) |*value, index| {
         if (value.tag() != .unbound) continue;
+        if (var_keyword_index != null and index == var_keyword_index.?) continue;
         if (defaults[index].tag() != .unbound) {
             value.* = defaults[index];
         } else return error.MissingArgument;
     }
-    return bound;
+    return .{ .values = bound, .extra_keywords = try extra_keywords.toOwnedSlice(allocator) };
 }
 
 pub fn bindRange(positional: []const Value, keywords: []const Keyword) error{TooManyPositional, MissingArgument, UnexpectedKeyword}! [3]Value {

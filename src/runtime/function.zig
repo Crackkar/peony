@@ -7,11 +7,13 @@ const bytecode = @import("frontend_bytecode");
 const Value = value_module.Value;
 
 pub const Native = enum {
-    print, range,
+    print, range, dict, set, hash,
     len, list, tuple, iter, next, enumerate, zip, reversed, slice,
     list_append, list_extend, list_insert, list_pop, list_remove, list_clear, list_index, list_count, list_reverse, list_copy, list_sort,
     str_find, str_index, str_split, str_join, str_strip, str_upper, str_lower, str_replace, str_count, str_startswith, str_endswith, str_encode,
     bytes_split, bytes_find, bytes_decode,
+    dict_get, dict_keys, dict_values, dict_items, dict_pop, dict_setdefault, dict_update, dict_clear, dict_copy,
+    set_add, set_remove, set_discard, set_pop, set_update, set_clear, set_copy,
 };
 
 pub const Cell = struct {

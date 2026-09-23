@@ -182,7 +182,7 @@ test('WASM iterates ranges and mutable sequences and expands positional iterable
   }
 });
 
-test('WASM rejects bad sequence operations and leaves dict unpacking explicit', async () => {
+test('WASM rejects bad sequence operations and supports empty **call expansion', async () => {
   const api = await newApi();
   const handle = api.peony_session_new(0, 0);
   assert.ok(handle > 0);
@@ -191,8 +191,9 @@ test('WASM rejects bad sequence operations and leaves dict unpacking explicit', 
     assert.equal(api.peony_run(handle, 0), status.pythonException);
     assert.match(errorText(api, handle), /ValueError.*step-zero\.py:1:/);
 
-    assert.equal(compile(api, handle, 'print("must not execute")\nprint(1, **{})\n'), status.unsupported);
-    assert.equal(stdout(api, handle), '');
+    assert.equal(compile(api, handle, 'print("before")\nprint(1, **{})\n'), status.ok);
+    assert.equal(api.peony_run(handle, 0), status.completed);
+    assert.equal(stdout(api, handle), 'before\n1\n');
   } finally {
     api.peony_session_destroy(handle);
   }
