@@ -31,7 +31,24 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const unit_tests = b.addTest(.{ .root_module = abi_module });
+    const gc_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/runtime_gc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gc_test_module.addImport("runtime_gc", b.createModule(.{
+        .root_source_file = b.path("src/runtime/gc.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const unit_test_root = b.createModule(.{
+        .root_source_file = b.path("tests/unit/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    unit_test_root.addImport("abi", abi_module);
+    unit_test_root.addImport("runtime_gc_tests", gc_test_module);
+    const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
     test_step.dependOn(&run_unit_tests.step);

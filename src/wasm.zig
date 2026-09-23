@@ -1,16 +1,21 @@
 const std = @import("std");
 const abi = @import("abi.zig");
+const runtime_allocator = @import("runtime/allocator.zig");
+const gc = @import("runtime/gc.zig");
 
 pub const std_options_debug_io: std.Io = std.Io.failing;
 
 const Status = abi.Status;
 const max_transfers = 256;
+const default_session_max_bytes = 64 * 1024 * 1024;
 const generation_mask = abi.generation_mask;
 
 const SessionSlot = struct {
     active: bool = false,
     generation: u32 = 1,
     error_ready: bool = false,
+    allocator: runtime_allocator.SessionAllocator = undefined,
+    heap: gc.Heap = .{},
 };
 
 const Transfer = struct {
@@ -50,6 +55,9 @@ export fn peony_session_new(config_ptr: u32, config_len: u32) u32 {
     if (config_ptr != 0 or config_len != 0) return 0;
     for (&sessions, 0..) |*slot, index| {
         if (!slot.active) {
+            slot.allocator = runtime_allocator.SessionAllocator.init(std.heap.wasm_allocator, default_session_max_bytes);
+            slot.heap = .{};
+            slot.heap.init(&slot.allocator, .{});
             slot.active = true;
             slot.error_ready = false;
             return abi.encodeSessionHandle(index, slot.generation);
@@ -60,6 +68,8 @@ export fn peony_session_new(config_ptr: u32, config_len: u32) u32 {
 
 export fn peony_session_destroy(handle: u32) u32 {
     const slot = sessionSlot(handle) orelse return status(Status.invalid_handle);
+    slot.heap.deinit();
+    std.debug.assert(slot.allocator.live_bytes == 0);
     slot.active = false;
     slot.error_ready = false;
     slot.generation = (slot.generation + 1) & generation_mask;

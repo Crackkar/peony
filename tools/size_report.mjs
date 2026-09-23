@@ -87,8 +87,16 @@ async function measure(relativePath) {
 
 async function prepareProbeSources() {
   const probeDir = path.join(root, 'zig-cache', 'size-probes');
+  const probeRuntimeDir = path.join(probeDir, 'runtime');
   const runtimeSource = await readFile(path.join(root, 'src', 'wasm.zig'), 'utf8');
   await copyFile(path.join(root, 'src', 'abi.zig'), path.join(probeDir, 'abi.zig'));
+  await mkdir(probeRuntimeDir, { recursive: true });
+  for (const name of ['allocator', 'gc', 'object', 'roots']) {
+    await copyFile(
+      path.join(root, 'src', 'runtime', `${name}.zig`),
+      path.join(probeRuntimeDir, `${name}.zig`),
+    );
+  }
   for (const name of probes) {
     const fragment = await readFile(path.join(root, 'tools', 'size-probes', `${name}.zig`), 'utf8');
     await writeFile(path.join(probeDir, `${name}-root.zig`), `${runtimeSource}\n\n${fragment}`);
