@@ -1,0 +1,25 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import test from 'node:test';
+
+test('the required Zig compiler is exactly 0.16.0', () => {
+  assert.equal(execFileSync('zig', ['version'], { encoding: 'utf8' }).trim(), '0.16.0');
+});
+
+test('size report is repeatable and includes the baseline plus all feature deltas', () => {
+  const run = () => JSON.parse(execFileSync('node', ['tools/size_report.mjs', '--json'], {
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  }));
+  const first = run();
+  const second = run();
+
+  assert.deepEqual(second, first);
+  assert.ok(first.baseline.rawBytes > 0);
+  assert.ok(first.baseline.brotliQ11Bytes > 0);
+  assert.deepEqual(Object.keys(first.probes).sort(), ['bigint', 'json', 'unicode15']);
+  for (const result of Object.values(first.probes)) {
+    assert.ok(result.rawDeltaBytes > 0);
+    assert.ok(result.brotliQ11DeltaBytes > 0);
+  }
+});

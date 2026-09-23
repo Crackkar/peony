@@ -1,0 +1,7 @@
+.{
+    .name = .peony,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{""},
+    .fingerprint = 0xa224134f7143e9d1,
+}
