@@ -62,6 +62,13 @@ pub fn build(b: *std.Build) void {
     const frontend_modules = createFrontendModules(b, target, optimize);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
+    const parser_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_test_module.addImport("frontend_parser", frontend_modules.parser);
+    parser_test_module.addImport("frontend_ast", frontend_modules.ast);
     const unit_test_root = b.createModule(.{
         .root_source_file = b.path("tests/unit/root.zig"),
         .target = target,
@@ -72,6 +79,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("value_number_tests", value_number_test_module);
     unit_test_root.addImport("string_bytes_tests", string_bytes_test_module);
     unit_test_root.addImport("lexer_tests", lexer_test_module);
+    unit_test_root.addImport("parser_tests", parser_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -112,6 +120,8 @@ pub fn build(b: *std.Build) void {
 const FrontendModules = struct {
     token: *std.Build.Module,
     lexer: *std.Build.Module,
+    ast: *std.Build.Module,
+    parser: *std.Build.Module,
 };
 
 fn createFrontendModules(
@@ -130,7 +140,20 @@ fn createFrontendModules(
         .optimize = optimize,
     });
     lexer_module.addImport("frontend_token", token_module);
-    return .{ .token = token_module, .lexer = lexer_module };
+    const ast_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/ast.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const parser_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_module.addImport("frontend_token", token_module);
+    parser_module.addImport("frontend_lexer", lexer_module);
+    parser_module.addImport("frontend_ast", ast_module);
+    return .{ .token = token_module, .lexer = lexer_module, .ast = ast_module, .parser = parser_module };
 }
 
 fn addProbe(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, probe_symbol: []const u8) void {

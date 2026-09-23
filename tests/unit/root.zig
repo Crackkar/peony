@@ -2,6 +2,7 @@ const gc_tests = @import("runtime_gc_tests");
 const value_tests = @import("value_number_tests");
 const string_tests = @import("string_bytes_tests");
 const lexer_tests = @import("lexer_tests");
+const parser_tests = @import("parser_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -145,6 +146,38 @@ test "lexer recognizes numeric forms and rejects malformed or complex literals" 
 
 test "lexer recognizes walrus and not-equal as single operators" {
     try lexer_tests.testOperators();
+}
+
+test "parser builds span-aware statements and suites" {
+    try parser_tests.testStatementsAndSuites();
+}
+
+test "Pratt parser follows Python precedence and associativity" {
+    try parser_tests.testPrecedence();
+}
+
+test "parser handles calls attributes subscripts slices and displays" {
+    try parser_tests.testPostfixesAndDisplays();
+}
+
+test "parser retains function signature markers and defaults" {
+    try parser_tests.testFunctionSignature();
+}
+
+test "parser validates assignment and delete targets" {
+    try parser_tests.testTargets();
+}
+
+test "parser supports walrus and soft keyword assignments" {
+    try parser_tests.testWalrusAndSoftKeywords();
+}
+
+test "parser reports suite syntax errors with source locations" {
+    try parser_tests.testSuiteErrors();
+}
+
+test "parser marks deferred and permanently excluded syntax" {
+    try parser_tests.testUnsupportedFeatures();
 }
 
 test "lexer recognizes literal prefixes and triple quotes" {
