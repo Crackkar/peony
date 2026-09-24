@@ -130,6 +130,8 @@ pub fn testHostConfigRoundTripAndValidation() !void {
         .max_memory_bytes = 8 * 1024 * 1024,
         .max_instructions = 123_456,
         .quantum = 17,
+        .max_vfs_bytes = 40_000,
+        .max_file_bytes = 20_000,
         .seed = "seed",
     };
     const encoded = try host.encodeConfig(std.testing.allocator, config);
@@ -138,12 +140,37 @@ pub fn testHostConfigRoundTripAndValidation() !void {
     try std.testing.expectEqual(config.max_memory_bytes, decoded.max_memory_bytes);
     try std.testing.expectEqual(config.max_instructions, decoded.max_instructions);
     try std.testing.expectEqual(config.quantum, decoded.quantum);
+    try std.testing.expectEqual(config.max_vfs_bytes, decoded.max_vfs_bytes);
+    try std.testing.expectEqual(config.max_file_bytes, decoded.max_file_bytes);
     try std.testing.expectEqualStrings("seed", decoded.seed);
     const defaults = try host.decodeConfig(&.{});
     try std.testing.expectEqual(host.Config.defaults().max_memory_bytes, defaults.max_memory_bytes);
     try std.testing.expectEqual(host.Config.defaults().max_instructions, defaults.max_instructions);
     try std.testing.expectEqual(host.Config.defaults().quantum, defaults.quantum);
+    try std.testing.expectEqual(host.Config.defaults().max_vfs_bytes, defaults.max_vfs_bytes);
+    try std.testing.expectEqual(host.Config.defaults().max_file_bytes, defaults.max_file_bytes);
     try std.testing.expectEqualStrings(host.Config.defaults().seed, defaults.seed);
+
+    // A pre-extension PCFG packet keeps the original 28-byte header and
+    // receives the documented default VFS budgets.
+    var legacy: [host.config_header_size]u8 = @splat(0);
+    @memcpy(legacy[0..4], "PCFG");
+    std.mem.writeInt(u16, legacy[4..6], 1, .little);
+    std.mem.writeInt(u32, legacy[8..12], 8 * 1024 * 1024, .little);
+    std.mem.writeInt(u64, legacy[12..20], 123_456, .little);
+    std.mem.writeInt(u32, legacy[20..24], 17, .little);
+    const legacy_decoded = try host.decodeConfig(&legacy);
+    try std.testing.expectEqual(host.Config.defaults().max_vfs_bytes, legacy_decoded.max_vfs_bytes);
+    try std.testing.expectEqual(host.Config.defaults().max_file_bytes, legacy_decoded.max_file_bytes);
+
+    var invalid_limits = config;
+    invalid_limits.max_file_bytes = invalid_limits.max_vfs_bytes + 1;
+    try std.testing.expectError(error.InvalidConfig, host.encodeConfig(std.testing.allocator, invalid_limits));
+
+    const invalid_extension = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(invalid_extension);
+    std.mem.writeInt(u32, invalid_extension[36..40], config.max_vfs_bytes + 1, .little);
+    try std.testing.expectError(error.InvalidConfig, host.decodeConfig(invalid_extension));
 
     const bad_version = try std.testing.allocator.dupe(u8, encoded);
     defer std.testing.allocator.free(bad_version);

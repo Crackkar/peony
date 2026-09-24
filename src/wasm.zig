@@ -63,8 +63,7 @@ export fn peony_session_new(config_ptr: u32, config_len: u32) u32 {
     const config = host.decodeConfig(config_bytes) catch return 0;
     for (&sessions, 0..) |*slot, index| {
         if (!slot.active) {
-            slot.runtime.init(std.heap.wasm_allocator, @intCast(config.max_memory_bytes)) catch return 0;
-            slot.runtime.configureHost(config);
+            slot.runtime.initWithConfig(std.heap.wasm_allocator, config) catch return 0;
             slot.active = true;
             slot.host_error = "";
             return abi.encodeSessionHandle(index, slot.generation);
@@ -146,6 +145,52 @@ export fn peony_reset(handle: u32) u32 {
     slot.runtime.reset();
     slot.host_error = "";
     return status(Status.ok);
+}
+
+export fn peony_vfs_mount(handle: u32, path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32) u32 {
+    const slot = sessionSlot(handle) orelse return status(Status.invalid_handle);
+    if (!isTransferSlice(path_ptr, path_len) or !isTransferSlice(data_ptr, data_len)) return status(Status.invalid_argument);
+    const path = transferSlice(path_ptr, path_len) orelse return status(Status.invalid_argument);
+    const data = transferSlice(data_ptr, data_len) orelse return status(Status.invalid_argument);
+    slot.runtime.mountCourseFile(path, data) catch |err| return vfsErrorStatus(err);
+    return status(Status.ok);
+}
+
+export fn peony_vfs_write(handle: u32, path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32) u32 {
+    const slot = sessionSlot(handle) orelse return status(Status.invalid_handle);
+    if (!isTransferSlice(path_ptr, path_len) or !isTransferSlice(data_ptr, data_len)) return status(Status.invalid_argument);
+    const path = transferSlice(path_ptr, path_len) orelse return status(Status.invalid_argument);
+    const data = transferSlice(data_ptr, data_len) orelse return status(Status.invalid_argument);
+    slot.runtime.writeVfsFile(path, data) catch |err| return vfsErrorStatus(err);
+    return status(Status.ok);
+}
+
+export fn peony_vfs_read(handle: u32, path_ptr: u32, path_len: u32) u32 {
+    const slot = sessionSlot(handle) orelse return status(Status.invalid_handle);
+    if (!isTransferSlice(path_ptr, path_len)) return status(Status.invalid_argument);
+    const path = transferSlice(path_ptr, path_len) orelse return status(Status.invalid_argument);
+    _ = slot.runtime.readVfsFile(path) catch |err| return vfsErrorStatus(err);
+    return status(Status.ok);
+}
+
+export fn peony_vfs_list(handle: u32, path_ptr: u32, path_len: u32) u32 {
+    const slot = sessionSlot(handle) orelse return status(Status.invalid_handle);
+    if (!isTransferSlice(path_ptr, path_len)) return status(Status.invalid_argument);
+    const path = transferSlice(path_ptr, path_len) orelse return status(Status.invalid_argument);
+    _ = slot.runtime.listVfsFiles(path) catch |err| return vfsErrorStatus(err);
+    return status(Status.ok);
+}
+
+export fn peony_vfs_data_ptr(handle: u32) u32 {
+    const slot = sessionSlot(handle) orelse return 0;
+    const bytes = slot.runtime.vfsData();
+    if (bytes.len == 0) return 0;
+    return @intCast(@intFromPtr(bytes.ptr));
+}
+
+export fn peony_vfs_data_len(handle: u32) u32 {
+    const slot = sessionSlot(handle) orelse return 0;
+    return @intCast(slot.runtime.vfsData().len);
 }
 
 export fn peony_event_ptr(handle: u32) u32 {
@@ -235,6 +280,13 @@ fn currentError(slot: *const SessionSlot) []const u8 {
 
 fn status(value: Status) u32 {
     return @intFromEnum(value);
+}
+
+fn vfsErrorStatus(err: anyerror) u32 {
+    return switch (err) {
+        error.OutOfMemory, error.TooLarge => status(Status.out_of_memory),
+        else => status(Status.invalid_argument),
+    };
 }
 
 fn sessionSlot(handle: u32) ?*SessionSlot {

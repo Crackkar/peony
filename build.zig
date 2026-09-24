@@ -11,6 +11,12 @@ const abi_exports = [_][]const u8{
     "peony_resume",
     "peony_cancel",
     "peony_reset",
+    "peony_vfs_mount",
+    "peony_vfs_write",
+    "peony_vfs_read",
+    "peony_vfs_list",
+    "peony_vfs_data_ptr",
+    "peony_vfs_data_len",
     "peony_event_ptr",
     "peony_event_len",
     "peony_instruction_count",
@@ -112,6 +118,8 @@ pub fn build(b: *std.Build) void {
     runtime_vm_module.addImport("runtime_function", native_function_module);
     runtime_vm_module.addImport("runtime_binder", native_binder_module);
     runtime_vm_module.addImport("runtime_host", native_runtime.host);
+    runtime_vm_module.addImport("runtime_vfs", native_runtime.vfs);
+    runtime_vm_module.addImport("runtime_file", native_runtime.file);
     const compiler_vm_test_module = b.createModule(.{
         .root_source_file = b.path("tests/unit/compiler_vm.zig"),
         .target = target,
@@ -194,6 +202,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     host_codec_test_module.addImport("runtime_host", native_runtime.host);
+    const vfs_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/vfs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vfs_test_module.addImport("runtime_vm", runtime_vm_module);
+    vfs_test_module.addImport("runtime_exception", native_runtime.exception);
+    const files_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/files.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    files_test_module.addImport("runtime_vm", runtime_vm_module);
+    files_test_module.addImport("runtime_exception", native_runtime.exception);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -233,6 +255,8 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("exception_tests", exceptions_test_module);
     unit_test_root.addImport("host_tests", host_test_module);
     unit_test_root.addImport("host_codec_tests", host_codec_test_module);
+    unit_test_root.addImport("vfs_tests", vfs_test_module);
+    unit_test_root.addImport("file_tests", files_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -406,6 +430,8 @@ fn createExecutionVmModule(
     vm_module.addImport("runtime_function", function_module);
     vm_module.addImport("runtime_binder", binder_module);
     vm_module.addImport("runtime_host", runtime.host);
+    vm_module.addImport("runtime_vfs", runtime.vfs);
+    vm_module.addImport("runtime_file", runtime.file);
     return vm_module;
 }
 
@@ -467,6 +493,7 @@ fn createRuntimeIteratorModule(
     module.addImport("runtime_dict", runtime.dict);
     module.addImport("runtime_slice", runtime.slice);
     module.addImport("runtime_exception", runtime.exception);
+    module.addImport("runtime_file", runtime.file);
     return module;
 }
 
@@ -483,6 +510,8 @@ const RuntimeModules = struct {
     dict: *std.Build.Module,
     hash: *std.Build.Module,
     host: *std.Build.Module,
+    vfs: *std.Build.Module,
+    file: *std.Build.Module,
 };
 
 fn createRuntimeModules(
@@ -520,6 +549,21 @@ fn createRuntimeModules(
         .target = target,
         .optimize = optimize,
     });
+    const vfs_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/vfs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vfs_module.addImport("runtime_gc", gc_module);
+    const file_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/file.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    file_module.addImport("runtime_gc", gc_module);
+    file_module.addImport("runtime_value", value_module);
+    file_module.addImport("runtime_exception", exception_module);
+    file_module.addImport("runtime_vfs", vfs_module);
 
     const slice_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/slice.zig"),
@@ -604,6 +648,8 @@ fn createRuntimeModules(
         .slice = slice_module,
         .dict = dict_module,
         .hash = hash_module,
+        .vfs = vfs_module,
+        .file = file_module,
     };
 }
 
@@ -618,4 +664,6 @@ fn addRuntimeImports(module: *std.Build.Module, runtime: RuntimeModules) void {
     module.addImport("runtime_bytes", runtime.bytes);
     module.addImport("runtime_sequence", runtime.sequence);
     module.addImport("runtime_slice", runtime.slice);
+    module.addImport("runtime_vfs", runtime.vfs);
+    module.addImport("runtime_file", runtime.file);
 }

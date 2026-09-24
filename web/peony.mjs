@@ -2,6 +2,7 @@ const STATUS = Object.freeze({
   ok: 0,
   invalidHandle: 2,
   invalidArgument: 3,
+  outOfMemory: 4,
   completed: 5,
   pythonException: 6,
   timeslice: 7,
@@ -69,6 +70,8 @@ class PeonySession {
       quantum: options.quantum ?? 50_000,
       maxMemoryBytes: options.maxMemoryBytes ?? 64 * 1024 * 1024,
       maxInstructions: options.maxInstructions ?? 50_000_000,
+      maxVfsBytes: options.maxVfsBytes ?? 8 * 1024 * 1024,
+      maxFileBytes: options.maxFileBytes ?? 2 * 1024 * 1024,
       seed: options.seed ?? new Uint8Array(),
     };
     this.config = encodeConfig(this.options);
@@ -184,6 +187,98 @@ class PeonySession {
     this.cancelled = true;
     this.api.peony_cancel(this.handle);
     if (this.resolveCancel) this.resolveCancel(cancelSentinel);
+  }
+
+  mount(files, options = {}) {
+    if (files === null || typeof files !== 'object') throw new TypeError('mount expects a mapping of course paths to bytes');
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('mount options must be an object');
+    for (const key of Reflect.ownKeys(options)) if (key !== 'root') throw new TypeError(`unsupported mount option: ${String(key)}`);
+    const root = Object.hasOwn(options, 'root') ? options.root : '/course';
+    if (typeof root !== 'string' || !root.startsWith('/course')) throw new TypeError('mount root must be inside /course');
+    if (!(files instanceof Map) && Object.getOwnPropertySymbols(files).some((key) => Object.prototype.propertyIsEnumerable.call(files, key))) {
+      throw new TypeError('mount paths must be strings');
+    }
+    for (const [path, content] of Object.entries(files)) {
+      checkedVfsPath(path, 'mount path');
+      const bytes = fileBytes(content);
+      const mountPath = path.startsWith('/') ? path : `${root.replace(/\/$/, '')}/${path}`;
+      this.vfsWrite('peony_vfs_mount', mountPath, bytes);
+    }
+  }
+
+  readFile(path) {
+    checkedVfsPath(path);
+    const pathBlock = this.writeTransfer(utf8Encoder.encode(path));
+    let result;
+    try {
+      result = this.api.peony_vfs_read(this.handle, pathBlock.pointer, pathBlock.length);
+    } finally {
+      this.freeTransfer(pathBlock);
+    }
+    this.checkVfsStatus(result, 'read');
+    const length = this.api.peony_vfs_data_len(this.handle);
+    const pointer = this.api.peony_vfs_data_ptr(this.handle);
+    return length === 0 ? new Uint8Array() : new Uint8Array(this.api.memory.buffer, pointer, length).slice();
+  }
+
+  writeFile(path, content) {
+    checkedVfsPath(path);
+    this.vfsWrite('peony_vfs_write', path, fileBytes(content));
+  }
+
+  listFiles(path = '/') {
+    checkedVfsPath(path);
+    const pathBlock = this.writeTransfer(utf8Encoder.encode(path));
+    let result;
+    try {
+      result = this.api.peony_vfs_list(this.handle, pathBlock.pointer, pathBlock.length);
+    } finally {
+      this.freeTransfer(pathBlock);
+    }
+    this.checkVfsStatus(result, 'list');
+    const length = this.api.peony_vfs_data_len(this.handle);
+    if (length === 0) return [];
+    const pointer = this.api.peony_vfs_data_ptr(this.handle);
+    const borrowed = new Uint8Array(this.api.memory.buffer, pointer, length);
+    return utf8Decoder.decode(borrowed).split('\0').filter((entry) => entry.length !== 0);
+  }
+
+  vfsWrite(exportName, path, bytes) {
+    checkedVfsPath(path);
+    let pathBlock = null;
+    let dataBlock = null;
+    try {
+      pathBlock = this.writeTransfer(utf8Encoder.encode(path));
+      dataBlock = this.writeTransfer(bytes);
+      const result = this.api[exportName](this.handle, pathBlock.pointer, pathBlock.length, dataBlock.pointer, dataBlock.length);
+      this.checkVfsStatus(result, exportName === 'peony_vfs_mount' ? 'mount' : 'write');
+    } finally {
+      if (dataBlock !== null) this.freeTransfer(dataBlock);
+      if (pathBlock !== null) this.freeTransfer(pathBlock);
+    }
+  }
+
+  checkVfsStatus(result, operation) {
+    if (result === STATUS.ok) return;
+    if (result === STATUS.invalidHandle) throw new Error(`Peony VFS ${operation} used an invalid session`);
+    if (result === STATUS.outOfMemory) throw new Error(`Peony VFS ${operation} exceeded its memory limit`);
+    if (operation === 'read') throw new Error(`Peony file not found, invalid path, or permission denied: ${result}`);
+    if (operation === 'mount') throw new Error(`Peony course mount rejected: invalid path, duplicate, or permission denied (${result})`);
+    throw new Error(`Peony VFS ${operation} rejected: invalid path or permission denied (${result})`);
+  }
+
+  snapshotPersistentVfs() {
+    const files = [];
+    for (const root of ['/course', '/home']) {
+      for (const path of this.listFiles(root)) files.push([path, this.readFile(path)]);
+    }
+    return files;
+  }
+
+  restorePersistentVfs(files) {
+    for (const [path, bytes] of files) {
+      this.vfsWrite(path.startsWith('/course/') ? 'peony_vfs_mount' : 'peony_vfs_write', path, bytes);
+    }
   }
 
   reset() {
@@ -315,15 +410,29 @@ class PeonySession {
   }
 
   replaceRawSession() {
+    const persistentFiles = this.handle === 0 ? [] : this.snapshotPersistentVfs();
     if (this.handle !== 0) {
       const destroyed = this.api.peony_session_destroy(this.handle);
       if (destroyed !== STATUS.ok) throw new Error(`Peony session destroy failed (${destroyed})`);
       this.handle = 0;
     }
     this.handle = this.createRawSession();
+    this.restorePersistentVfs(persistentFiles);
     this.outputDecoder = new TextDecoder();
     this.cancelled = false;
   }
+}
+
+function fileBytes(content) {
+  if (typeof content === 'string') return utf8Encoder.encode(content);
+  if (content instanceof ArrayBuffer) return new Uint8Array(content);
+  if (ArrayBuffer.isView(content)) return new Uint8Array(content.buffer, content.byteOffset, content.byteLength);
+  throw new TypeError('VFS file contents must be a string or byte buffer');
+}
+
+function checkedVfsPath(path, label = 'VFS path') {
+  if (typeof path !== 'string') throw new TypeError(`${label} must be a string`);
+  return path;
 }
 
 const cancelSentinel = Symbol('cancelled input');
@@ -332,6 +441,9 @@ function encodeConfig(options) {
   const maxMemoryBytes = positiveUint32(options.maxMemoryBytes, 'maxMemoryBytes');
   const quantum = positiveUint32(options.quantum, 'quantum');
   const maxInstructions = positiveUint64(options.maxInstructions);
+  const maxVfsBytes = positiveUint32(options.maxVfsBytes, 'maxVfsBytes');
+  const maxFileBytes = positiveUint32(options.maxFileBytes, 'maxFileBytes');
+  if (maxFileBytes > maxVfsBytes) throw new RangeError('maxFileBytes cannot exceed maxVfsBytes');
   let seed;
   if (typeof options.seed === 'string') {
     seed = utf8Encoder.encode(options.seed);
@@ -343,7 +455,9 @@ function encodeConfig(options) {
     throw new TypeError('seed must be a string or byte buffer');
   }
   if (seed.length > 1024) throw new RangeError('Peony seed is too long');
-  const packet = new Uint8Array(28 + seed.length);
+  const hasVfsExtension = maxVfsBytes !== 8 * 1024 * 1024 || maxFileBytes !== 2 * 1024 * 1024;
+  const extensionLength = hasVfsExtension ? 8 : 0;
+  const packet = new Uint8Array(28 + seed.length + extensionLength);
   const view = new DataView(packet.buffer);
   packet.set([0x50, 0x43, 0x46, 0x47]);
   view.setUint16(4, 1, true);
@@ -352,7 +466,12 @@ function encodeConfig(options) {
   view.setBigUint64(12, maxInstructions, true);
   view.setUint32(20, quantum, true);
   view.setUint16(24, seed.length, true);
+  view.setUint16(26, extensionLength, true);
   packet.set(seed, 28);
+  if (hasVfsExtension) {
+    view.setUint32(28 + seed.length, maxVfsBytes, true);
+    view.setUint32(32 + seed.length, maxFileBytes, true);
+  }
   return packet;
 }
 

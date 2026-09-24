@@ -8,6 +8,7 @@ const sequence = @import("runtime_sequence");
 const slice_utils = @import("runtime_slice");
 const dict_module = @import("runtime_dict");
 const exceptions = @import("runtime_exception");
+const file_module = @import("runtime_file");
 
 const Heap = gc.Heap;
 const Value = value_module.Value;
@@ -66,7 +67,6 @@ pub const Iterator = struct {
     generator_yielded: ?Value = null,
     generator_frame_destroy: ?*const fn (*anyopaque, std.mem.Allocator) void = null,
 };
-
 
 pub const NextResult = union(enum) {
     item: Value,
@@ -429,6 +429,7 @@ pub fn createIterator(heap: *Heap, value: Value) exceptions.Result(*Iterator) {
     var has_sequence = false;
     if (value.asObject()) |header| {
         if (iteratorFromHeader(header)) |existing| return .{ .value = existing };
+        if (file_module.fromHeader(header) != null) return createInitialized(heap, .{ .sequence_value = value });
         if (dict_module.dictFromHeader(header)) |mapping| return createMappingIterator(heap, mapping, .keys);
         if (dict_module.viewFromHeader(header)) |view| return createMappingIterator(heap, view.owner, view.kind);
         range = rangeFromHeader(header);
@@ -632,6 +633,28 @@ pub fn next(heap: *Heap, iterator: *Iterator) NextResult {
         .basic, .map, .filter, .generator => {},
     }
     if (iterator.range) |range| return nextRange(heap, iterator, range);
+    if (iterator.sequence_value.asObject()) |sequence_header| {
+        if (file_module.fromHeader(sequence_header)) |file| {
+            const line = file_module.readBuffer(heap, file.fs, file, null, true);
+            const contents = switch (line) {
+                .value => |selected| selected,
+                .python_exception => |exception| return .{ .python_exception = exception },
+                .engine_error => |failure| return .{ .engine_error = failure },
+            };
+            defer if (contents.len != 0) heap.allocator.free(contents);
+            if (contents.len == 0) return .done;
+            if (file.mode.binary) return switch (bytes.create(heap, contents)) {
+                .value => |item| .{ .item = Value.object(&item.header) },
+                .python_exception => |exception| .{ .python_exception = exception },
+                .engine_error => |failure| .{ .engine_error = failure },
+            };
+            return switch (string.create(heap, contents)) {
+                .value => |item| .{ .item = Value.object(&item.header) },
+                .python_exception => |exception| .{ .python_exception = exception },
+                .engine_error => |failure| .{ .engine_error = failure },
+            };
+        }
+    }
     if (iterator.mapping_iterator) |mapping_iterator| return switch (dict_module.next(heap, mapping_iterator)) {
         .item => |item| .{ .item = item },
         .done => .done,

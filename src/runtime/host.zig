@@ -3,6 +3,7 @@ const std = @import("std");
 pub const packet_header_size = 24;
 pub const section_descriptor_size = 12;
 pub const config_header_size = 28;
+pub const config_vfs_extension_size = 8;
 pub const max_packet_sections = 64;
 pub const max_packet_bytes = 1024 * 1024;
 pub const max_seed_length = 1024;
@@ -65,6 +66,8 @@ pub const Config = struct {
     max_memory_bytes: u32,
     max_instructions: u64,
     quantum: u32,
+    max_vfs_bytes: u32,
+    max_file_bytes: u32,
     seed: []const u8,
 
     pub fn defaults() Config {
@@ -72,6 +75,8 @@ pub const Config = struct {
             .max_memory_bytes = 64 * 1024 * 1024,
             .max_instructions = 50_000_000,
             .quantum = 50_000,
+            .max_vfs_bytes = 8 * 1024 * 1024,
+            .max_file_bytes = 2 * 1024 * 1024,
             .seed = &.{},
         };
     }
@@ -175,8 +180,10 @@ pub fn peekEnvelope(bytes: []const u8) error{InvalidPacket}!Envelope {
 }
 
 pub fn encodeConfig(allocator: std.mem.Allocator, config: Config) (std.mem.Allocator.Error || error{InvalidConfig})![]u8 {
-    if (config.max_memory_bytes == 0 or config.max_instructions == 0 or config.quantum == 0 or config.seed.len > max_seed_length) return error.InvalidConfig;
-    const total = std.math.add(usize, config_header_size, config.seed.len) catch return error.InvalidConfig;
+    if (config.max_memory_bytes == 0 or config.max_instructions == 0 or config.quantum == 0 or config.max_vfs_bytes == 0 or config.max_file_bytes == 0 or config.max_file_bytes > config.max_vfs_bytes or config.seed.len > max_seed_length) return error.InvalidConfig;
+    const has_vfs_extension = config.max_vfs_bytes != Config.defaults().max_vfs_bytes or config.max_file_bytes != Config.defaults().max_file_bytes;
+    const extension_length: usize = if (has_vfs_extension) config_vfs_extension_size else 0;
+    const total = std.math.add(usize, config_header_size + extension_length, config.seed.len) catch return error.InvalidConfig;
     if (config.seed.len > std.math.maxInt(u16)) return error.InvalidConfig;
     const bytes = try allocator.alloc(u8, total);
     @memset(bytes, 0);
@@ -187,23 +194,42 @@ pub fn encodeConfig(allocator: std.mem.Allocator, config: Config) (std.mem.Alloc
     put(u64, bytes, 12, config.max_instructions);
     put(u32, bytes, 20, config.quantum);
     put(u16, bytes, 24, @intCast(config.seed.len));
-    put(u16, bytes, 26, 0);
-    @memcpy(bytes[config_header_size..], config.seed);
+    put(u16, bytes, 26, @intCast(extension_length));
+    @memcpy(bytes[config_header_size..][0..config.seed.len], config.seed);
+    if (has_vfs_extension) {
+        const extension = config_header_size + config.seed.len;
+        put(u32, bytes, extension, config.max_vfs_bytes);
+        put(u32, bytes, extension + 4, config.max_file_bytes);
+    }
     return bytes;
 }
 
 pub fn decodeConfig(bytes: []const u8) error{InvalidConfig}!Config {
     if (bytes.len == 0) return Config.defaults();
     if (bytes.len < config_header_size or !std.mem.eql(u8, bytes[0..4], "PCFG")) return error.InvalidConfig;
-    if (get(u16, bytes, 4) != 1 or get(u16, bytes, 26) != 0) return error.InvalidConfig;
+    if (get(u16, bytes, 4) != 1) return error.InvalidConfig;
     const flags = get(u16, bytes, 6);
     const memory = get(u32, bytes, 8);
     const instructions = get(u64, bytes, 12);
     const quantum = get(u32, bytes, 20);
     const seed_length: usize = get(u16, bytes, 24);
+    const extension_length: usize = get(u16, bytes, 26);
     if (flags > 1 or (flags == 0) != (seed_length == 0) or seed_length > max_seed_length) return error.InvalidConfig;
-    if (bytes.len != config_header_size + seed_length or memory == 0 or instructions == 0 or quantum == 0) return error.InvalidConfig;
-    return .{ .max_memory_bytes = memory, .max_instructions = instructions, .quantum = quantum, .seed = bytes[config_header_size..] };
+    if (extension_length != 0 and extension_length != config_vfs_extension_size) return error.InvalidConfig;
+    const expected_length = std.math.add(usize, config_header_size + extension_length, seed_length) catch return error.InvalidConfig;
+    if (bytes.len != expected_length or memory == 0 or instructions == 0 or quantum == 0) return error.InvalidConfig;
+    var config = Config.defaults();
+    config.max_memory_bytes = memory;
+    config.max_instructions = instructions;
+    config.quantum = quantum;
+    config.seed = bytes[config_header_size..][0..seed_length];
+    if (extension_length != 0) {
+        const extension = config_header_size + seed_length;
+        config.max_vfs_bytes = get(u32, bytes, extension);
+        config.max_file_bytes = get(u32, bytes, extension + 4);
+    }
+    if (config.max_vfs_bytes == 0 or config.max_file_bytes == 0 or config.max_file_bytes > config.max_vfs_bytes) return error.InvalidConfig;
+    return config;
 }
 
 fn put(comptime T: type, bytes: []u8, offset: usize, value: T) void {

@@ -18,6 +18,8 @@ const binder = @import("runtime_binder");
 const ast_module = @import("frontend_ast");
 const format_rules = @import("format.zig");
 const host = @import("runtime_host");
+const vfs_module = @import("runtime_vfs");
+const file_module = @import("runtime_file");
 
 const Value = value_module.Value;
 const Code = bytecode.Code;
@@ -197,6 +199,9 @@ fn destroyEnvironment(header: *gc.Header, allocator: std.mem.Allocator) void {
 pub const Runtime = struct {
     session_allocator: gc.SessionAllocator = undefined,
     heap: gc.Heap = .{},
+    vfs: vfs_module.Vfs = undefined,
+    vfs_output: []const u8 = &.{},
+    vfs_output_owned: bool = false,
     environment: *Environment = undefined,
     environment_frame: gc.RootFrame = .{},
     environment_root: gc.Root = .{ .object = null },
@@ -245,12 +250,44 @@ pub const Runtime = struct {
     initialized: bool = false,
 
     pub fn init(self: *Runtime, backing: std.mem.Allocator, max_bytes: usize) std.mem.Allocator.Error!void {
+        const vfs_limit = @min(8 * 1024 * 1024, @max(@as(usize, 1024), max_bytes / 2));
+        const file_limit = @min(2 * 1024 * 1024, vfs_limit);
+        return self.initWithVfsLimits(backing, max_bytes, vfs_limit, file_limit);
+    }
+
+    pub fn initWithConfig(self: *Runtime, backing: std.mem.Allocator, config: host.Config) std.mem.Allocator.Error!void {
+        try self.initWithVfsLimits(
+            backing,
+            @intCast(config.max_memory_bytes),
+            @intCast(config.max_vfs_bytes),
+            @intCast(config.max_file_bytes),
+        );
+        self.configureHost(config);
+    }
+
+    fn initWithVfsLimits(
+        self: *Runtime,
+        backing: std.mem.Allocator,
+        max_bytes: usize,
+        vfs_limit: usize,
+        file_limit: usize,
+    ) std.mem.Allocator.Error!void {
         self.* = .{};
         session_hash_nonce +%= 1;
         self.hash_seed = hash_module.mixSessionSeed(session_hash_nonce, @intFromPtr(self));
         self.session_allocator = gc.SessionAllocator.init(backing, max_bytes);
         self.heap.init(&self.session_allocator, .{});
-        const environment = try self.heap.createObject(Environment, &environment_kind);
+        self.vfs = vfs_module.Vfs.init(self.heap.allocator, vfs_limit, file_limit) catch {
+            self.heap.deinit();
+            self.* = .{};
+            return error.OutOfMemory;
+        };
+        const environment = self.heap.createObject(Environment, &environment_kind) catch {
+            self.vfs.deinit();
+            self.heap.deinit();
+            self.* = .{};
+            return error.OutOfMemory;
+        };
         environment.entries = .empty;
         self.environment = environment;
         self.environment_root.object = &environment.header;
@@ -270,6 +307,7 @@ pub const Runtime = struct {
                 self.exception_frame.pop();
                 self.builtin_frame.pop();
                 self.environment_frame.pop();
+                self.vfs.deinit();
                 self.heap.deinit();
                 self.* = .{};
                 return error.OutOfMemory;
@@ -282,6 +320,7 @@ pub const Runtime = struct {
                 self.exception_frame.pop();
                 self.builtin_frame.pop();
                 self.environment_frame.pop();
+                self.vfs.deinit();
                 self.heap.deinit();
                 self.* = .{};
                 return error.OutOfMemory;
@@ -294,6 +333,7 @@ pub const Runtime = struct {
                 self.exception_frame.pop();
                 self.builtin_frame.pop();
                 self.environment_frame.pop();
+                self.vfs.deinit();
                 self.heap.deinit();
                 self.* = .{};
                 return error.OutOfMemory;
@@ -312,6 +352,8 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         if (!self.initialized) return;
         self.resetProgram(false);
+        self.clearVfsOutput();
+        self.vfs.deinit();
         self.stdout_bytes.deinit(self.heap.allocator);
         self.repr_path.deinit(self.heap.allocator);
         if (self.traceback_json_owned) |json| self.heap.allocator.free(json);
@@ -325,6 +367,8 @@ pub const Runtime = struct {
     }
 
     pub fn compileAndStart(self: *Runtime, source: []const u8, filename: []const u8) CompileOutcome {
+        self.vfs.clearTemporary();
+        self.clearVfsOutput();
         self.resetProgram(true);
         self.instructions_executed = 0;
         self.work_executed = 0;
@@ -356,6 +400,10 @@ pub const Runtime = struct {
     }
 
     pub fn run(self: *Runtime, requested_quantum: u32) RunStatus {
+        // `vfs_output` may borrow an entry's byte storage. A running Python
+        // program can replace that entry, so expire any prior VFS view before
+        // execution can mutate the filesystem.
+        self.clearVfsOutput();
         if (self.engine_failed) return .engine_error;
         if (self.cancel_requested) {
             self.cancel_requested = false;
@@ -459,6 +507,39 @@ pub const Runtime = struct {
         return self.work_executed;
     }
 
+    pub fn mountCourseFile(self: *Runtime, path: []const u8, bytes: []const u8) vfs_module.Error!void {
+        self.clearVfsOutput();
+        try self.vfs.mountCourse(path, bytes);
+    }
+
+    pub fn writeVfsFile(self: *Runtime, path: []const u8, bytes: []const u8) vfs_module.Error!void {
+        self.clearVfsOutput();
+        try self.vfs.write(path, bytes, .replace);
+    }
+
+    pub fn readVfsFile(self: *Runtime, path: []const u8) vfs_module.Error![]const u8 {
+        self.clearVfsOutput();
+        self.vfs_output = try self.vfs.read(path);
+        return self.vfs_output;
+    }
+
+    pub fn listVfsFiles(self: *Runtime, path: []const u8) vfs_module.Error![]const u8 {
+        self.clearVfsOutput();
+        self.vfs_output = try self.vfs.list(path);
+        self.vfs_output_owned = true;
+        return self.vfs_output;
+    }
+
+    pub fn vfsData(self: *const Runtime) []const u8 {
+        return self.vfs_output;
+    }
+
+    pub fn clearVfsOutput(self: *Runtime) void {
+        if (self.vfs_output_owned and self.vfs_output.len != 0) self.heap.allocator.free(@constCast(self.vfs_output));
+        self.vfs_output = &.{};
+        self.vfs_output_owned = false;
+    }
+
     pub fn eventBytes(self: *const Runtime) []const u8 {
         return self.event_packet orelse "";
     }
@@ -469,6 +550,8 @@ pub const Runtime = struct {
     }
 
     pub fn reset(self: *Runtime) void {
+        self.vfs.clearTemporary();
+        self.clearVfsOutput();
         self.resetProgram(true);
         self.instructions_executed = 0;
         self.work_executed = 0;
@@ -703,6 +786,8 @@ pub const Runtime = struct {
         if (self.exception_frame.stack != null) self.exception_frame.pop();
         if (self.builtin_frame.stack != null) self.builtin_frame.pop();
         if (self.environment_frame.stack != null) self.environment_frame.pop();
+        self.clearVfsOutput();
+        self.vfs.deinit();
         self.heap.deinit();
         self.* = .{};
     }
@@ -1025,6 +1110,17 @@ pub const Runtime = struct {
     }
 
     fn executeWithEnter(self: *Runtime, destination: u16, manager_value: Value, line: u32, column: u32) bool {
+        if (manager_value.asObject()) |header| {
+            if (file_module.fromHeader(header)) |file| {
+                if (file.closed) {
+                    self.setException(.{ .kind = .value_error, .message = "I/O operation on closed file" }, line, column, null);
+                    return false;
+                }
+                if (!self.validRegister(destination)) return self.engineFault();
+                self.setRegister(destination, manager_value);
+                return true;
+            }
+        }
         const manager = testContextManager(manager_value) orelse {
             self.setException(.{ .kind = .type_error, .message = "object does not support the context manager protocol" }, line, column, null);
             return false;
@@ -1044,6 +1140,12 @@ pub const Runtime = struct {
         if (frame.try_blocks.items.len == 0) return self.engineFault();
         const block = &frame.try_blocks.items[frame.try_blocks.items.len - 1];
         if (block.phase != .finally_body) return self.engineFault();
+        if (manager_value.asObject()) |header| {
+            if (file_module.fromHeader(header)) |file| {
+                file_module.close(file);
+                return true;
+            }
+        }
         const manager = testContextManager(manager_value) orelse {
             self.setException(.{ .kind = .type_error, .message = "object does not support the context manager protocol" }, line, column, null);
             return false;
@@ -1823,6 +1925,7 @@ pub const Runtime = struct {
                 }
                 return true;
             },
+            .open => return self.executeOpen(destination, positional, keywords, line, column),
             else => return self.executeOtherNativeCall(destination, native, bound_self, positional, keywords, line, column),
         }
     }
@@ -1882,7 +1985,10 @@ pub const Runtime = struct {
                 const list_result = sequence.createList(&self.heap, &.{});
                 const list = switch (list_result) {
                     .value => |selected| selected,
-                    .python_exception => |exception| { self.setException(exception, line, column, null); return false; },
+                    .python_exception => |exception| {
+                        self.setException(exception, line, column, null);
+                        return false;
+                    },
                     .engine_error => return self.engineFault(),
                 };
                 var list_root = gc.Root{ .object = &list.header };
@@ -1896,8 +2002,22 @@ pub const Runtime = struct {
                 return true;
             },
             .dict, .set => return self.executeMappingConstructor(destination, native == .set, positional, keywords, line, column),
-            .dict_get, .dict_keys, .dict_values, .dict_items, .dict_pop, .dict_setdefault, .dict_update, .dict_clear, .dict_copy,
-            .set_add, .set_remove, .set_discard, .set_pop, .set_update, .set_clear, .set_copy,
+            .dict_get,
+            .dict_keys,
+            .dict_values,
+            .dict_items,
+            .dict_pop,
+            .dict_setdefault,
+            .dict_update,
+            .dict_clear,
+            .dict_copy,
+            .set_add,
+            .set_remove,
+            .set_discard,
+            .set_pop,
+            .set_update,
+            .set_clear,
+            .set_copy,
             => return self.executeMappingMethod(destination, native, bound_self, positional, keywords, line, column),
             .list_append, .list_extend, .list_insert, .list_pop, .list_remove, .list_clear, .list_index, .list_count, .list_reverse, .list_copy, .list_sort => {
                 const header = bound_self.asObject() orelse return self.engineFault();
@@ -2010,6 +2130,17 @@ pub const Runtime = struct {
                 const data = byte_module.fromHeader(header) orelse return self.engineFault();
                 return self.executeBytesNative(destination, native, data, positional, keywords, line, column);
             },
+            .file_read,
+            .file_readline,
+            .file_readlines,
+            .file_write,
+            .file_writelines,
+            .file_seek,
+            .file_tell,
+            .file_truncate,
+            .file_flush,
+            .file_close,
+            => return self.executeFileNative(destination, native, bound_self, positional, keywords, line, column),
             .len => {
                 if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
                 const value = positional[0];
@@ -2097,6 +2228,275 @@ pub const Runtime = struct {
             },
             else => return self.engineFault(),
         }
+    }
+
+    fn executeOpen(self: *Runtime, destination: u16, positional: []const Value, keywords: []const binder.Keyword, line: u32, column: u32) bool {
+        if (positional.len == 0 or positional.len > 2) return self.nativeArity(line, column);
+        const path = self.valueString(positional[0]) orelse return self.nativeTypeError(line, column, "open() path must be a string");
+        var mode: []const u8 = "r";
+        var mode_supplied = positional.len > 1;
+        if (mode_supplied) mode = self.valueString(positional[1]) orelse return self.nativeTypeError(line, column, "open() mode must be a string");
+        var encoding: ?[]const u8 = null;
+        var newline: ?[]const u8 = null;
+        for (keywords) |keyword| {
+            if (std.mem.eql(u8, keyword.name, "mode")) {
+                if (mode_supplied) return self.nativeTypeError(line, column, "open() got multiple values for mode");
+                mode = self.valueString(keyword.value) orelse return self.nativeTypeError(line, column, "open() mode must be a string");
+                mode_supplied = true;
+            } else if (std.mem.eql(u8, keyword.name, "encoding")) {
+                if (keyword.value.tag() != .none) encoding = self.valueString(keyword.value) orelse return self.nativeTypeError(line, column, "encoding must be a string or None");
+            } else if (std.mem.eql(u8, keyword.name, "newline")) {
+                if (keyword.value.tag() != .none) newline = self.valueString(keyword.value) orelse return self.nativeTypeError(line, column, "newline must be a string or None");
+            } else {
+                return self.nativeTypeError(line, column, "unsupported open() argument");
+            }
+        }
+        return switch (file_module.open(&self.heap, &self.vfs, path, mode, encoding, newline)) {
+            .value => |file| blk: {
+                self.setRegister(destination, Value.object(&file.header));
+                break :blk true;
+            },
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk false;
+            },
+            .engine_error => self.engineFault(),
+        };
+    }
+
+    fn executeFileNative(
+        self: *Runtime,
+        destination: u16,
+        native: functions.Native,
+        bound_self: Value,
+        positional: []const Value,
+        keywords: []const binder.Keyword,
+        line: u32,
+        column: u32,
+    ) bool {
+        if (keywords.len != 0) return self.nativeTypeError(line, column, "file method does not accept keyword arguments");
+        const header = bound_self.asObject() orelse return self.engineFault();
+        const file = file_module.fromHeader(header) orelse return self.engineFault();
+        var file_root = gc.Root{ .object = &file.header };
+        var roots = gc.RootFrame{};
+        roots.push(&self.heap.roots);
+        roots.add(&file_root);
+        defer roots.pop();
+
+        switch (native) {
+            .file_read, .file_readline => {
+                if (positional.len > 1) return self.nativeArity(line, column);
+                const size = if (positional.len == 0) null else self.fileInteger(positional[0], line, column) orelse return false;
+                const result = file_module.readBuffer(&self.heap, file.fs, file, size, native == .file_readline);
+                const contents = switch (result) {
+                    .value => |selected| selected,
+                    .python_exception => |exception| {
+                        self.setException(exception, line, column, null);
+                        return false;
+                    },
+                    .engine_error => return self.engineFault(),
+                };
+                defer if (contents.len != 0) self.heap.allocator.free(contents);
+                if (file.mode.binary) return self.storeBytesResult(destination, byte_module.create(&self.heap, contents), line, column);
+                return self.storeStringResult(destination, string.create(&self.heap, contents), line, column);
+            },
+            .file_readlines => {
+                if (positional.len > 1) return self.nativeArity(line, column);
+                const hint: i64 = if (positional.len == 0) -1 else self.fileInteger(positional[0], line, column) orelse return false;
+                const created = sequence.createList(&self.heap, &.{});
+                const list = switch (created) {
+                    .value => |selected| selected,
+                    .python_exception => |exception| {
+                        self.setException(exception, line, column, null);
+                        return false;
+                    },
+                    .engine_error => return self.engineFault(),
+                };
+                var list_root = gc.Root{ .object = &list.header };
+                var item_root = gc.Root{ .object = null };
+                roots.add(&list_root);
+                roots.add(&item_root);
+                const owns_work_budget = self.beginSynchronousWork();
+                defer self.endSynchronousWork(owns_work_budget);
+                var total: usize = 0;
+                while (true) {
+                    if (!self.chargeSynchronousWork(line, column)) return false;
+                    const result = file_module.readBuffer(&self.heap, file.fs, file, null, true);
+                    const contents = switch (result) {
+                        .value => |selected| selected,
+                        .python_exception => |exception| {
+                            self.setException(exception, line, column, null);
+                            return false;
+                        },
+                        .engine_error => return self.engineFault(),
+                    };
+                    if (contents.len == 0) {
+                        self.heap.allocator.free(contents);
+                        break;
+                    }
+                    const line_size = if (file.mode.binary) contents.len else std.unicode.utf8CountCodepoints(contents) catch {
+                        self.heap.allocator.free(contents);
+                        self.setException(.{ .kind = .unicode_decode_error, .message = "invalid UTF-8 data in file" }, line, column, null);
+                        return false;
+                    };
+                    const item: Value = if (file.mode.binary) blk: {
+                        const created_item = byte_module.create(&self.heap, contents);
+                        self.heap.allocator.free(contents);
+                        break :blk switch (created_item) {
+                            .value => |selected| Value.object(&selected.header),
+                            .python_exception => |exception| {
+                                self.setException(exception, line, column, null);
+                                return false;
+                            },
+                            .engine_error => return self.engineFault(),
+                        };
+                    } else blk: {
+                        const created_item = string.create(&self.heap, contents);
+                        self.heap.allocator.free(contents);
+                        break :blk switch (created_item) {
+                            .value => |selected| Value.object(&selected.header),
+                            .python_exception => |exception| {
+                                self.setException(exception, line, column, null);
+                                return false;
+                            },
+                            .engine_error => return self.engineFault(),
+                        };
+                    };
+                    item_root.object = item.asObject();
+                    const append = sequence.append(&self.heap, list, item);
+                    switch (append) {
+                        .value => {},
+                        .python_exception => |exception| {
+                            self.setException(exception, line, column, null);
+                            return false;
+                        },
+                        .engine_error => return self.engineFault(),
+                    }
+                    total += line_size;
+                    if (hint > 0 and total >= @as(usize, @intCast(hint))) break;
+                }
+                self.setRegister(destination, Value.object(&list.header));
+                return true;
+            },
+            .file_write => {
+                if (positional.len != 1) return self.nativeArity(line, column);
+                const bytes = if (file.mode.binary)
+                    self.valueBytes(positional[0]) orelse return self.nativeTypeError(line, column, "a bytes-like object is required")
+                else
+                    self.valueString(positional[0]) orelse return self.nativeTypeError(line, column, "write() argument must be str");
+                return switch (file_module.writeBuffer(&self.heap, file.fs, file, bytes)) {
+                    .value => |count| self.setSmallInt(destination, count, line, column),
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk false;
+                    },
+                    .engine_error => self.engineFault(),
+                };
+            },
+            .file_writelines => {
+                if (positional.len != 1) return self.nativeArity(line, column);
+                const created = iterator.createIterator(&self.heap, positional[0]);
+                const iter = switch (created) {
+                    .value => |selected| selected,
+                    .python_exception => |exception| {
+                        self.setException(exception, line, column, null);
+                        return false;
+                    },
+                    .engine_error => return self.engineFault(),
+                };
+                var iterator_root = gc.Root{ .object = &iter.header };
+                var item_root = gc.Root{ .object = null };
+                roots.add(&iterator_root);
+                roots.add(&item_root);
+                const owns_work_budget = self.beginSynchronousWork();
+                defer self.endSynchronousWork(owns_work_budget);
+                while (true) {
+                    if (!self.chargeSynchronousWork(line, column)) return false;
+                    const next = self.nextIteratorValue(iter, destination, line, column);
+                    const item = switch (next) {
+                        .item => |selected| selected,
+                        .done => break,
+                        .suspended => return self.nativeTypeError(line, column, "writelines does not support a suspended iterator in this runtime slice"),
+                        .python_exception => |exception| {
+                            self.setException(exception, line, column, null);
+                            return false;
+                        },
+                        .engine_error => return self.engineFault(),
+                    };
+                    item_root.object = item.asObject();
+                    const bytes = if (file.mode.binary)
+                        self.valueBytes(item) orelse return self.nativeTypeError(line, column, "writelines() argument must contain bytes")
+                    else
+                        self.valueString(item) orelse return self.nativeTypeError(line, column, "writelines() argument must contain strings");
+                    switch (file_module.writeBuffer(&self.heap, file.fs, file, bytes)) {
+                        .value => {},
+                        .python_exception => |exception| {
+                            self.setException(exception, line, column, null);
+                            return false;
+                        },
+                        .engine_error => return self.engineFault(),
+                    }
+                }
+                self.setRegister(destination, Value.noneValue());
+                return true;
+            },
+            .file_seek => {
+                if (positional.len == 0 or positional.len > 2) return self.nativeArity(line, column);
+                const offset = self.fileInteger(positional[0], line, column) orelse return false;
+                const whence = if (positional.len == 2) self.fileInteger(positional[1], line, column) orelse return false else 0;
+                return switch (file_module.seek(file.fs, file, offset, whence)) {
+                    .value => |position| self.setSmallInt(destination, @as(i64, @intCast(position)), line, column),
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk false;
+                    },
+                    .engine_error => self.engineFault(),
+                };
+            },
+            .file_tell => {
+                if (positional.len != 0) return self.nativeArity(line, column);
+                if (file.closed) {
+                    self.setException(.{ .kind = .value_error, .message = "I/O operation on closed file" }, line, column, null);
+                    return false;
+                }
+                return self.setSmallInt(destination, @as(i64, @intCast(file.cursor)), line, column);
+            },
+            .file_truncate => {
+                if (positional.len > 1) return self.nativeArity(line, column);
+                const size: ?i64 = if (positional.len == 0) null else self.fileInteger(positional[0], line, column) orelse return false;
+                return switch (file_module.truncate(&self.heap, file.fs, file, size)) {
+                    .value => |count| self.setSmallInt(destination, @as(i64, @intCast(count)), line, column),
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk false;
+                    },
+                    .engine_error => self.engineFault(),
+                };
+            },
+            .file_flush => {
+                if (positional.len != 0) return self.nativeArity(line, column);
+                return self.storeVoidResult(destination, file_module.flush(file), line, column);
+            },
+            .file_close => {
+                if (positional.len != 0) return self.nativeArity(line, column);
+                file_module.close(file);
+                self.setRegister(destination, Value.noneValue());
+                return true;
+            },
+            else => return self.engineFault(),
+        }
+    }
+
+    fn fileInteger(self: *Runtime, value: Value, line: u32, column: u32) ?i64 {
+        if (value.asBool()) |boolean| return if (boolean) 1 else 0;
+        if (!number.isIntegerValue(value)) {
+            _ = self.nativeTypeError(line, column, "integer argument expected");
+            return null;
+        }
+        return number.toInt(i64, value) orelse blk: {
+            self.setException(.{ .kind = .overflow_error, .message = "Python int too large to convert to C ssize_t" }, line, column, null);
+            break :blk null;
+        };
     }
 
     fn executeMappingConstructor(self: *Runtime, destination: u16, is_set: bool, positional: []const Value, keywords: []const binder.Keyword, line: u32, column: u32) bool {
@@ -2303,8 +2703,14 @@ pub const Runtime = struct {
                 const key_hash = self.pythonHash(positional[0], line, column) orelse return false;
                 var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
                 return switch (dict_module.get(mapping, positional[0], key_hash, &context, dictKeysEqual)) {
-                    .value => |value| blk: { self.setRegister(destination, value); break :blk true; },
-                    .missing => blk: { self.setRegister(destination, if (positional.len == 2) positional[1] else Value.noneValue()); break :blk true; },
+                    .value => |value| blk: {
+                        self.setRegister(destination, value);
+                        break :blk true;
+                    },
+                    .missing => blk: {
+                        self.setRegister(destination, if (positional.len == 2) positional[1] else Value.noneValue());
+                        break :blk true;
+                    },
                     .failed => self.last_exception == null and self.engineFault(),
                 };
             },
@@ -2312,8 +2718,14 @@ pub const Runtime = struct {
                 if (positional.len != 0) return self.nativeArity(line, column);
                 const kind: dict_module.ViewKind = if (native == .dict_keys) .keys else if (native == .dict_values) .values else .items;
                 return switch (dict_module.createView(&self.heap, mapping, kind)) {
-                    .value => |view| blk: { self.setRegister(destination, Value.object(&view.header)); break :blk true; },
-                    .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk false; },
+                    .value => |view| blk: {
+                        self.setRegister(destination, Value.object(&view.header));
+                        break :blk true;
+                    },
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk false;
+                    },
                     .engine_error => self.engineFault(),
                 };
             },
@@ -2369,7 +2781,10 @@ pub const Runtime = struct {
                 const key_hash = self.pythonHash(positional[0], line, column) orelse return false;
                 var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
                 return switch (dict_module.delete(mapping, positional[0], key_hash, &context, dictKeysEqual)) {
-                    .found => blk: { self.setRegister(destination, Value.noneValue()); break :blk true; },
+                    .found => blk: {
+                        self.setRegister(destination, Value.noneValue());
+                        break :blk true;
+                    },
                     .missing => blk: {
                         if (native == .set_remove) {
                             self.setException(.{ .kind = .key_error, .message = "element not found" }, line, column, null);
@@ -2404,8 +2819,14 @@ pub const Runtime = struct {
 
     fn storeDictResult(self: *Runtime, destination: u16, result: exceptions.Result(*dict_module.Dict), line: u32, column: u32) bool {
         return switch (result) {
-            .value => |mapping| blk: { self.setRegister(destination, Value.object(&mapping.header)); break :blk true; },
-            .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk false; },
+            .value => |mapping| blk: {
+                self.setRegister(destination, Value.object(&mapping.header));
+                break :blk true;
+            },
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk false;
+            },
             .engine_error => self.engineFault(),
         };
     }
@@ -2492,12 +2913,18 @@ pub const Runtime = struct {
         var numbering_mode: enum { unset, automatic, manual } = .unset;
         while (index < source.len) {
             if (index + 1 < source.len and source[index] == '{' and source[index + 1] == '{') {
-                output.append(self.heap.allocator, '{') catch { _ = self.formatMemoryFailure(line, column); return false; };
+                output.append(self.heap.allocator, '{') catch {
+                    _ = self.formatMemoryFailure(line, column);
+                    return false;
+                };
                 index += 2;
                 continue;
             }
             if (index + 1 < source.len and source[index] == '}' and source[index + 1] == '}') {
-                output.append(self.heap.allocator, '}') catch { _ = self.formatMemoryFailure(line, column); return false; };
+                output.append(self.heap.allocator, '}') catch {
+                    _ = self.formatMemoryFailure(line, column);
+                    return false;
+                };
                 index += 2;
                 continue;
             }
@@ -2506,11 +2933,17 @@ pub const Runtime = struct {
                 return false;
             }
             if (source[index] != '{') {
-                output.append(self.heap.allocator, source[index]) catch { _ = self.formatMemoryFailure(line, column); return false; };
+                output.append(self.heap.allocator, source[index]) catch {
+                    _ = self.formatMemoryFailure(line, column);
+                    return false;
+                };
                 index += 1;
                 continue;
             }
-            const close = std.mem.indexOfScalarPos(u8, source, index + 1, '}') orelse { _ = self.formatValueError(line, column, "unmatched '{' in format string"); return false; };
+            const close = std.mem.indexOfScalarPos(u8, source, index + 1, '}') orelse {
+                _ = self.formatValueError(line, column, "unmatched '{' in format string");
+                return false;
+            };
             const field = source[index + 1 .. close];
             const colon = std.mem.indexOfScalar(u8, field, ':');
             const name = if (colon) |at| field[0..at] else field;
@@ -2522,7 +2955,10 @@ pub const Runtime = struct {
                     return false;
                 }
                 numbering_mode = .automatic;
-                if (automatic >= positional.len) { _ = self.formatValueError(line, column, "replacement index out of range"); return false; }
+                if (automatic >= positional.len) {
+                    _ = self.formatValueError(line, column, "replacement index out of range");
+                    return false;
+                }
                 value = positional[automatic];
                 automatic += 1;
             } else if (std.fmt.parseInt(usize, name, 10) catch null) |position| {
@@ -2531,7 +2967,10 @@ pub const Runtime = struct {
                     return false;
                 }
                 numbering_mode = .manual;
-                if (position >= positional.len) { _ = self.formatValueError(line, column, "replacement index out of range"); return false; }
+                if (position >= positional.len) {
+                    _ = self.formatValueError(line, column, "replacement index out of range");
+                    return false;
+                }
                 value = positional[position];
             } else {
                 for (keywords) |keyword| if (std.mem.eql(u8, keyword.name, name)) {
@@ -2545,10 +2984,16 @@ pub const Runtime = struct {
             };
             const formatted = self.makeFormattedText(selected, spec, 0, line, column) orelse return false;
             defer self.heap.allocator.free(formatted);
-            output.appendSlice(self.heap.allocator, formatted) catch { _ = self.formatMemoryFailure(line, column); return false; };
+            output.appendSlice(self.heap.allocator, formatted) catch {
+                _ = self.formatMemoryFailure(line, column);
+                return false;
+            };
             index = close + 1;
         }
-        const owned = output.toOwnedSlice(self.heap.allocator) catch { _ = self.formatMemoryFailure(line, column); return false; };
+        const owned = output.toOwnedSlice(self.heap.allocator) catch {
+            _ = self.formatMemoryFailure(line, column);
+            return false;
+        };
         defer self.heap.allocator.free(owned);
         return self.storeStringResult(destination, string.create(&self.heap, owned), line, column);
     }
@@ -2646,8 +3091,14 @@ pub const Runtime = struct {
         if (use_float) {
             const float_value = switch (number.toFloat(&self.heap, value)) {
                 .value => |selected| selected,
-                .python_exception => |exception| { self.setException(exception, line, column, null); return null; },
-                .engine_error => { _ = self.engineFault(); return null; },
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return null;
+                },
+                .engine_error => {
+                    _ = self.engineFault();
+                    return null;
+                },
             };
             if (kind == 0) {
                 var default_text = if (parsed.precision) |precision|
@@ -2672,7 +3123,10 @@ pub const Runtime = struct {
             const scaled = if (actual_kind == '%') float_value * 100 else float_value;
             var float_text = self.formatFloat(scaled, precision, actual_kind, parsed.alternate, line, column) orelse return null;
             if (parsed.comma) {
-                const grouped = self.groupThousands(float_text) orelse { self.heap.allocator.free(float_text); return self.formatMemoryFailure(line, column); };
+                const grouped = self.groupThousands(float_text) orelse {
+                    self.heap.allocator.free(float_text);
+                    return self.formatMemoryFailure(line, column);
+                };
                 self.heap.allocator.free(float_text);
                 float_text = grouped;
             }
@@ -2697,8 +3151,14 @@ pub const Runtime = struct {
         const digits_result = number.formatIntegerBase(&self.heap, value, base, if (kind == 'X') .upper else .lower) orelse return self.formatTypeError(line, column, "integer format requires an integer");
         var digits_owned = switch (digits_result) {
             .value => |selected| selected,
-            .python_exception => |exception| { self.setException(exception, line, column, null); return null; },
-            .engine_error => { _ = self.engineFault(); return null; },
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return null;
+            },
+            .engine_error => {
+                _ = self.engineFault();
+                return null;
+            },
         };
         defer self.heap.allocator.free(digits_owned);
         const negative = digits_owned.len != 0 and digits_owned[0] == '-';
@@ -4717,7 +5177,10 @@ pub const Runtime = struct {
                 const list = sequence.listFromHeader(header) orelse return self.engineFault();
                 return switch (sequence.append(&self.heap, list, self.registers[instruction.b()])) {
                     .value => true,
-                    .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk false; },
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk false;
+                    },
                     .engine_error => self.engineFault(),
                 };
             },
@@ -5100,6 +5563,21 @@ pub const Runtime = struct {
         if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
         const name = self.codeName(instruction.c()) orelse return self.engineFault();
         const receiver = self.registers[instruction.b()];
+        if (receiver.asObject()) |header| if (file_module.fromHeader(header)) |file| {
+            if (std.mem.eql(u8, name, "closed")) {
+                self.setRegister(instruction.a(), if (file.closed) Value.trueValue() else Value.falseValue());
+                return true;
+            }
+            if (std.mem.eql(u8, name, "name")) return self.storeStringResult(instruction.a(), string.create(&self.heap, file.path), line, column);
+            if (std.mem.eql(u8, name, "mode")) return self.storeStringResult(instruction.a(), string.create(&self.heap, file.mode_text), line, column);
+            if (std.mem.eql(u8, name, "encoding")) {
+                if (file.mode.binary) {
+                    self.setRegister(instruction.a(), Value.noneValue());
+                    return true;
+                }
+                return self.storeStringResult(instruction.a(), string.create(&self.heap, "UTF-8"), line, column);
+            }
+        };
         const native = attributeNative(receiver, name) orelse {
             self.setException(.{ .kind = .attribute_error, .message = "object has no such attribute" }, line, column, null);
             return false;
@@ -5123,7 +5601,7 @@ pub const Runtime = struct {
             return false;
         };
         if (index_value.asObject()) |index_header| {
-        if (slice.fromHeader(index_header) != null) return self.executeSliceItem(instruction.a(), container, index_value, line, column);
+            if (slice.fromHeader(index_header) != null) return self.executeSliceItem(instruction.a(), container, index_value, line, column);
         }
         if (iterator.rangeFromHeader(header)) |range| {
             const result = iterator.rangeIndex(&self.heap, range, index_value);
@@ -5627,8 +6105,14 @@ pub const Runtime = struct {
                             @memcpy(joined_data[0..left_bytes.data.len], left_bytes.data);
                             @memcpy(joined_data[left_bytes.data.len..], right_bytes.data);
                             return switch (byte_module.create(&self.heap, joined_data)) {
-                                .value => |joined| blk: { self.setRegister(destination, Value.object(&joined.header)); break :blk true; },
-                                .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk false; },
+                                .value => |joined| blk: {
+                                    self.setRegister(destination, Value.object(&joined.header));
+                                    break :blk true;
+                                },
+                                .python_exception => |exception| blk: {
+                                    self.setException(exception, line, column, null);
+                                    break :blk false;
+                                },
                                 .engine_error => self.engineFault(),
                             };
                         }
@@ -5674,13 +6158,19 @@ pub const Runtime = struct {
         var argument_index: usize = 0;
         while (index < input.len) {
             if (input[index] != '%') {
-                output.append(self.heap.allocator, input[index]) catch { _ = self.formatMemoryFailure(line, column); return false; };
+                output.append(self.heap.allocator, input[index]) catch {
+                    _ = self.formatMemoryFailure(line, column);
+                    return false;
+                };
                 index += 1;
                 continue;
             }
             index += 1;
             if (index < input.len and input[index] == '%') {
-                output.append(self.heap.allocator, '%') catch { _ = self.formatMemoryFailure(line, column); return false; };
+                output.append(self.heap.allocator, '%') catch {
+                    _ = self.formatMemoryFailure(line, column);
+                    return false;
+                };
                 index += 1;
                 continue;
             }
@@ -5694,20 +6184,32 @@ pub const Runtime = struct {
             if (index >= input.len) return self.nativeTypeError(line, column, "incomplete format");
             const kind = input[index];
             index += 1;
-            if (std.mem.indexOfScalar(u8, "sradiuxXof", kind) == null) { _ = self.formatValueError(line, column, "unsupported format character"); return false; }
+            if (std.mem.indexOfScalar(u8, "sradiuxXof", kind) == null) {
+                _ = self.formatValueError(line, column, "unsupported format character");
+                return false;
+            }
             if (argument_index >= arguments.len) return self.nativeTypeError(line, column, "not enough arguments for format string");
             const argument = arguments[argument_index];
             argument_index += 1;
             const conversion: u8 = if (kind == 's') 1 else if (kind == 'r') 2 else if (kind == 'a') 3 else 0;
             const fmt_kind = if (conversion != 0) 's' else if (kind == 'i' or kind == 'u') 'd' else kind;
-            const fmt_spec = std.fmt.allocPrint(self.heap.allocator, "{s}{c}", .{ input[spec_start .. index - 1], fmt_kind }) catch { _ = self.formatMemoryFailure(line, column); return false; };
+            const fmt_spec = std.fmt.allocPrint(self.heap.allocator, "{s}{c}", .{ input[spec_start .. index - 1], fmt_kind }) catch {
+                _ = self.formatMemoryFailure(line, column);
+                return false;
+            };
             defer self.heap.allocator.free(fmt_spec);
             const formatted = self.makeFormattedText(argument, fmt_spec, conversion, line, column) orelse return false;
             defer self.heap.allocator.free(formatted);
-            output.appendSlice(self.heap.allocator, formatted) catch { _ = self.formatMemoryFailure(line, column); return false; };
+            output.appendSlice(self.heap.allocator, formatted) catch {
+                _ = self.formatMemoryFailure(line, column);
+                return false;
+            };
         }
         if (argument_index < arguments.len) return self.nativeTypeError(line, column, "not all arguments converted during string formatting");
-        const owned = output.toOwnedSlice(self.heap.allocator) catch { _ = self.formatMemoryFailure(line, column); return false; };
+        const owned = output.toOwnedSlice(self.heap.allocator) catch {
+            _ = self.formatMemoryFailure(line, column);
+            return false;
+        };
         defer self.heap.allocator.free(owned);
         return self.storeStringResult(destination, string.create(&self.heap, owned), line, column);
     }
@@ -5752,7 +6254,7 @@ pub const Runtime = struct {
             }
         }
         if (!self.appendOutput("\n")) {
-                    self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return false;
         }
         return true;
@@ -5821,6 +6323,7 @@ pub const Runtime = struct {
             if (dict_module.dictFromHeader(header)) |mapping| return self.appendMapping(header, mapping, line, column);
             if (dict_module.viewFromHeader(header)) |view| return self.appendMappingView(header, view, line, column);
             if (iterator.rangeFromHeader(header)) |range| return self.appendRange(range, line, column);
+            if (file_module.fromHeader(header)) |file| return self.appendFormatted("<_io.File name={s} mode={s}>", .{ file.path, file.mode_text });
             self.setException(.{ .kind = .type_error, .message = "object has no printable representation" }, line, column, null);
             return false;
         }
@@ -6000,8 +6503,14 @@ pub const Runtime = struct {
             const order = number.compare(value, Value.fromSmallInt(0).?);
             return switch (order) {
                 .value => |comparison| if (comparison == .less) 0 else length,
-                .python_exception => |exception| blk: { self.setException(exception, line, column, null); break :blk null; },
-                .engine_error => blk: { _ = self.engineFault(); break :blk null; },
+                .python_exception => |exception| blk: {
+                    self.setException(exception, line, column, null);
+                    break :blk null;
+                },
+                .engine_error => blk: {
+                    _ = self.engineFault();
+                    break :blk null;
+                },
             };
         };
         const adjusted = if (converted < 0) converted + len else converted;
@@ -6247,7 +6756,9 @@ pub const Runtime = struct {
         const previous_exception = self.active_exception;
         switch (exceptions.createInstance(&self.heap, exception.kind, exception.message)) {
             .value => |instance| {
-                if (previous_exception) |context| if (context != instance) { instance.context = context; };
+                if (previous_exception) |context| if (context != instance) {
+                    instance.context = context;
+                };
                 self.active_exception = instance;
                 self.exception_root.object = &instance.header;
                 if (self.top_frame) |frame| {
@@ -6538,6 +7049,7 @@ fn isAlign(character: u8) bool {
 }
 
 fn builtinNative(name: []const u8) ?functions.Native {
+    if (std.mem.eql(u8, name, "open")) return .open;
     if (std.mem.eql(u8, name, "str")) return .str_constructor;
     if (std.mem.eql(u8, name, "format")) return .format_builtin;
     if (std.mem.eql(u8, name, "sorted")) return .sorted;
@@ -6560,6 +7072,18 @@ fn builtinNative(name: []const u8) ?functions.Native {
 
 fn attributeNative(receiver: Value, name: []const u8) ?functions.Native {
     const header = receiver.asObject() orelse return null;
+    if (file_module.fromHeader(header) != null) {
+        if (std.mem.eql(u8, name, "read")) return .file_read;
+        if (std.mem.eql(u8, name, "readline")) return .file_readline;
+        if (std.mem.eql(u8, name, "readlines")) return .file_readlines;
+        if (std.mem.eql(u8, name, "write")) return .file_write;
+        if (std.mem.eql(u8, name, "writelines")) return .file_writelines;
+        if (std.mem.eql(u8, name, "seek")) return .file_seek;
+        if (std.mem.eql(u8, name, "tell")) return .file_tell;
+        if (std.mem.eql(u8, name, "truncate")) return .file_truncate;
+        if (std.mem.eql(u8, name, "flush")) return .file_flush;
+        if (std.mem.eql(u8, name, "close")) return .file_close;
+    }
     if (dict_module.dictFromHeader(header)) |mapping| {
         if (mapping.is_set) {
             if (std.mem.eql(u8, name, "add")) return .set_add;

@@ -14,6 +14,8 @@ const formatting_tests = @import("formatting_tests");
 const exception_tests = @import("exception_tests");
 const host_tests = @import("host_tests");
 const host_codec_tests = @import("host_codec_tests");
+const vfs_tests = @import("vfs_tests");
+const file_tests = @import("file_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -714,4 +716,88 @@ test "lexer accepts Unicode string data and rejects Unicode identifiers" {
 
 test "Python soft keywords remain identifiers" {
     try lexer_tests.testSoftKeywords();
+}
+
+test "VFS home survives reset while temporary files clear" {
+    try vfs_tests.testHomeSurvivesResetAndTemporaryFilesClear();
+}
+
+test "VFS paths are case sensitive and session local" {
+    try vfs_tests.testVfsPathsAreCaseSensitiveAndSessionLocal();
+}
+
+test "VFS rejects traversal and missing parents atomically" {
+    try vfs_tests.testVfsRejectsTraversalAndMissingParentsWithoutMutation();
+}
+
+test "nested course mounts create every parent directory" {
+    try vfs_tests.testNestedCourseMountCreatesEveryParentDirectory();
+}
+
+test "home persists between programs while temporary files clear" {
+    try vfs_tests.testHomeSurvivesNewProgramWhileTemporaryFilesClear();
+}
+
+test "VFS capacity failures are atomic and recover" {
+    try vfs_tests.testVfsCapacityFailureIsAtomicAndRecovers();
+}
+
+test "VFS reads borrow content without a second session allocation" {
+    try vfs_tests.testVfsReadReturnsBorrowedContentWithoutSessionDuplication();
+}
+
+test "Python file writes invalidate borrowed VFS read views" {
+    try vfs_tests.testPythonFileWriteInvalidatesBorrowedVfsRead();
+}
+
+test "text files implement reads and universal newlines" {
+    try file_tests.testTextFileMethodsAndUniversalNewlines();
+}
+
+test "binary files implement seek tell and truncate" {
+    try file_tests.testBinaryFilesSeekTellAndTruncate();
+}
+
+test "binary read after seeking past end preserves position" {
+    try file_tests.testBinaryReadAfterSeekPastEndPreservesPosition();
+}
+
+test "file mode errors and text tell seek cookies match Python" {
+    try file_tests.testOpenModeErrorsAndTextTellSeekCookie();
+}
+
+test "preserved CRLF text reads respect character size" {
+    try file_tests.testPreservedCrLfReadsRespectTextCharacterSize();
+}
+
+test "readlines hint counts text characters" {
+    try file_tests.testReadlinesHintCountsTextCharacters();
+}
+
+test "writelines accepts a generator expression" {
+    try file_tests.testWritelinesAcceptsGeneratorExpression();
+}
+
+test "writelines resumes generators at tiny quantum without replay" {
+    try file_tests.testWritelinesGeneratorResumesAtTinyQuantumWithoutReplay();
+}
+
+test "writelines charges long work and allows session recovery" {
+    try file_tests.testWritelinesChargesLongSynchronousWorkAndRecovers();
+}
+
+test "file modes context management and closed errors" {
+    try file_tests.testFileModesContextAndClosedErrors();
+}
+
+test "file contexts close on exception and return" {
+    try file_tests.testFileContextClosesDuringExceptionAndReturn();
+}
+
+test "closed file tell raises ValueError" {
+    try file_tests.testClosedTellRaisesValueError();
+}
+
+test "invalid UTF-8 text read releases partial buffer and allows reuse" {
+    try file_tests.testInvalidTextReadReleasesPartialBufferAndAllowsReuse();
 }

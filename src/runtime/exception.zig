@@ -22,6 +22,7 @@ pub const PythonExceptionKind = enum {
     unbound_local_error,
     os_error,
     file_not_found_error,
+    file_exists_error,
     permission_error,
     timeout_error,
     runtime_error,
@@ -40,14 +41,14 @@ pub const PythonExceptionKind = enum {
 };
 
 pub const allKinds = [_]PythonExceptionKind{
-    .base_exception, .generator_exit, .keyboard_interrupt, .system_exit, .exception,
-    .arithmetic_error, .zero_division_error, .overflow_error, .assertion_error,
-    .attribute_error, .eof_error, .import_error, .module_not_found_error,
-    .index_error, .key_error, .lookup_error, .name_error, .unbound_local_error,
-    .os_error, .file_not_found_error, .permission_error, .timeout_error,
-    .runtime_error, .recursion_error, .memory_error, .not_implemented_error,
-    .stop_iteration, .unicode_error, .unicode_encode_error, .unicode_decode_error,
-    .syntax_error, .indentation_error, .tab_error, .type_error, .value_error,
+    .base_exception,       .generator_exit,        .keyboard_interrupt,     .system_exit,     .exception,
+    .arithmetic_error,     .zero_division_error,   .overflow_error,         .assertion_error, .attribute_error,
+    .eof_error,            .import_error,          .module_not_found_error, .index_error,     .key_error,
+    .lookup_error,         .name_error,            .unbound_local_error,    .os_error,        .file_not_found_error,
+    .file_exists_error,    .permission_error,      .timeout_error,          .runtime_error,   .recursion_error,
+    .memory_error,         .not_implemented_error, .stop_iteration,         .unicode_error,   .unicode_encode_error,
+    .unicode_decode_error, .syntax_error,          .indentation_error,      .tab_error,       .type_error,
+    .value_error,
 };
 
 /// Allocation-safe transport for Python faults. Messages are static until the runtime adds owned strings.
@@ -162,7 +163,7 @@ pub fn parent(kind: PythonExceptionKind) ?PythonExceptionKind {
         .module_not_found_error => .import_error,
         .index_error, .key_error => .lookup_error,
         .unbound_local_error => .name_error,
-        .file_not_found_error, .permission_error, .timeout_error => .os_error,
+        .file_not_found_error, .file_exists_error, .permission_error, .timeout_error => .os_error,
         .recursion_error => .runtime_error,
         .unicode_error => .value_error,
         .unicode_encode_error, .unicode_decode_error => .unicode_error,
@@ -200,6 +201,7 @@ pub fn exceptionName(kind: PythonExceptionKind) []const u8 {
         .unbound_local_error => "UnboundLocalError",
         .os_error => "OSError",
         .file_not_found_error => "FileNotFoundError",
+        .file_exists_error => "FileExistsError",
         .permission_error => "PermissionError",
         .timeout_error => "TimeoutError",
         .runtime_error => "RuntimeError",

@@ -14,6 +14,8 @@ node tools/size_report.mjs
 
 The size report uses Node's built-in Brotli encoder at quality 11. It builds the shipping artifact and separate artifacts that add one `std.math.big.int.Managed` multiplication, a `std.json.Stringify` call, or a generated Unicode-15.0.0 classification/case-mapping table. Each probe is compared with the shipping baseline. The Unicode prototype generator requires Python whose `unicodedata` version is exactly 15.0.0; it writes the generated input and probe roots under the ignored `zig-cache/` directory.
 
+The native tests/unit/vfs.zig and tests/unit/files.zig suites cover session-owned path/file storage, text and binary file methods, newline handling, atomic VFS limits, and reset persistence. tests/wasm-vfs.test.mjs and tests/web-files.test.mjs exercise the shipping artifact and facade. The configurable maxVfsBytes and maxFileBytes options use an optional PCFG extension while original config packets retain their defaults. readlines() and writelines() charge per-line work against the shared configured budget, and a long native file-method loop returns LIMIT instead of exceeding it.
+
 ## String and bytes hash seeds
 
 Each Peony session mixes an optional copied host seed with a per-session counter and runtime address to seed string and bytes hashing. When a host seed is omitted, the local counter/address fallback still varies session table hashes in freestanding WASM without a system entropy source. This is a per-session variation mechanism, not a cryptographic or unpredictability guarantee.
