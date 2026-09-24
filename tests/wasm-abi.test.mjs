@@ -26,8 +26,11 @@ test('ABI v1 exports linear memory and the documented entry points', async () =>
     'peony_run',
     'peony_resume',
     'peony_cancel',
+    'peony_reset',
     'peony_event_ptr',
     'peony_event_len',
+    'peony_instruction_count',
+    'peony_work_count',
     'peony_stdout_ptr',
     'peony_stdout_len',
     'peony_stdout_consume',
@@ -59,7 +62,6 @@ test('session handles are distinct, stale handles fail, and execution statuses a
   const { instance } = await instantiateBytes();
   const api = instance.exports;
   const ok = 0;
-  const unsupported = 1;
   const invalidHandle = 2;
   const invalidArgument = 3;
   const first = api.peony_session_new(0, 0);
@@ -81,7 +83,7 @@ test('session handles are distinct, stale handles fail, and execution statuses a
   assert.equal(new TextDecoder().decode(new Uint8Array(api.memory.buffer, outputPtr, api.peony_stdout_len(first))), '1\n');
   assert.equal(api.peony_compile_and_start(first, 1, 8, 0, 0), invalidArgument);
   assert.equal(api.peony_error_len(first), 0);
-  assert.equal(api.peony_resume(first, 0, 0), unsupported);
+  assert.equal(api.peony_resume(first, 0, 0), invalidArgument);
   assert.equal(api.peony_cancel(first), ok);
   assert.equal(api.peony_run(first, 1), 8);
   api.peony_transfer_free(sourcePtr, 8);

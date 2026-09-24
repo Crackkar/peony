@@ -1,6 +1,7 @@
 const std = @import("std");
 const abi = @import("abi.zig");
 const runtime_vm = @import("runtime_vm");
+const host = @import("runtime_host");
 const Runtime = runtime_vm.Runtime;
 
 comptime {
@@ -11,7 +12,6 @@ pub const std_options_debug_io: std.Io = std.Io.failing;
 
 const Status = abi.Status;
 const max_transfers = 256;
-const default_session_max_bytes = 64 * 1024 * 1024;
 const generation_mask = abi.generation_mask;
 
 const SessionSlot = struct {
@@ -28,8 +28,6 @@ const Transfer = struct {
 
 var sessions: [abi.max_sessions]SessionSlot = [_]SessionSlot{.{}} ** abi.max_sessions;
 var transfers: [max_transfers]Transfer = [_]Transfer{.{}} ** max_transfers;
-
-const resume_unsupported_message = "host resume packets are not implemented yet";
 
 export fn peony_abi_version() u32 {
     return abi.abi_version;
@@ -55,10 +53,18 @@ export fn peony_transfer_free(pointer: u32, len: u32) void {
 }
 
 export fn peony_session_new(config_ptr: u32, config_len: u32) u32 {
-    if (config_ptr != 0 or config_len != 0) return 0;
+    var config_bytes: []const u8 = &.{};
+    if (config_len == 0) {
+        if (config_ptr != 0) return 0;
+    } else {
+        if (!isTransferSlice(config_ptr, config_len)) return 0;
+        config_bytes = transferSlice(config_ptr, config_len) orelse return 0;
+    }
+    const config = host.decodeConfig(config_bytes) catch return 0;
     for (&sessions, 0..) |*slot, index| {
         if (!slot.active) {
-            slot.runtime.init(std.heap.wasm_allocator, default_session_max_bytes) catch return 0;
+            slot.runtime.init(std.heap.wasm_allocator, @intCast(config.max_memory_bytes)) catch return 0;
+            slot.runtime.configureHost(config);
             slot.active = true;
             slot.host_error = "";
             return abi.encodeSessionHandle(index, slot.generation);
@@ -107,15 +113,26 @@ export fn peony_run(handle: u32, quantum: u32) u32 {
         .engine_error => status(Status.internal_error),
         .timeslice => status(Status.timeslice),
         .cancelled => status(Status.cancelled),
+        .host_request => status(Status.host_request),
+        .output_event => status(Status.output_event),
+        .limit => status(Status.limit),
     };
 }
 
 export fn peony_resume(handle: u32, packet_ptr: u32, packet_len: u32) u32 {
     const slot = sessionSlot(handle) orelse return status(Status.invalid_handle);
-    slot.host_error = "";
     if (!isTransferSlice(packet_ptr, packet_len)) return status(Status.invalid_argument);
-    slot.host_error = resume_unsupported_message;
-    return status(Status.unsupported);
+    const packet_bytes = transferSlice(packet_ptr, packet_len) orelse return status(Status.invalid_argument);
+    const envelope = host.peekEnvelope(packet_bytes) catch return status(Status.invalid_argument);
+    if (envelope.kind != .input or slot.runtime.pendingInputRequestId() != envelope.request_id) return status(Status.invalid_argument);
+    var packet = host.decode(slot.runtime.heap.allocator, packet_bytes) catch |err| return switch (err) {
+        error.InvalidPacket => status(Status.invalid_argument),
+        error.OutOfMemory => status(Status.out_of_memory),
+    };
+    defer packet.deinit(slot.runtime.heap.allocator);
+    if (!slot.runtime.resumeHost(&packet)) return status(Status.invalid_argument);
+    slot.host_error = "";
+    return status(Status.ok);
 }
 
 export fn peony_cancel(handle: u32) u32 {
@@ -124,14 +141,33 @@ export fn peony_cancel(handle: u32) u32 {
     return status(Status.ok);
 }
 
+export fn peony_reset(handle: u32) u32 {
+    const slot = sessionSlot(handle) orelse return status(Status.invalid_handle);
+    slot.runtime.reset();
+    slot.host_error = "";
+    return status(Status.ok);
+}
+
 export fn peony_event_ptr(handle: u32) u32 {
-    _ = sessionSlot(handle) orelse return 0;
-    return 0;
+    const slot = sessionSlot(handle) orelse return 0;
+    const bytes = slot.runtime.eventBytes();
+    if (bytes.len == 0) return 0;
+    return @intCast(@intFromPtr(bytes.ptr));
 }
 
 export fn peony_event_len(handle: u32) u32 {
-    _ = sessionSlot(handle) orelse return 0;
-    return 0;
+    const slot = sessionSlot(handle) orelse return 0;
+    return @intCast(slot.runtime.eventBytes().len);
+}
+
+export fn peony_instruction_count(handle: u32) u64 {
+    const slot = sessionSlot(handle) orelse return 0;
+    return slot.runtime.instructionCount();
+}
+
+export fn peony_work_count(handle: u32) u64 {
+    const slot = sessionSlot(handle) orelse return 0;
+    return slot.runtime.workCount();
 }
 
 export fn peony_stdout_ptr(handle: u32) u32 {

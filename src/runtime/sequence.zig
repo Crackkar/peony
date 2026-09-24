@@ -179,6 +179,49 @@ pub fn repeat(heap: *gc.Heap, sequence_value: Value, multiplier: Value) ValueRes
     return if (list != null) listValue(createList(heap, output)) else tupleValue(createTuple(heap, output));
 }
 
+/// Returns the number of output elements to copy when repeat's arguments are
+/// valid and the result size is physically representable. A null result leaves
+/// error classification to repeat(), which preserves Python's TypeError,
+/// OverflowError, and MemoryError ordering.
+pub fn repeatWorkCost(sequence_value: Value, multiplier: Value) ?usize {
+    if (!number.isIntegerValue(multiplier)) return null;
+    const count = if (multiplier.asBool()) |boolean|
+        @as(i64, @intFromBool(boolean))
+    else
+        number.toInt(i64, multiplier) orelse return null;
+    if (count <= 0) return 0;
+    const source_len = length(sequence_value) orelse return null;
+    if (source_len == 0) return 0;
+    const source_count = std.math.cast(i64, source_len) orelse return null;
+    const output_len_i64 = std.math.mul(i64, source_count, count) catch return null;
+    return std.math.cast(usize, output_len_i64);
+}
+
+/// Returns the total session allocation requested by repeat() before it
+/// copies the completed result into registers: its temporary Value slice, the
+/// result object, and the result's backing allocation (including ArrayList's
+/// actual growth capacity for lists).
+pub fn repeatAllocationEstimate(sequence_value: Value, output_len: usize) ?usize {
+    const header = sequence_value.asObject() orelse return null;
+    const object_bytes: usize = if (listFromHeader(header) != null)
+        @sizeOf(List)
+    else if (tupleFromHeader(header) != null)
+        @sizeOf(Tuple)
+    else
+        return null;
+
+    var total = object_bytes;
+    if (output_len == 0) return total;
+    const temporary_bytes = std.math.mul(usize, output_len, @sizeOf(Value)) catch return null;
+    total = std.math.add(usize, total, temporary_bytes) catch return null;
+    const backing_count = if (listFromHeader(header) != null)
+        std.ArrayList(Value).growCapacity(output_len)
+    else
+        output_len;
+    const backing_bytes = std.math.mul(usize, backing_count, @sizeOf(Value)) catch return null;
+    return std.math.add(usize, total, backing_bytes) catch return null;
+}
+
 pub fn length(value: Value) ?usize {
     const header = value.asObject() orelse return null;
     if (listFromHeader(header)) |list| return list.items.items.len;

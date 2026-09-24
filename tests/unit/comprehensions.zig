@@ -1,6 +1,7 @@
 const std = @import("std");
 const runtime_vm = @import("runtime_vm");
 const exceptions = @import("runtime_exception");
+const host = @import("runtime_host");
 
 pub fn testComprehensionScopesNestedClausesAndLateBinding() !void {
     try expectOutput(
@@ -194,20 +195,30 @@ pub fn testTemporaryReceiverAndCallbackSurviveSortCollection() !void {
 }
 
 pub fn testSortUsesSharedSynchronousWorkLimit() !void {
-    try expectRuntimeExceptionOutput(
-        "values = list(range(1500))\nvalues.reverse()\nvalues.sort()\n",
-        .runtime_error,
-        "",
-    );
+    var runtime: runtime_vm.Runtime = undefined;
+    try runtime.init(std.testing.allocator, 4 * 1024 * 1024);
+    defer runtime.deinit();
+    var config = host.Config.defaults();
+    config.max_instructions = 2_000;
+    runtime.configureHost(config);
+    try expectReady(runtime.compileAndStart("values = list(range(1500))\nvalues.reverse()\nvalues.sort()\n", "sort-limit.py"));
+    try std.testing.expectEqual(runtime_vm.RunStatus.limit, runtime.run(100_000));
+    try std.testing.expect(runtime.instructionCount() <= config.max_instructions);
+    try expectReady(runtime.compileAndStart("print(\"recovered\")\n", "sort-limit-recovery.py"));
+    try runToCompletion(&runtime, 100);
+    try std.testing.expectEqualStrings("recovered\n", runtime.stdout());
 }
 
 pub fn testGeneratorWorkLimitCancelCheckpointAndReuse() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 4 * 1024 * 1024);
     defer runtime.deinit();
+    var config = host.Config.defaults();
+    config.max_instructions = 2_000;
+    runtime.configureHost(config);
     try expectReady(runtime.compileAndStart("items = (value for value in range(10000000) if False)\nnext(items)\n", "generator-limit.py"));
-    try std.testing.expectEqual(runtime_vm.RunStatus.python_exception, runtime.run(100_000));
-    try std.testing.expectEqual(exceptions.PythonExceptionKind.runtime_error, runtime.pythonException().?.kind);
+    try std.testing.expectEqual(runtime_vm.RunStatus.limit, runtime.run(100_000));
+    try std.testing.expect(runtime.instructionCount() <= config.max_instructions);
     try expectReady(runtime.compileAndStart("print(\"recovered\")\n", "generator-recovery.py"));
     try runToCompletion(&runtime, 2);
     try std.testing.expectEqualStrings("recovered\n", runtime.stdout());

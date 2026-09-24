@@ -10,13 +10,13 @@ node --test --test-concurrency=1 tests/*.test.mjs
 node tools/size_report.mjs
 ```
 
-`zig build wasm` installs `zig-out/bin/peony.wasm`. Build output and compiler caches stay ignored. The Node suite exercises the artifact directly through WebAssembly, from bytes and with `instantiateStreaming()` using `application/wasm`. It covers the ABI plus straight-line compilation and execution, output, Python exceptions, timeslices, cancellation, stale handles and per-session isolation.
+`zig build wasm` installs `zig-out/bin/peony.wasm`. Build output and compiler caches stay ignored. The sequential Node suite exercises the shipping artifact directly through WebAssembly, including packet/config validation, resumable `input()`, flush boundaries, instruction/work limits, cancellation, traceback views, stale handles, and per-session isolation. `tests/web-session.test.mjs` also exercises the direct ESM facade, URL/Response/byte loading, fresh runs, host callbacks, pending-input reset, and browser-task yielding.
 
 The size report uses Node's built-in Brotli encoder at quality 11. It builds the shipping artifact and separate artifacts that add one `std.math.big.int.Managed` multiplication, a `std.json.Stringify` call, or a generated Unicode-15.0.0 classification/case-mapping table. Each probe is compared with the shipping baseline. The Unicode prototype generator requires Python whose `unicodedata` version is exactly 15.0.0; it writes the generated input and probe roots under the ignored `zig-cache/` directory.
 
 ## String and bytes hash seeds
 
-Each Peony session mixes a session counter with its runtime address to seed string and bytes hashing. This gives separate sessions different table hashes, including in freestanding WASM where no system entropy source is available. The seed is a per-session variation mechanism, not a cryptographic or unpredictability guarantee. The browser host entropy hook is scheduled for Commit 15.
+Each Peony session mixes an optional copied host seed with a per-session counter and runtime address to seed string and bytes hashing. When a host seed is omitted, the local counter/address fallback still varies session table hashes in freestanding WASM without a system entropy source. This is a per-session variation mechanism, not a cryptographic or unpredictability guarantee.
 
 The repeatability check runs the size report twice:
 

@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const wasmPath = fileURLToPath(new URL('../zig-out/bin/peony.wasm', import.meta.url));
-const status = Object.freeze({ ok: 0, unsupported: 1, completed: 5, pythonException: 6, timeslice: 7, cancelled: 8 });
+const status = Object.freeze({ ok: 0, unsupported: 1, completed: 5, pythonException: 6, timeslice: 7, cancelled: 8, limit: 12 });
 
 async function newApi() {
   const bytes = await readFile(wasmPath);
@@ -28,6 +28,24 @@ function compile(api, handle, source, filename = 'comprehensions.py') {
   } finally {
     api.peony_transfer_free(sourceBlock.pointer, sourceBlock.length);
     api.peony_transfer_free(filenameBlock.pointer, filenameBlock.length);
+  }
+}
+
+function limitedSession(api, maxInstructions, quantum = 50_000) {
+  const config = new Uint8Array(28);
+  const view = new DataView(config.buffer);
+  config.set([0x50, 0x43, 0x46, 0x47]);
+  view.setUint16(4, 1, true);
+  view.setUint32(8, 8 * 1024 * 1024, true);
+  view.setBigUint64(12, BigInt(maxInstructions), true);
+  view.setUint32(20, quantum, true);
+  const pointer = api.peony_transfer_alloc(config.length);
+  assert.ok(pointer > 0);
+  new Uint8Array(api.memory.buffer, pointer, config.length).set(config);
+  try {
+    return api.peony_session_new(pointer, config.length);
+  } finally {
+    api.peony_transfer_free(pointer, config.length);
   }
 }
 
@@ -70,7 +88,7 @@ test('WASM comprehensions use implicit scopes, filters, nested clauses and late 
 
 test('WASM generator expressions evaluate outer iter once and defer filters and bodies', async () => {
   const api = await newApi();
-  const handle = api.peony_session_new(0, 0);
+  const handle = limitedSession(api, 50_000n);
   try {
     const source = [
       'def source(): print("outer iterable"); return [1, 2, 3]',
@@ -107,16 +125,18 @@ test('WASM generator expressions evaluate outer iter once and defer filters and 
     assert.equal(stdout(api, handle), 'reused\n');
 
     assert.equal(compile(api, handle, 'items=(value for value in range(10000000) if False)\nnext(items)\n'), status.ok);
-    assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /RuntimeError/);
+    let result = api.peony_run(handle, 0);
+    for (let checkpoint = 0; result === status.timeslice && checkpoint < 1000; checkpoint += 1) result = api.peony_run(handle, 0);
+    assert.equal(result, status.limit);
+    assert.ok(api.peony_work_count(handle) <= 50_000);
     assert.equal(compile(api, handle, 'print("recovered")\n'), status.ok);
     assert.equal(runToCompletion(api, handle, 2), status.completed);
     assert.equal(stdout(api, handle), 'recovered\n');
 
     assert.equal(compile(api, handle, 'items=(value for value in [1,2])\nprint(next(items))\n'), status.ok);
-    let result = api.peony_run(handle, 1);
-    for (let checkpoint = 0; result === status.timeslice && stdout(api, handle) === '' && checkpoint < 100; checkpoint += 1) {
-      result = api.peony_run(handle, 1);
+    let nextResult = api.peony_run(handle, 1);
+    for (let checkpoint = 0; nextResult === status.timeslice && stdout(api, handle) === '' && checkpoint < 100; checkpoint += 1) {
+      nextResult = api.peony_run(handle, 1);
     }
     assert.equal(stdout(api, handle), '1\n');
     api.peony_cancel(handle);
@@ -145,7 +165,7 @@ test('WASM generator expressions evaluate outer iter once and defer filters and 
 
 test('WASM lambdas, walrus, lazy map and filter, stable keyed sorting and list.index bounds', async () => {
   const api = await newApi();
-  const handle = api.peony_session_new(0, 0);
+  const handle = limitedSession(api, 50_000n);
   try {
     const source = [
       'calls = 0',
@@ -204,8 +224,10 @@ test('WASM lambdas, walrus, lazy map and filter, stable keyed sorting and list.i
     assert.match(errorText(api, handle), /ValueError/);
 
     assert.equal(compile(api, handle, 'values=list(range(1500))\nvalues.reverse()\nvalues.sort()\n'), status.ok);
-    assert.equal(api.peony_run(handle, 0), status.pythonException);
-    assert.match(errorText(api, handle), /RuntimeError.*work limit/);
+    let result = api.peony_run(handle, 0);
+    for (let checkpoint = 0; result === status.timeslice && checkpoint < 1000; checkpoint += 1) result = api.peony_run(handle, 0);
+    assert.equal(result, status.limit);
+    assert.ok(api.peony_work_count(handle) <= 50_000);
   } finally {
     api.peony_session_destroy(handle);
   }

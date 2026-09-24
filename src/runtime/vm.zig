@@ -17,6 +17,7 @@ const functions = @import("runtime_function");
 const binder = @import("runtime_binder");
 const ast_module = @import("frontend_ast");
 const format_rules = @import("format.zig");
+const host = @import("runtime_host");
 
 const Value = value_module.Value;
 const Code = bytecode.Code;
@@ -33,6 +34,9 @@ pub const RunStatus = enum {
     timeslice,
     cancelled,
     engine_error,
+    host_request,
+    output_event,
+    limit,
 };
 
 const default_quantum: u32 = 50_000;
@@ -117,6 +121,48 @@ const Frame = struct {
     }
 };
 
+const PendingInput = struct {
+    frame: *Frame,
+    destination: u16,
+    request_id: u32,
+    line: u32,
+    column: u32,
+};
+
+const SyncTaskOperation = enum { materialize, sorted, list_sort, next_value };
+const SyncTaskPhase = enum { collect, keys, order };
+const SyncCallbackResult = union(enum) { value: Value, suspended, failed };
+
+const SyncTask = struct {
+    frame: *Frame,
+    call_ip: usize,
+    operation: SyncTaskOperation,
+    phase: SyncTaskPhase = .collect,
+    destination: u16,
+    line: u32,
+    column: u32,
+    want_tuple: bool = false,
+    iterator_value: ?*iterator.Iterator = null,
+    target: ?*sequence.List = null,
+    callback: Value = Value.noneValue(),
+    reverse: bool = false,
+    snapshot: ?*sequence.List = null,
+    keys: ?*sequence.List = null,
+    order: []usize = &.{},
+    index: usize = 0,
+    position: usize = 0,
+    selected_index: usize = 0,
+    sort_item_started: bool = false,
+    original_version: u64 = 0,
+    original_length: usize = 0,
+    callback_in_progress: bool = false,
+    callback_completed: bool = false,
+    callback_failed: bool = false,
+    callback_depth_held: bool = false,
+    callback_result: Value = Value.noneValue(),
+    complete: bool = false,
+};
+
 fn destroyGeneratorFrameOpaque(pointer: *anyopaque, allocator: std.mem.Allocator) void {
     const frame: *Frame = @ptrCast(@alignCast(pointer));
     if (frame.root_frame.stack != null) frame.root_frame.pop();
@@ -156,6 +202,7 @@ pub const Runtime = struct {
     environment_root: gc.Root = .{ .object = null },
     builtin_frame: gc.RootFrame = .{},
     print_builtin_root: gc.Root = .{ .object = null },
+    input_builtin_root: gc.Root = .{ .object = null },
     range_builtin_root: gc.Root = .{ .object = null },
     exception_frame: gc.RootFrame = .{},
     exception_root: gc.Root = .{ .object = null },
@@ -169,6 +216,22 @@ pub const Runtime = struct {
     instruction_pointer: usize = 0,
     resuming_generator: ?*iterator.Iterator = null,
     synchronous_work_remaining: ?usize = null,
+    sync_root_frame: gc.RootFrame = .{},
+    sync_roots: [8]gc.Root = @splat(.{ .object = null }),
+    sync_task: ?SyncTask = null,
+    sync_task_quantum: u32 = default_quantum,
+    sync_yield_requested: bool = false,
+    resumed_exception_pending: bool = false,
+    sync_callback_depth: usize = 0,
+    pending_input: ?PendingInput = null,
+    event_packet: ?[]u8 = null,
+    next_host_request_id: u32 = 1,
+    output_event_pending: bool = false,
+    max_instructions: u64 = 50_000_000,
+    instructions_executed: u64 = 0,
+    work_executed: u64 = 0,
+    limit_reached: bool = false,
+    configured_quantum: u32 = default_quantum,
     stdout_bytes: std.ArrayList(u8) = .empty,
     repr_path: std.ArrayList(*gc.Header) = .empty,
     value_equality_depth: usize = 0,
@@ -195,6 +258,7 @@ pub const Runtime = struct {
         self.environment_frame.add(&self.environment_root);
         self.builtin_frame.push(&self.heap.roots);
         self.builtin_frame.add(&self.print_builtin_root);
+        self.builtin_frame.add(&self.input_builtin_root);
         self.builtin_frame.add(&self.range_builtin_root);
         self.exception_frame.push(&self.heap.roots);
         self.exception_frame.add(&self.exception_root);
@@ -214,6 +278,18 @@ pub const Runtime = struct {
         const range_builtin = functions.createNative(&self.heap, .range);
         switch (range_builtin) {
             .value => |function| self.range_builtin_root.object = &function.header,
+            .python_exception => {
+                self.exception_frame.pop();
+                self.builtin_frame.pop();
+                self.environment_frame.pop();
+                self.heap.deinit();
+                self.* = .{};
+                return error.OutOfMemory;
+            },
+        }
+        const input_builtin = functions.createNative(&self.heap, .input);
+        switch (input_builtin) {
+            .value => |function| self.input_builtin_root.object = &function.header,
             .python_exception => {
                 self.exception_frame.pop();
                 self.builtin_frame.pop();
@@ -250,6 +326,9 @@ pub const Runtime = struct {
 
     pub fn compileAndStart(self: *Runtime, source: []const u8, filename: []const u8) CompileOutcome {
         self.resetProgram(true);
+        self.instructions_executed = 0;
+        self.work_executed = 0;
+        self.limit_reached = false;
         const outcome = compiler.compile(&self.heap, source, filename);
         switch (outcome) {
             .ready => |code| {
@@ -283,13 +362,26 @@ pub const Runtime = struct {
             self.resetProgram(false);
             return .cancelled;
         }
+        if (self.pending_input != null) return .host_request;
+        if (self.limit_reached) return .limit;
+        if (self.resumed_exception_pending) {
+            self.resumed_exception_pending = false;
+            if (self.last_exception != null and !self.unwindPythonException()) {
+                if (self.engine_failed) return .engine_error;
+                self.prepareExceptionDiagnostics();
+                return .python_exception;
+            }
+        }
         if (self.last_exception != null and !self.hasExceptionContinuation()) {
             self.prepareExceptionDiagnostics();
             return .python_exception;
         }
         if (self.top_frame == null) return .completed;
 
-        const quantum = if (requested_quantum == 0) default_quantum else requested_quantum;
+        self.invalidateEvent();
+        const quantum = if (requested_quantum == 0) self.configured_quantum else requested_quantum;
+        self.sync_task_quantum = quantum;
+        self.sync_yield_requested = false;
         var executed: u32 = 0;
         while (executed < quantum) : (executed += 1) {
             const frame = self.top_frame orelse return .completed;
@@ -300,10 +392,23 @@ pub const Runtime = struct {
             }
             const current = frame.code.positions[frame.ip];
             const instruction = frame.code.instructions[frame.ip];
+            if (!self.chargeBytecode()) return .limit;
             frame.ip += 1;
             self.activateFrame(frame);
             if (!self.execute(instruction, current.line, current.column)) {
-                if (!self.engine_failed and self.last_exception != null and self.unwindPythonException()) continue;
+                if (self.limit_reached) {
+                    if (self.sync_task) |task| if (!task.callback_in_progress) self.clearSyncTask();
+                    return .limit;
+                }
+                if (self.sync_task) |task| if (!task.callback_in_progress) self.clearSyncTask();
+                if (!self.engine_failed and self.last_exception != null and self.unwindPythonException()) {
+                    if (self.sync_task) |task| if (task.callback_failed or !task.callback_in_progress) self.clearSyncTask();
+                    continue;
+                }
+                if (self.sync_task) |task| {
+                    if (task.callback_in_progress) self.unwindFramesUntil(task.frame);
+                    if (self.sync_task != null) self.clearSyncTask();
+                }
                 self.unwindFrames();
                 if (self.engine_failed) return .engine_error;
                 self.prepareExceptionDiagnostics();
@@ -312,13 +417,108 @@ pub const Runtime = struct {
             if (self.top_frame == frame) {
                 frame.ip = self.instruction_pointer;
             }
+            if (self.sync_task != null and self.sync_task.?.complete) self.clearSyncTask();
+            if (self.limit_reached) {
+                if (self.sync_task != null) self.clearSyncTask();
+                return .limit;
+            }
+            if (self.pending_input != null) return .host_request;
+            if (self.output_event_pending) {
+                self.output_event_pending = false;
+                return .output_event;
+            }
+            if (self.sync_yield_requested) {
+                self.sync_yield_requested = false;
+                return .timeslice;
+            }
             if (self.top_frame == null) return .completed;
         }
         return if (self.top_frame == null) .completed else .timeslice;
     }
 
     pub fn cancel(self: *Runtime) void {
+        self.pending_input = null;
+        self.invalidateEvent();
+        self.output_event_pending = false;
         self.cancel_requested = true;
+    }
+
+    pub fn configureHost(self: *Runtime, config: host.Config) void {
+        self.max_instructions = config.max_instructions;
+        self.configured_quantum = config.quantum;
+        if (config.seed.len != 0) {
+            self.hash_seed = hash_module.mixSessionSeed(std.hash.Wyhash.hash(0, config.seed), @intFromPtr(self));
+        }
+    }
+
+    pub fn instructionCount(self: *const Runtime) u64 {
+        return self.instructions_executed;
+    }
+
+    pub fn workCount(self: *const Runtime) u64 {
+        return self.work_executed;
+    }
+
+    pub fn eventBytes(self: *const Runtime) []const u8 {
+        return self.event_packet orelse "";
+    }
+
+    pub fn pendingInputRequestId(self: *const Runtime) ?u32 {
+        const pending = self.pending_input orelse return null;
+        return pending.request_id;
+    }
+
+    pub fn reset(self: *Runtime) void {
+        self.resetProgram(true);
+        self.instructions_executed = 0;
+        self.work_executed = 0;
+        self.limit_reached = false;
+    }
+
+    /// Accepts a fully decoded packet. A false return leaves the suspended input and event untouched.
+    pub fn resumeHost(self: *Runtime, packet: *const host.DecodedPacket) bool {
+        const pending = self.pending_input orelse return false;
+        if (packet.kind != .input or packet.request_id != pending.request_id or packet.flags != 0) return false;
+        switch (packet.status) {
+            .ok => if (packet.sections.len != 1 or packet.sections[0].kind != .utf8) return false,
+            .eof => if (packet.sections.len != 0) return false,
+            .host_error => if (packet.sections.len != 1 or packet.sections[0].kind != .utf8) return false,
+        }
+
+        self.pending_input = null;
+        self.invalidateEvent();
+        switch (packet.status) {
+            .ok => {
+                const line = trimInputEnding(packet.sections[0].bytes);
+                const created = string.create(&self.heap, line);
+                switch (created) {
+                    .value => |text| {
+                        const position: usize = pending.destination;
+                        if (position >= pending.frame.registers.len or pending.frame.roots.len < pending.frame.registers.len) {
+                            _ = self.engineFault();
+                            return true;
+                        }
+                        const value = Value.object(&text.header);
+                        pending.frame.registers[position] = value;
+                        pending.frame.roots[position].object = &text.header;
+                    },
+                    .python_exception => |exception| {
+                        self.setException(exception, pending.line, pending.column, null);
+                        self.resumed_exception_pending = true;
+                    },
+                    .engine_error => _ = self.engineFault(),
+                }
+            },
+            .eof => {
+                self.setException(.{ .kind = .eof_error, .message = "EOF when reading a line" }, pending.line, pending.column, null);
+                self.resumed_exception_pending = true;
+            },
+            .host_error => {
+                self.setException(.{ .kind = .os_error, .message = packet.sections[0].bytes }, pending.line, pending.column, null);
+                self.resumed_exception_pending = true;
+            },
+        }
+        return true;
     }
 
     pub fn stdout(self: *const Runtime) []const u8 {
@@ -327,6 +527,7 @@ pub const Runtime = struct {
 
     pub fn consumeStdout(self: *Runtime, length: usize) bool {
         if (length > self.stdout_bytes.items.len) return false;
+        self.invalidateEvent();
         const remaining = self.stdout_bytes.items.len - length;
         if (remaining != 0) std.mem.copyForwards(u8, self.stdout_bytes.items[0..remaining], self.stdout_bytes.items[length..]);
         self.stdout_bytes.items.len = remaining;
@@ -381,7 +582,15 @@ pub const Runtime = struct {
     }
 
     fn resetProgram(self: *Runtime, clear_output: bool) void {
+        if (self.sync_task) |task| {
+            if (task.callback_in_progress) self.unwindFramesUntil(task.frame);
+        }
+        if (self.sync_task != null) self.clearSyncTask();
         self.unwindFrames();
+
+        self.pending_input = null;
+        self.output_event_pending = false;
+        self.invalidateEvent();
 
         self.clearGlobals();
         if (self.code) |code| {
@@ -392,6 +601,7 @@ pub const Runtime = struct {
         self.cancel_requested = false;
         self.engine_failed = false;
         self.last_exception = null;
+        self.resumed_exception_pending = false;
         self.active_exception = null;
         self.exception_root.object = null;
         self.clearErrorText();
@@ -399,6 +609,51 @@ pub const Runtime = struct {
         self.traceback_json_owned = null;
         if (clear_output) self.stdout_bytes.clearRetainingCapacity();
         _ = self.heap.collect();
+    }
+
+    fn invalidateEvent(self: *Runtime) void {
+        if (self.event_packet) |packet| self.heap.allocator.free(packet);
+        self.event_packet = null;
+    }
+
+    fn createEventPacket(self: *Runtime, packet: host.Packet) bool {
+        self.invalidateEvent();
+        self.event_packet = host.encode(self.heap.allocator, packet) catch return false;
+        return true;
+    }
+
+    fn nextEventId(self: *Runtime) u32 {
+        const result = self.next_host_request_id;
+        self.next_host_request_id +%= 1;
+        if (self.next_host_request_id == 0) self.next_host_request_id = 1;
+        if (result != 0) return result;
+        return self.nextEventId();
+    }
+
+    fn beginInputRequest(self: *Runtime, destination: u16, prompt: []const u8, line: u32, column: u32) bool {
+        if (!self.appendOutput(prompt)) {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        }
+        const request_id = self.nextEventId();
+        const sections = [_]host.Section{.{ .kind = .utf8, .bytes = prompt }};
+        if (!self.createEventPacket(.{ .kind = .input, .request_id = request_id, .sections = &sections })) {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        }
+        const frame = self.top_frame orelse return self.engineFault();
+        self.pending_input = .{ .frame = frame, .destination = destination, .request_id = request_id, .line = line, .column = column };
+        return true;
+    }
+
+    fn beginOutputEvent(self: *Runtime, line: u32, column: u32) bool {
+        const event_id = self.nextEventId();
+        if (!self.createEventPacket(.{ .kind = .output, .request_id = event_id })) {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        }
+        self.output_event_pending = true;
+        return true;
     }
 
     fn allocateFrame(self: *Runtime, code: *Code, return_destination: ?u16) error{OutOfMemory}!*Frame {
@@ -460,6 +715,14 @@ pub const Runtime = struct {
 
     fn popFrame(self: *Runtime) ?*Frame {
         const frame = self.top_frame orelse return null;
+        if (self.sync_task) |*task| {
+            if (task.callback_in_progress and frame.previous == task.frame) {
+                task.callback_in_progress = false;
+                task.callback_failed = true;
+                self.releaseSyncCallbackDepth(task);
+            }
+            if (task.callback_failed and frame == task.frame) self.clearSyncTask();
+        }
         if (frame.root_frame.stack != null) frame.root_frame.pop();
         self.top_frame = frame.previous;
         const previous = self.top_frame;
@@ -684,6 +947,15 @@ pub const Runtime = struct {
     }
 
     fn performReturn(self: *Runtime, result: Value) bool {
+        if (self.sync_task) |*task| {
+            if (task.callback_in_progress and framePreviousIsTask(self.top_frame, task.frame)) {
+                task.callback_result = result;
+                task.callback_completed = true;
+                task.callback_in_progress = false;
+                self.sync_roots[6].object = result.asObject();
+                self.releaseSyncCallbackDepth(task);
+            }
+        }
         const frame = self.popFrame() orelse return self.engineFault();
         if (frame.generator_owner != null) {
             self.forgetGeneratorFrame(frame);
@@ -699,6 +971,11 @@ pub const Runtime = struct {
             _ = caller;
         } else if (return_destination != null) return self.engineFault();
         return true;
+    }
+
+    fn framePreviousIsTask(selected: ?*Frame, task_frame: *Frame) bool {
+        const frame = selected orelse return false;
+        return frame.previous == task_frame;
     }
 
     fn beginReturnTransfer(self: *Runtime, frame: *Frame, result: Value) bool {
@@ -1065,6 +1342,10 @@ pub const Runtime = struct {
     }
 
     fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        if (self.sync_task) |task| {
+            const frame = self.top_frame orelse return self.engineFault();
+            if (task.frame == frame and frame.ip != 0 and task.call_ip == frame.ip - 1) return self.advanceSyncTask();
+        }
         const code = self.activeCode() orelse return self.engineFault();
         const site_index: usize = instruction.index32();
         if (site_index >= code.call_sites.len) return self.engineFault();
@@ -1147,6 +1428,7 @@ pub const Runtime = struct {
                                 }
                             },
                             .done => break,
+                            .suspended => return self.engineFault(),
                             .python_exception => |exception| {
                                 self.setException(exception, line, column, null);
                                 return false;
@@ -1204,7 +1486,17 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
             return false;
         };
-        if (function.native) |native| return self.executeNativeCall(instruction.a(), native, function.bound_self, positional, keywords[0..keyword_count], line, column);
+        if (function.native) |native| {
+            const resumable_native = switch (native) {
+                .list, .tuple, .sorted, .next, .list_sort => true,
+                else => false,
+            };
+            if (resumable_native and self.sync_callback_depth == 0 and self.resuming_generator == null) {
+                call_root_frame.pop();
+                call_roots_active = false;
+            }
+            return self.executeNativeCall(instruction.a(), native, function.bound_self, positional, keywords[0..keyword_count], line, column);
+        }
 
         const function_code = function.code orelse return self.engineFault();
         const binding = binder.bindFunction(
@@ -1389,6 +1681,7 @@ pub const Runtime = struct {
                     }
                 },
                 .done => break,
+                .suspended => return self.engineFault(),
                 .python_exception => |exception| {
                     self.setException(exception, line, column, null);
                     return false;
@@ -1445,6 +1738,7 @@ pub const Runtime = struct {
                     }
                 },
                 .done => break,
+                .suspended => return self.engineFault(),
                 .python_exception => |exception| {
                     self.setException(exception, line, column, null);
                     return false;
@@ -1501,8 +1795,18 @@ pub const Runtime = struct {
                     }
                 }
                 if (!self.executePrintValues(arguments.values, separator, ending, line, column)) return false;
+                if (arguments.flush) |flush_value| {
+                    const should_flush = self.valueTruthy(flush_value, line, column) orelse return false;
+                    if (should_flush and !self.beginOutputEvent(line, column)) return false;
+                }
                 self.setRegister(destination, Value.noneValue());
                 return true;
+            },
+            .input => {
+                if (positional.len > 1 or keywords.len != 0) return self.nativeArity(line, column);
+                const prompt = if (positional.len == 0) &.{} else self.renderValueOwned(positional[0], false, line, column) orelse return false;
+                defer if (positional.len != 0) self.heap.allocator.free(prompt);
+                return self.beginInputRequest(destination, prompt, line, column);
             },
             .range => {
                 const arguments = binder.bindRange(positional, keywords) catch |err| {
@@ -1572,6 +1876,9 @@ pub const Runtime = struct {
                         if (keyword.value.tag() != .none) key = keyword.value;
                     } else return self.nativeTypeError(line, column, "unexpected keyword argument");
                 }
+                if (self.sync_callback_depth == 0 and self.resuming_generator == null) {
+                    return self.startSortedTask(destination, positional[0], key, reverse, line, column);
+                }
                 const list_result = sequence.createList(&self.heap, &.{});
                 const list = switch (list_result) {
                     .value => |selected| selected,
@@ -1606,6 +1913,9 @@ pub const Runtime = struct {
                             if (keyword.value.tag() != .none and !self.isCallable(keyword.value)) return self.nativeTypeError(line, column, "key must be callable or None");
                             if (keyword.value.tag() != .none) key = keyword.value;
                         } else return self.nativeTypeError(line, column, "invalid list.sort arguments");
+                    }
+                    if (self.sync_callback_depth == 0 and self.resuming_generator == null) {
+                        return self.startListSortTask(destination, list, key, reverse, line, column);
                     }
                     if (!self.sortListWithKey(list, key, reverse, destination, line, column)) return false;
                     self.setRegister(destination, Value.noneValue());
@@ -1740,6 +2050,9 @@ pub const Runtime = struct {
                     if (native == .list) return self.storeListResult(destination, sequence.createList(&self.heap, &.{}), line, column);
                     return self.storeTupleResult(destination, sequence.createTuple(&self.heap, &.{}), line, column);
                 }
+                if (self.sync_callback_depth != 0 or self.resuming_generator != null) {
+                    return self.materializeSequenceImmediate(destination, positional[0], native == .tuple, line, column);
+                }
                 return self.materializeSequence(destination, positional[0], native == .tuple, line, column);
             },
             .iter => {
@@ -1750,11 +2063,13 @@ pub const Runtime = struct {
                 if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
                 const header = positional[0].asObject() orelse return self.nativeTypeError(line, column, "object is not an iterator");
                 const loop_iterator = iterator.iteratorFromHeader(header) orelse return self.nativeTypeError(line, column, "object is not an iterator");
+                if (self.sync_callback_depth == 0 and self.resuming_generator == null) return self.startNextTask(destination, loop_iterator, line, column);
                 return switch (self.nextIteratorValue(loop_iterator, destination, line, column)) {
                     .item => |value| blk: {
                         self.setRegister(destination, value);
                         break :blk true;
                     },
+                    .suspended => self.engineFault(),
                     .done => blk: {
                         self.setException(.{ .kind = .stop_iteration, .message = "" }, line, column, null);
                         break :blk false;
@@ -1851,6 +2166,7 @@ pub const Runtime = struct {
             const pair = switch (next_pair) {
                 .item => |selected| selected,
                 .done => break,
+                .suspended => return self.engineFault(),
                 .python_exception => |exception| {
                     self.setException(exception, line, column, null);
                     return false;
@@ -1875,6 +2191,7 @@ pub const Runtime = struct {
                     self.setException(.{ .kind = .value_error, .message = "dictionary update sequence element has length 0; 2 is required" }, line, column, null);
                     return false;
                 },
+                .suspended => return self.engineFault(),
                 .python_exception => |exception| {
                     self.setException(exception, line, column, null);
                     return false;
@@ -1892,6 +2209,7 @@ pub const Runtime = struct {
                     self.setException(.{ .kind = .value_error, .message = "dictionary update sequence element has length 1; 2 is required" }, line, column, null);
                     return false;
                 },
+                .suspended => return self.engineFault(),
                 .python_exception => |exception| {
                     self.setException(exception, line, column, null);
                     return false;
@@ -1908,6 +2226,7 @@ pub const Runtime = struct {
                     self.setException(.{ .kind = .value_error, .message = "dictionary update sequence element has length greater than 2" }, line, column, null);
                     return false;
                 },
+                .suspended => return self.engineFault(),
                 .python_exception => |exception| {
                     self.setException(exception, line, column, null);
                     return false;
@@ -1941,6 +2260,7 @@ pub const Runtime = struct {
                 if (!self.setMappingValue(target, item, Value.noneValue(), line, column)) return false;
             },
             .done => return true,
+            .suspended => return self.engineFault(),
             .python_exception => |exception| {
                 self.setException(exception, line, column, null);
                 return false;
@@ -2674,6 +2994,11 @@ pub const Runtime = struct {
     }
 
     fn nextIteratorValue(self: *Runtime, selected: *iterator.Iterator, destination: u16, line: u32, column: u32) iterator.NextResult {
+        switch (selected.mode) {
+            .enumerate => return self.nextEnumerateIteratorValue(selected, destination, line, column),
+            .zip => return self.nextZipIteratorValue(selected, destination, line, column),
+            else => {},
+        }
         switch (iterator.deferredKind(selected) orelse return iterator.next(&self.heap, selected)) {
             .generator => {
                 const owns_work_budget = self.beginSynchronousWork();
@@ -2684,31 +3009,132 @@ pub const Runtime = struct {
                 const owns_work_budget = self.beginSynchronousWork();
                 defer self.endSynchronousWork(owns_work_budget);
                 if (selected.children.len == 0 or selected.values.len != selected.children.len) return .{ .engine_error = .internal_invariant };
+                if (selected.finished) return .done;
                 while (true) {
                     if (!self.chargeSynchronousWork(line, column)) return .{ .python_exception = self.last_exception.? };
-                    for (selected.children, 0..) |maybe_child, index| {
+                    if (selected.callback_pending) {
+                        const mapped = self.takeCompletedSyncCallback() orelse return .suspended;
+                        selected.callback_pending = false;
+                        if (kind == .map) return .{ .item = mapped };
+                        const keep = self.valueTruthy(mapped, line, column) orelse return .{ .python_exception = self.last_exception.? };
+                        if (keep) return .{ .item = selected.values[0] };
+                        continue;
+                    }
+                    while (selected.child_index < selected.children.len) {
+                        const index = selected.child_index;
+                        const maybe_child = selected.children[index];
                         const child = maybe_child orelse return .{ .engine_error = .internal_invariant };
                         switch (self.nextIteratorValue(child, destination, line, column)) {
-                            .item => |value| selected.values[index] = value,
-                            .done => return .done,
+                            .item => |value| {
+                                selected.values[index] = value;
+                                selected.child_index += 1;
+                            },
+                            .done => {
+                                selected.child_index = 0;
+                                selected.finished = true;
+                                return .done;
+                            },
+                            .suspended => return .suspended,
                             .python_exception => |exception| return .{ .python_exception = exception },
                             .engine_error => |failure| return .{ .engine_error = failure },
                         }
                     }
+                    selected.child_index = 0;
                     if (kind == .filter and selected.callback.tag() == .none) {
                         const keep = self.valueTruthy(selected.values[0], line, column) orelse return .{ .python_exception = self.last_exception.? };
                         if (keep) return .{ .item = selected.values[0] };
+                        if (self.sync_task != null and self.sync_callback_depth == 0 and self.resuming_generator == null) return .suspended;
                         continue;
                     }
-                    const mapped = self.invokeCallableSync(selected.callback, selected.values, destination, line, column) orelse {
-                        return .{ .python_exception = self.last_exception orelse .{ .kind = .runtime_error, .message = "iterator callback failed" } };
+                    const callback_result = self.invokeSyncTaskCallback(selected.callback, selected.values, destination, line, column);
+                    const mapped = switch (callback_result) {
+                        .value => |value| value,
+                        .suspended => {
+                            selected.callback_pending = true;
+                            return .suspended;
+                        },
+                        .failed => return .{ .python_exception = self.last_exception orelse .{ .kind = .runtime_error, .message = "iterator callback failed" } },
                     };
                     if (kind == .map) return .{ .item = mapped };
                     const keep = self.valueTruthy(mapped, line, column) orelse return .{ .python_exception = self.last_exception.? };
                     if (keep) return .{ .item = selected.values[0] };
+                    if (self.sync_task != null and self.sync_callback_depth == 0 and self.resuming_generator == null) return .suspended;
                 }
             },
         }
+    }
+
+    fn nextEnumerateIteratorValue(self: *Runtime, selected: *iterator.Iterator, destination: u16, line: u32, column: u32) iterator.NextResult {
+        const owns_work_budget = self.beginSynchronousWork();
+        defer self.endSynchronousWork(owns_work_budget);
+        if (!self.chargeSynchronousWork(line, column)) return .{ .python_exception = self.last_exception orelse .{ .kind = .runtime_error, .message = "iterator work limit reached" } };
+        if (selected.finished) return .done;
+        const inner = selected.inner orelse return .{ .engine_error = .internal_invariant };
+        switch (self.nextIteratorValue(inner, destination, line, column)) {
+            .item => |item| {
+                selected.enumerate_values[0] = selected.enumerate_index;
+                selected.enumerate_values[1] = item;
+                const advanced = switch (number.add(&self.heap, selected.enumerate_index, Value.fromSmallInt(1).?)) {
+                    .value => |value| value,
+                    .python_exception => |exception| return .{ .python_exception = exception },
+                    .engine_error => |failure| return .{ .engine_error = failure },
+                };
+                selected.enumerate_index = advanced;
+                const tuple = sequence.createTuple(&self.heap, &selected.enumerate_values);
+                selected.enumerate_values = .{ Value.noneValue(), Value.noneValue() };
+                return switch (tuple) {
+                    .value => |value| .{ .item = Value.object(&value.header) },
+                    .python_exception => |exception| .{ .python_exception = exception },
+                    .engine_error => |failure| .{ .engine_error = failure },
+                };
+            },
+            .done => {
+                selected.finished = true;
+                return .done;
+            },
+            .suspended => return .suspended,
+            .python_exception => |exception| return .{ .python_exception = exception },
+            .engine_error => |failure| return .{ .engine_error = failure },
+        }
+    }
+
+    fn nextZipIteratorValue(self: *Runtime, selected: *iterator.Iterator, destination: u16, line: u32, column: u32) iterator.NextResult {
+        const owns_work_budget = self.beginSynchronousWork();
+        defer self.endSynchronousWork(owns_work_budget);
+        if (selected.finished) return .done;
+        if (selected.values.len != selected.children.len) return .{ .engine_error = .internal_invariant };
+        if (selected.children.len == 0) {
+            selected.finished = true;
+            return .done;
+        }
+        while (selected.child_index < selected.children.len) {
+            if (!self.chargeSynchronousWork(line, column)) return .{ .python_exception = self.last_exception orelse .{ .kind = .runtime_error, .message = "iterator work limit reached" } };
+            const index = selected.child_index;
+            const child = selected.children[index] orelse return .{ .engine_error = .internal_invariant };
+            switch (self.nextIteratorValue(child, destination, line, column)) {
+                .item => |item| {
+                    selected.values[index] = item;
+                    selected.child_index += 1;
+                },
+                .done => {
+                    selected.child_index = 0;
+                    selected.finished = true;
+                    @memset(selected.values, Value.noneValue());
+                    return .done;
+                },
+                .suspended => return .suspended,
+                .python_exception => |exception| return .{ .python_exception = exception },
+                .engine_error => |failure| return .{ .engine_error = failure },
+            }
+        }
+        const tuple = sequence.createTuple(&self.heap, selected.values);
+        selected.child_index = 0;
+        @memset(selected.values, Value.noneValue());
+        return switch (tuple) {
+            .value => |value| .{ .item = Value.object(&value.header) },
+            .python_exception => |exception| .{ .python_exception = exception },
+            .engine_error => |failure| .{ .engine_error = failure },
+        };
     }
 
     fn resumeGenerator(self: *Runtime, selected: *iterator.Iterator, line: u32, column: u32) iterator.NextResult {
@@ -2733,17 +3159,16 @@ pub const Runtime = struct {
         for (frame.roots) |*root| frame.root_frame.add(root);
         self.top_frame = frame;
         self.activateFrame(frame);
-        var steps: usize = 0;
-        while (true) : (steps += 1) {
+        var executed: u32 = 0;
+        while (true) {
             if (selected.generator_yielded) |value| {
                 selected.generator_yielded = null;
                 return .{ .item = value };
             }
             if (selected.generator_done) return .done;
-            if (steps >= 1_000_000 or !self.chargeSynchronousWork(line, column)) {
-                if (self.last_exception == null) self.setException(.{ .kind = .runtime_error, .message = "generator exceeded synchronous work limit" }, line, column, null);
+            if (!self.chargeSynchronousWork(line, column) or !self.chargeNestedInstruction()) {
                 self.unwindFramesUntil(caller);
-                return .{ .python_exception = self.last_exception.? };
+                return if (self.engine_failed) .{ .engine_error = .internal_invariant } else .done;
             }
             const active = self.top_frame orelse return .{ .engine_error = .internal_invariant };
             if (active.ip >= active.code.instructions.len or active.code.positions.len != active.code.instructions.len) {
@@ -2766,6 +3191,14 @@ pub const Runtime = struct {
                 return failure;
             }
             if (self.top_frame == active) active.ip = self.instruction_pointer;
+            executed += 1;
+            if (self.sync_task != null and self.sync_callback_depth == 0 and self.top_frame == frame and executed >= @max(self.sync_task_quantum, 1)) {
+                if (frame.root_frame.stack != null) frame.root_frame.pop();
+                self.top_frame = caller;
+                frame.previous = null;
+                self.activateFrame(caller);
+                return .suspended;
+            }
         }
     }
 
@@ -2875,7 +3308,415 @@ pub const Runtime = struct {
         return frame;
     }
 
+    fn beginSyncTaskRoots(self: *Runtime) void {
+        self.sync_roots = @splat(.{ .object = null });
+        self.sync_root_frame.push(&self.heap.roots);
+        for (&self.sync_roots) |*root| self.sync_root_frame.add(root);
+    }
+
+    fn releaseSyncCallbackDepth(self: *Runtime, task: *SyncTask) void {
+        if (!task.callback_depth_held) return;
+        task.callback_depth_held = false;
+        self.sync_callback_depth -|= 1;
+    }
+
+    fn takeCompletedSyncCallback(self: *Runtime) ?Value {
+        const task = if (self.sync_task) |*active| active else return null;
+        if (!task.callback_completed) return null;
+        const result = task.callback_result;
+        task.callback_result = Value.noneValue();
+        task.callback_completed = false;
+        self.sync_roots[6].object = null;
+        return result;
+    }
+
+    fn invokeSyncTaskCallback(self: *Runtime, callable: Value, args: []const Value, destination: u16, line: u32, column: u32) SyncCallbackResult {
+        if (self.takeCompletedSyncCallback()) |result| return .{ .value = result };
+        if (self.sync_task) |task| if (task.callback_in_progress) return .suspended;
+        if (self.invokeCallableSync(callable, args, destination, line, column)) |result| return .{ .value = result };
+        if (self.sync_task) |task| if (task.callback_in_progress) return .suspended;
+        return .failed;
+    }
+
+    fn clearSyncTask(self: *Runtime) void {
+        if (self.sync_task) |*task| self.releaseSyncCallbackDepth(task);
+        if (self.sync_root_frame.stack != null) self.sync_root_frame.pop();
+        if (self.sync_task) |task| if (task.order.len != 0) self.heap.allocator.free(task.order);
+        self.sync_roots = @splat(.{ .object = null });
+        self.sync_task = null;
+        self.sync_yield_requested = false;
+    }
+
+    fn pauseSyncTask(self: *Runtime, task: *SyncTask) bool {
+        task.frame.ip = task.call_ip;
+        self.instruction_pointer = task.call_ip;
+        self.sync_yield_requested = true;
+        return true;
+    }
+
+    fn continueSyncTaskAfterCallback(self: *Runtime, task: *SyncTask) bool {
+        task.frame.ip = task.call_ip;
+        self.instruction_pointer = task.call_ip;
+        return true;
+    }
+
+    fn iteratorHasPendingCallback(selected: *iterator.Iterator) bool {
+        if (selected.callback_pending) return true;
+        if (selected.inner) |inner| if (iteratorHasPendingCallback(inner)) return true;
+        for (selected.children) |maybe_child| if (maybe_child) |child| {
+            if (iteratorHasPendingCallback(child)) return true;
+        };
+        return false;
+    }
+
+    fn startSortedTask(self: *Runtime, destination: u16, source: Value, callback: ?Value, reverse: bool, line: u32, column: u32) bool {
+        const frame = self.top_frame orelse return self.engineFault();
+        const call_ip = if (frame.ip == 0) return self.engineFault() else frame.ip - 1;
+        if (self.sync_task) |task| {
+            if (task.frame != frame or task.call_ip != call_ip or task.operation != .sorted) return self.engineFault();
+            return self.advanceSyncTask();
+        }
+        const selected = switch (iterator.createIterator(&self.heap, source)) {
+            .value => |object| object,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        self.beginSyncTaskRoots();
+        self.sync_roots[0].object = &selected.header;
+        self.sync_task = .{
+            .frame = frame,
+            .call_ip = call_ip,
+            .operation = .sorted,
+            .destination = destination,
+            .line = line,
+            .column = column,
+            .callback = callback orelse Value.noneValue(),
+            .reverse = reverse,
+        };
+        self.sync_roots[4].object = if (callback) |value| value.asObject() else null;
+        const list = switch (sequence.createList(&self.heap, &.{})) {
+            .value => |object| object,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        self.sync_roots[1].object = &list.header;
+        self.sync_task.?.target = list;
+        self.sync_task.?.iterator_value = selected;
+        return self.advanceSyncTask();
+    }
+
+    fn startListSortTask(self: *Runtime, destination: u16, list: *sequence.List, callback: ?Value, reverse: bool, line: u32, column: u32) bool {
+        const frame = self.top_frame orelse return self.engineFault();
+        const call_ip = if (frame.ip == 0) return self.engineFault() else frame.ip - 1;
+        if (self.sync_task) |task| {
+            if (task.frame != frame or task.call_ip != call_ip or task.operation != .list_sort) return self.engineFault();
+            return self.advanceSyncTask();
+        }
+        self.beginSyncTaskRoots();
+        self.sync_roots[1].object = &list.header;
+        self.sync_roots[4].object = if (callback) |value| value.asObject() else null;
+        self.sync_task = .{
+            .frame = frame,
+            .call_ip = call_ip,
+            .operation = .list_sort,
+            .phase = .order,
+            .destination = destination,
+            .line = line,
+            .column = column,
+            .target = list,
+            .callback = callback orelse Value.noneValue(),
+            .reverse = reverse,
+            .original_version = list.version,
+            .original_length = list.items.items.len,
+        };
+        if (!self.prepareSyncSort(&self.sync_task.?)) return false;
+        return self.advanceSyncTask();
+    }
+
+    fn startNextTask(self: *Runtime, destination: u16, selected: *iterator.Iterator, line: u32, column: u32) bool {
+        const frame = self.top_frame orelse return self.engineFault();
+        const call_ip = if (frame.ip == 0) return self.engineFault() else frame.ip - 1;
+        if (self.sync_task) |task| {
+            if (task.frame != frame or task.call_ip != call_ip or task.operation != .next_value) return self.engineFault();
+            return self.advanceSyncTask();
+        }
+        self.beginSyncTaskRoots();
+        self.sync_roots[0].object = &selected.header;
+        self.sync_task = .{
+            .frame = frame,
+            .call_ip = call_ip,
+            .operation = .next_value,
+            .destination = destination,
+            .line = line,
+            .column = column,
+            .iterator_value = selected,
+        };
+        return self.advanceSyncTask();
+    }
+
+    fn prepareSyncSort(self: *Runtime, task: *SyncTask) bool {
+        const target = task.target orelse return self.engineFault();
+        const snapshot = switch (sequence.createList(&self.heap, target.items.items)) {
+            .value => |object| object,
+            .python_exception => |exception| {
+                self.setException(exception, task.line, task.column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        task.snapshot = snapshot;
+        self.sync_roots[2].object = &snapshot.header;
+        if (task.callback.tag() != .none) {
+            const keys = switch (sequence.createList(&self.heap, &.{})) {
+                .value => |object| object,
+                .python_exception => |exception| {
+                    self.setException(exception, task.line, task.column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            task.keys = keys;
+            self.sync_roots[3].object = &keys.header;
+            task.phase = .keys;
+            task.index = 0;
+            task.position = 0;
+        } else {
+            task.phase = .order;
+            task.index = 1;
+            task.position = 1;
+        }
+        task.order = self.heap.allocator.alloc(usize, snapshot.items.items.len) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, task.line, task.column, null);
+            return false;
+        };
+        for (task.order, 0..) |*entry, index| entry.* = index;
+        return true;
+    }
+
+    fn completeSyncTask(self: *Runtime, task: *SyncTask) bool {
+        const target = task.target orelse return self.engineFault();
+        if (task.want_tuple) {
+            switch (sequence.createTuple(&self.heap, target.items.items)) {
+                .value => |tuple| self.setRegister(task.destination, Value.object(&tuple.header)),
+                .python_exception => |exception| {
+                    self.setException(exception, task.line, task.column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            }
+        } else if (task.operation == .list_sort) {
+            self.setRegister(task.destination, Value.noneValue());
+        } else {
+            self.setRegister(task.destination, Value.object(&target.header));
+        }
+        task.complete = true;
+        return true;
+    }
+
+    fn finishSyncSort(self: *Runtime, task: *SyncTask) bool {
+        const target = task.target orelse return self.engineFault();
+        const snapshot = task.snapshot orelse return self.engineFault();
+        if (task.operation == .list_sort and (target.version != task.original_version or target.items.items.len != task.original_length)) {
+            self.setException(.{ .kind = .value_error, .message = "list modified during sort" }, task.line, task.column, null);
+            return false;
+        }
+        for (task.order, 0..) |source_index, target_index| target.items.items[target_index] = snapshot.items.items[source_index];
+        if (task.operation == .list_sort) target.version +%= 1;
+        if (task.operation == .list_sort) {
+            self.setRegister(task.destination, Value.noneValue());
+        } else {
+            self.setRegister(task.destination, Value.object(&target.header));
+        }
+        task.complete = true;
+        return true;
+    }
+
+    fn advanceSyncTask(self: *Runtime) bool {
+        const task = if (self.sync_task) |*active| active else return self.engineFault();
+        const owns_budget = self.beginSynchronousWork();
+        defer self.endSynchronousWork(owns_budget);
+        var remaining = @max(self.sync_task_quantum, 1);
+        while (remaining != 0 and !task.complete) {
+            if (task.operation == .next_value) {
+                if (!self.chargeSynchronousWork(task.line, task.column)) return false;
+                remaining -= 1;
+                const selected = task.iterator_value orelse return self.engineFault();
+                switch (self.nextIteratorValue(selected, task.destination, task.line, task.column)) {
+                    .item => |item| {
+                        self.setRegister(task.destination, item);
+                        task.complete = true;
+                        return true;
+                    },
+                    .done => {
+                        self.setException(.{ .kind = .stop_iteration, .message = "" }, task.line, task.column, null);
+                        return false;
+                    },
+                    .suspended => {
+                        if (iteratorHasPendingCallback(selected)) return self.continueSyncTaskAfterCallback(task);
+                        return self.pauseSyncTask(task);
+                    },
+                    .python_exception => |exception| {
+                        self.setException(exception, task.line, task.column, null);
+                        return false;
+                    },
+                    .engine_error => return self.engineFault(),
+                }
+            }
+            const target = task.target orelse return self.engineFault();
+            switch (task.phase) {
+                .collect => {
+                    if (!self.chargeSynchronousWork(task.line, task.column)) return false;
+                    remaining -= 1;
+                    const selected = task.iterator_value orelse return self.engineFault();
+                    switch (self.nextIteratorValue(selected, task.destination, task.line, task.column)) {
+                        .item => |item| {
+                            self.sync_roots[5].object = item.asObject();
+                            switch (sequence.append(&self.heap, target, item)) {
+                                .value => {},
+                                .python_exception => |exception| {
+                                    self.setException(exception, task.line, task.column, null);
+                                    return false;
+                                },
+                                .engine_error => return self.engineFault(),
+                            }
+                        },
+                        .done => {
+                            if (task.operation == .materialize) return self.completeSyncTask(task);
+                            if (!self.prepareSyncSort(task)) return false;
+                        },
+                        .suspended => {
+                            if (iteratorHasPendingCallback(selected)) return self.continueSyncTaskAfterCallback(task);
+                            return self.pauseSyncTask(task);
+                        },
+                        .python_exception => |exception| {
+                            self.setException(exception, task.line, task.column, null);
+                            return false;
+                        },
+                        .engine_error => return self.engineFault(),
+                    }
+                },
+                .keys => {
+                    const snapshot = task.snapshot orelse return self.engineFault();
+                    const keys = task.keys orelse return self.engineFault();
+                    if (task.index >= snapshot.items.items.len) {
+                        task.phase = .order;
+                        task.index = 1;
+                        task.position = 1;
+                        task.sort_item_started = false;
+                        continue;
+                    }
+                    if (!self.chargeSynchronousWork(task.line, task.column)) return false;
+                    remaining -= 1;
+                    const value = snapshot.items.items[task.index];
+                    const callback_result = self.invokeSyncTaskCallback(task.callback, &.{value}, task.destination, task.line, task.column);
+                    const returned = switch (callback_result) {
+                        .value => |result| result,
+                        .suspended => return self.continueSyncTaskAfterCallback(task),
+                        .failed => return false,
+                    };
+                    const target_after_call = task.target orelse return self.engineFault();
+                    if (task.operation == .list_sort and (target_after_call.version != task.original_version or target_after_call.items.items.len != task.original_length)) {
+                        self.setException(.{ .kind = .value_error, .message = "list modified during sort" }, task.line, task.column, null);
+                        return false;
+                    }
+                    self.sync_roots[5].object = returned.asObject();
+                    switch (sequence.append(&self.heap, keys, returned)) {
+                        .value => {},
+                        .python_exception => |exception| {
+                            self.setException(exception, task.line, task.column, null);
+                            return false;
+                        },
+                        .engine_error => return self.engineFault(),
+                    }
+                    task.index += 1;
+                },
+                .order => {
+                    const snapshot = task.snapshot orelse return self.engineFault();
+                    if (task.index >= task.order.len) return self.finishSyncSort(task);
+                    if (!self.chargeSynchronousWork(task.line, task.column)) return false;
+                    remaining -= 1;
+                    if (!task.sort_item_started) {
+                        task.selected_index = task.order[task.index];
+                        task.position = task.index;
+                        task.sort_item_started = true;
+                    }
+                    if (task.position == 0) {
+                        task.order[0] = task.selected_index;
+                        task.index += 1;
+                        task.sort_item_started = false;
+                        continue;
+                    }
+                    const left_items = if (task.keys) |keys| keys.items.items else snapshot.items.items;
+                    const order = self.sortOrder(left_items[task.selected_index], left_items[task.order[task.position - 1]], task.line, task.column) orelse return false;
+                    const precedes = if (task.reverse) order == .gt else order == .lt;
+                    if (precedes) {
+                        task.order[task.position] = task.order[task.position - 1];
+                        task.position -= 1;
+                    } else {
+                        task.order[task.position] = task.selected_index;
+                        task.index += 1;
+                        task.sort_item_started = false;
+                    }
+                },
+            }
+            if (self.output_event_pending or self.pending_input != null) return self.pauseSyncTask(task);
+        }
+        if (!task.complete) return self.pauseSyncTask(task);
+        return true;
+    }
+
     fn materializeSequence(self: *Runtime, destination: u16, source: Value, want_tuple: bool, line: u32, column: u32) bool {
+        if (self.sync_callback_depth != 0 or self.resuming_generator != null) {
+            return self.materializeSequenceImmediate(destination, source, want_tuple, line, column);
+        }
+        const frame = self.top_frame orelse return self.engineFault();
+        const call_ip = if (frame.ip == 0) return self.engineFault() else frame.ip - 1;
+        if (self.sync_task) |task| {
+            if (task.frame != frame or task.call_ip != call_ip or task.operation != .materialize) return self.engineFault();
+            return self.advanceSyncTask();
+        }
+        const iterator_value = switch (iterator.createIterator(&self.heap, source)) {
+            .value => |object| object,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        self.beginSyncTaskRoots();
+        self.sync_roots[0].object = &iterator_value.header;
+        self.sync_task = .{
+            .frame = frame,
+            .call_ip = call_ip,
+            .operation = .materialize,
+            .destination = destination,
+            .line = line,
+            .column = column,
+            .want_tuple = want_tuple,
+        };
+        const list = switch (sequence.createList(&self.heap, &.{})) {
+            .value => |object| object,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        self.sync_roots[1].object = &list.header;
+        self.sync_task.?.target = list;
+        self.sync_task.?.iterator_value = iterator_value;
+        return self.advanceSyncTask();
+    }
+
+    fn materializeSequenceImmediate(self: *Runtime, destination: u16, source: Value, want_tuple: bool, line: u32, column: u32) bool {
+        const owns_work_budget = self.beginSynchronousWork();
+        defer self.endSynchronousWork(owns_work_budget);
         if (source.asObject()) |header| {
             if (iterator.rangeFromHeader(header)) |range| {
                 const count = switch (iterator.rangeLength(&self.heap, range)) {
@@ -2930,6 +3771,7 @@ pub const Runtime = struct {
         };
         roots[1].object = &list.header;
         while (true) {
+            if (!self.chargeSynchronousWork(line, column)) return false;
             switch (self.nextIteratorValue(iterator_value, destination, line, column)) {
                 .item => |item| {
                     roots[2].object = item.asObject();
@@ -2943,6 +3785,7 @@ pub const Runtime = struct {
                     }
                 },
                 .done => break,
+                .suspended => return self.engineFault(),
                 .python_exception => |exception| {
                     self.setException(exception, line, column, null);
                     return false;
@@ -3174,7 +4017,7 @@ pub const Runtime = struct {
 
     fn beginSynchronousWork(self: *Runtime) bool {
         if (self.synchronous_work_remaining != null) return false;
-        self.synchronous_work_remaining = 1_000_000;
+        self.synchronous_work_remaining = std.math.cast(usize, self.max_instructions -| self.work_executed) orelse std.math.maxInt(usize);
         return true;
     }
 
@@ -3185,10 +4028,68 @@ pub const Runtime = struct {
     fn chargeSynchronousWork(self: *Runtime, line: u32, column: u32) bool {
         const remaining = self.synchronous_work_remaining orelse return true;
         if (remaining == 0) {
-            self.setException(.{ .kind = .runtime_error, .message = "synchronous operation exceeded work limit" }, line, column, null);
+            _ = line;
+            _ = column;
+            self.limit_reached = true;
             return false;
         }
         self.synchronous_work_remaining = remaining - 1;
+        self.work_executed +%= 1;
+        return true;
+    }
+
+    fn chargeBulkWork(self: *Runtime, amount: usize) bool {
+        const amount_u64 = std.math.cast(u64, amount) orelse {
+            self.limit_reached = true;
+            return false;
+        };
+        if (amount_u64 > self.max_instructions -| self.work_executed) {
+            self.limit_reached = true;
+            return false;
+        }
+        if (self.synchronous_work_remaining) |remaining| {
+            if (amount > remaining) {
+                self.limit_reached = true;
+                return false;
+            }
+            self.synchronous_work_remaining = remaining - amount;
+        }
+        self.work_executed += amount_u64;
+        return true;
+    }
+
+    fn repeatResultFitsSessionHeap(self: *Runtime, estimated_bytes: usize) bool {
+        if (estimated_bytes > self.session_allocator.max_bytes -| self.session_allocator.live_bytes) _ = self.heap.collect();
+        return estimated_bytes <= self.session_allocator.max_bytes -| self.session_allocator.live_bytes;
+    }
+
+    fn executeSequenceRepeat(self: *Runtime, destination: u16, sequence_value: Value, multiplier: Value, line: u32, column: u32) bool {
+        if (sequence.repeatWorkCost(sequence_value, multiplier)) |cost| {
+            // Reproduce MemoryError when the result buffers cannot fit the
+            // session heap; only charge native work for viable allocations.
+            if (sequence.repeatAllocationEstimate(sequence_value, cost)) |estimated_bytes| {
+                if (self.repeatResultFitsSessionHeap(estimated_bytes) and !self.chargeBulkWork(cost)) return false;
+            }
+        }
+        return self.storeValueResult(destination, sequence.repeat(&self.heap, sequence_value, multiplier), line, column);
+    }
+
+    fn chargeBytecode(self: *Runtime) bool {
+        if (self.instructions_executed >= self.max_instructions or self.work_executed >= self.max_instructions) {
+            self.limit_reached = true;
+            return false;
+        }
+        self.instructions_executed += 1;
+        self.work_executed +%= 1;
+        return true;
+    }
+
+    fn chargeNestedInstruction(self: *Runtime) bool {
+        if (self.instructions_executed >= self.max_instructions) {
+            self.limit_reached = true;
+            return false;
+        }
+        self.instructions_executed += 1;
         return true;
     }
 
@@ -3211,6 +4112,12 @@ pub const Runtime = struct {
     fn invokePythonSync(self: *Runtime, callable: Value, args: []const Value, destination: u16, line: u32, column: u32) ?Value {
         const owns_work_budget = self.beginSynchronousWork();
         defer self.endSynchronousWork(owns_work_budget);
+        const previous_callback_depth = self.sync_callback_depth;
+        self.sync_callback_depth += 1;
+        var retain_callback_depth = false;
+        defer {
+            if (!retain_callback_depth) self.sync_callback_depth -= 1;
+        }
         const header = callable.asObject() orelse {
             self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
             return null;
@@ -3250,12 +4157,15 @@ pub const Runtime = struct {
             return null;
         };
         var complete = false;
+        var suspended = false;
         defer if (!complete) {
-            if (bound_active) {
-                bound_frame.pop();
-                bound_active = false;
+            if (!suspended) {
+                if (bound_active) {
+                    bound_frame.pop();
+                    bound_active = false;
+                }
+                self.unwindFramesUntil(caller);
             }
-            self.unwindFramesUntil(caller);
         };
         frame.root_frame.pop();
         bound_frame.pop();
@@ -3289,10 +4199,20 @@ pub const Runtime = struct {
         }
         bound_frame.pop();
         bound_active = false;
-        var steps: usize = 0;
-        while (self.top_frame != caller) : (steps += 1) {
-            if (steps >= 1_000_000 or !self.chargeSynchronousWork(line, column)) {
-                if (self.last_exception == null) self.setException(.{ .kind = .runtime_error, .message = "synchronous callback exceeded work limit" }, line, column, null);
+        if (self.sync_task) |*task| {
+            if (previous_callback_depth == 0 and self.resuming_generator == null) {
+                task.callback_in_progress = true;
+                task.callback_failed = false;
+                task.frame.ip = task.call_ip;
+                self.instruction_pointer = task.call_ip;
+                task.callback_depth_held = true;
+                retain_callback_depth = true;
+                suspended = true;
+                return null;
+            }
+        }
+        while (self.top_frame != caller) {
+            if (!self.chargeSynchronousWork(line, column) or !self.chargeNestedInstruction()) {
                 return null;
             }
             const active = self.top_frame orelse return null;
@@ -3305,6 +4225,7 @@ pub const Runtime = struct {
             active.ip += 1;
             self.activateFrame(active);
             if (!self.execute(instruction, position.line, position.column)) {
+                if (self.limit_reached) return null;
                 if (!self.engine_failed and self.last_exception != null and self.unwindPythonExceptionUntil(caller)) continue;
                 return null;
             }
@@ -3916,6 +4837,7 @@ pub const Runtime = struct {
                         self.setRegister(instruction.c(), Value.trueValue());
                     },
                     .done => self.setRegister(instruction.c(), Value.falseValue()),
+                    .suspended => return self.engineFault(),
                     .python_exception => |exception| {
                         self.setException(exception, line, column, null);
                         return false;
@@ -4617,6 +5539,7 @@ pub const Runtime = struct {
                     count += 1;
                 },
                 .done => break,
+                .suspended => return self.engineFault(),
                 .python_exception => |exception| {
                     self.setException(exception, line, column, null);
                     return false;
@@ -4717,8 +5640,12 @@ pub const Runtime = struct {
             }
         }
         if (operation == 2) {
-            if (sequence.length(left) != null) return self.storeValueResult(destination, sequence.repeat(&self.heap, left, right), line, column);
-            if (sequence.length(right) != null) return self.storeValueResult(destination, sequence.repeat(&self.heap, right, left), line, column);
+            if (sequence.length(left) != null) {
+                return self.executeSequenceRepeat(destination, left, right, line, column);
+            }
+            if (sequence.length(right) != null) {
+                return self.executeSequenceRepeat(destination, right, left, line, column);
+            }
         }
         const result = switch (operation) {
             0 => number.add(&self.heap, left, right),
@@ -5290,6 +6217,7 @@ pub const Runtime = struct {
 
     fn builtinValue(self: *const Runtime, name: []const u8) ?Value {
         if (std.mem.eql(u8, name, "print")) return if (self.print_builtin_root.object) |header| Value.object(header) else null;
+        if (std.mem.eql(u8, name, "input")) return if (self.input_builtin_root.object) |header| Value.object(header) else null;
         if (std.mem.eql(u8, name, "range")) return if (self.range_builtin_root.object) |header| Value.object(header) else null;
         return null;
     }
@@ -5558,6 +6486,12 @@ fn truncateUtf8(input: []const u8, codepoints: usize) []const u8 {
         byte_index = @min(input.len, byte_index + width);
     }
     return input[0..byte_index];
+}
+
+fn trimInputEnding(input: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, input, "\r\n")) return input[0 .. input.len - 2];
+    if (std.mem.endsWith(u8, input, "\n") or std.mem.endsWith(u8, input, "\r")) return input[0 .. input.len - 1];
+    return input;
 }
 
 fn trimFloatZeros(input: []const u8) []const u8 {

@@ -1,6 +1,6 @@
 # Peony WASM ABI v1
 
-The ABI targets `wasm32-freestanding`. All pointers and lengths are unsigned 32-bit byte offsets into the exported `memory`. A zero pointer represents an empty slice or a failed pointer lookup/allocation.
+The ABI targets `wasm32-freestanding`. Pointers and lengths are unsigned 32-bit byte offsets into the exported `memory`. A zero pointer represents an empty slice or a failed pointer lookup/allocation. Status values `0` through `9` retain their ABI v1 meanings; new statuses are appended.
 
 ## Exported functions
 
@@ -9,50 +9,80 @@ The ABI targets `wasm32-freestanding`. All pointers and lengths are unsigned 32-
 | `peony_abi_version` | `() -> u32` | Returns `1`. |
 | `peony_transfer_alloc` | `(len: u32) -> ptr: u32` | Allocates a writable input block. Returns `0` for zero length, allocation failure, or a full transfer table. |
 | `peony_transfer_free` | `(ptr: u32, len: u32) -> void` | Frees a live block only when both values match its original allocation. Other requests are ignored. |
-| `peony_session_new` | `(config_ptr: u32, config_len: u32) -> handle: u32` | Accepts only empty config `(0, 0)`. Returns `0` if the config is invalid, allocation fails, or all 64 slots are occupied. |
+| `peony_session_new` | `(config_ptr: u32, config_len: u32) -> handle: u32` | Accepts empty config `(0, 0)` for defaults or a versioned `PCFG` config in a live transfer block. Returns `0` for invalid config, allocation failure, or a full session table. |
 | `peony_session_destroy` | `(handle: u32) -> status: u32` | Destroys a live session and advances its slot generation. |
-| `peony_compile_and_start` | `(handle, src_ptr, src_len, filename_ptr, filename_len: u32) -> status: u32` | Compiles a source slice and starts it in the session. Non-empty input slices must lie inside live transfer allocations. |
-| `peony_run` | `(handle, quantum: u32) -> status: u32` | Runs at most `quantum` bytecode instructions. A quantum of `0` selects the default `50,000`. |
-| `peony_resume` | `(handle, packet_ptr, packet_len: u32) -> status: u32` | Validates the packet slice, then returns `UNSUPPORTED`; host resume packets are not implemented yet. |
-| `peony_cancel` | `(handle: u32) -> status: u32` | Requests cancellation. The next `peony_run` returns `CANCELLED`. |
-| `peony_event_ptr`, `peony_event_len` | `(handle: u32) -> ptr/len: u32` | Events are not implemented; return `0`. |
+| `peony_reset` | `(handle: u32) -> status: u32` | Cancels pending work without Python finalizers and resets the session program, output, pending host request, and diagnostics. |
+| `peony_compile_and_start` | `(handle, src_ptr, src_len, filename_ptr, filename_len: u32) -> status: u32` | Compiles source from live transfer slices and starts it. |
+| `peony_run` | `(handle, quantum: u32) -> status: u32` | Runs at most `quantum` bytecode steps and bounded native work. Zero uses the configured quantum. |
+| `peony_resume` | `(handle, packet_ptr, packet_len: u32) -> status: u32` | Validates and applies a matching host response packet. Invalid or stale responses leave the pending request intact. |
+| `peony_cancel` | `(handle: u32) -> status: u32` | Requests hard cancellation. The next `peony_run` returns `CANCELLED`; Python `finally`/exit code is skipped. |
+| `peony_event_ptr`, `peony_event_len` | `(handle: u32) -> ptr/len: u32` | Return a borrowed request or flush event packet, or zero when no event is available. |
 | `peony_stdout_ptr`, `peony_stdout_len` | `(handle: u32) -> ptr/len: u32` | Return a borrowed view of buffered standard output, or zero when empty/invalid. |
 | `peony_stdout_consume` | `(handle, len: u32) -> status: u32` | Removes `len` bytes from the start of buffered output; rejects lengths beyond the buffer. |
-| `peony_stderr_ptr`, `peony_stderr_len` | `(handle: u32) -> ptr/len: u32` | Standard error is not implemented; return `0`. |
+| `peony_stderr_ptr`, `peony_stderr_len` | `(handle: u32) -> ptr/len: u32` | Reserved; currently return zero. |
 | `peony_stderr_consume` | `(handle, len: u32) -> status: u32` | Accepts only `len == 0`. |
 | `peony_error_ptr`, `peony_error_len` | `(handle: u32) -> ptr/len: u32` | Return a borrowed UTF-8 diagnostic or exception message, or zero when empty/invalid. |
-| `peony_traceback_ptr`, `peony_traceback_len` | `(handle: u32) -> ptr/len: u32` | Return borrowed UTF-8 JSON for the unhandled exception's structured traceback frames, or zero when empty/invalid. Each frame has `filename`, `name`, `line`, `column` and `source_line`. |
+| `peony_traceback_ptr`, `peony_traceback_len` | `(handle: u32) -> ptr/len: u32` | Return borrowed UTF-8 JSON for an unhandled exception's structured traceback frames, or zero when empty/invalid. Each frame has `filename`, `name`, `line`, `column`, and `source_line`. |
+| `peony_instruction_count`, `peony_work_count` | `(handle: u32) -> u64` | Return per-run bytecode and combined bytecode/native-work counters. |
 
-The current compiler supports scalar expressions and assignments, branches and loops with else clauses, short-circuit Boolean operations, comparisons, and lazy arbitrary-precision range. Ordinary functions support recursion, mutable lexical closures, global and nonlocal declarations, positional-only and keyword-only parameters, defaults, definition-time annotations, variadic arguments, and keyword binding. Lists, tuples, dictionaries and sets support the implemented indexing, slicing, iteration, unpacking, mutation, equality, hashing and methods. Comprehensions, generator expressions, lambdas, assignment expressions, f-strings, str.format, percent formatting, assert, and Python exception construction, matching, chaining, try/except/else/finally are implemented in the current subset. Unhandled Python exceptions include rendered tracebacks and borrowed structured frame data. Callable builtins include print, range, common sequence and mapping constructors, iteration helpers, map, filter, sorted and format.
+## Host packets
 
-With statements compile through the shared unwind path, but Python source cannot yet construct a context-manager object: classes and file APIs are not implemented, so an ordinary unsupported object raises Python TypeError at entry. Native tests inject a manager to verify entry, reverse-order exit, suppression, error, return and cancellation behavior. Unknown-length starred unpacking has a temporary 65,536-item limit and raises MemoryError beyond it. Classes, imports, except*, async syntax, yield-based generator functions, events and host resume packets remain excluded; recognized unsupported syntax returns UNSUPPORTED with a diagnostic.
+All packet integers are little-endian. The 24-byte header is followed by `section_count` 12-byte descriptors and then section payloads. Packets are limited to 1 MiB total before decoding or session allocation. UTF-8 sections are validated before a packet can mutate a session.
 
+| Header offset | Type | Field |
+|---:|---|---|
+| 0 | 4 bytes | ASCII magic `PEON` |
+| 4 | `u16` | Packet version, currently `1` |
+| 6 | `u16` | Kind: `1` input, `2` HTTP reserved, `3` sleep reserved, `4` clock reserved, `5` output/flush event |
+| 8 | `u32` | Nonzero per-session request/event id |
+| 12 | `u16` | Status: `0` success, `1` EOF, `2` host error |
+| 14 | `u16` | Flags, currently zero |
+| 16 | `u16` | Section count, at most 64 |
+| 18 | `u16` | Reserved, must be zero |
+| 20 | `u32` | Total packet length |
+
+Each descriptor contains a `u16` section kind (`1` UTF-8, `2` binary), a zero `u16` reserved field, and `u32` payload offset and length. Descriptors may not overlap each other or the descriptor table, and every section must fit inside the total packet.
+
+An input request has kind `1` and one UTF-8 section containing the prompt. A success response has the same kind and request id with one UTF-8 section; one trailing `LF` and optional preceding `CR` are removed. EOF has status `1` and no sections. Host error has status `2` and one UTF-8 message section; Python receives `OSError`. `peony_resume` checks the fixed envelope, kind and pending request id before allocating from the session heap; a malformed, stale or wrong-kind packet leaves the request pending. Kinds `2` through `4` are reserved and currently rejected.
+
+`print(..., flush=True)` creates a kind `5` output event with zero sections. It marks a drain boundary; stdout bytes remain available through `peony_stdout_ptr/len` and the host consumes them in the ordinary way without sending a response packet. Keeping output in the borrowed stdout buffer means a large flush is not constrained by the 1 MiB packet limit.
+
+Session config is either empty, which selects defaults, or a `PCFG` version 1 record. The fixed 28-byte header stores flags, `max_memory_bytes` (`u32`), `max_instructions` (`u64`), `quantum` (`u32`), seed length (`u16`), and a zero reserved `u16`; up to 1,024 seed bytes follow. Zero limits, invalid lengths, unknown flags, or nonzero reserved values are rejected. Defaults are a 64 MiB session heap, 50,000,000 combined work units, and a 50,000 instruction quantum.
 
 ## Status values
-
-Values `0` through `4` retain their original ABI v1 meanings. Execution statuses are appended without renumbering them.
 
 | Value | Name | Meaning |
 |---:|---|---|
 | `0` | `OK` | The operation completed. |
 | `1` | `UNSUPPORTED` | The syntax or host operation is outside the implemented subset. |
-| `2` | `INVALID_HANDLE` | The handle is zero, stale, out of range or destroyed. |
-| `3` | `INVALID_ARGUMENT` | A slice is outside a live transfer allocation or a stream consume exceeds its buffer. |
+| `2` | `INVALID_HANDLE` | The handle is zero, stale, out of range, or destroyed. |
+| `3` | `INVALID_ARGUMENT` | A slice, packet, response, or stream consume is invalid. |
 | `4` | `OUT_OF_MEMORY` | Reserved operation-level allocation status. Session creation and transfer allocation report failure as a zero handle/pointer; execution allocation failures are Python `MemoryError` exceptions. |
 | `5` | `COMPLETED` | The current program finished. |
 | `6` | `PYTHON_EXCEPTION` | Compilation or execution raised a Python syntax/runtime exception; inspect the error view. |
-| `7` | `TIMESLICE` | The instruction quantum expired; call `peony_run` again to continue. |
-| `8` | `CANCELLED` | A cancellation request stopped the program. |
+| `7` | `TIMESLICE` | The requested bytecode quantum expired; call `peony_run` again to continue. |
+| `8` | `CANCELLED` | A hard cancellation stopped the program. |
 | `9` | `INTERNAL_ERROR` | A corrupt bytecode or engine invariant failure occurred; it is not a Python exception. |
+| `10` | `HOST_REQUEST` | Python `input()` is suspended; copy the event and resume it with a matching response. |
+| `11` | `OUTPUT_EVENT` | An explicit output flush boundary is ready. |
+| `12` | `LIMIT` | The configured per-run bytecode/native-work budget was reached. |
 
-`COMPILE_AND_START` returns `OK` for a compiled program, `UNSUPPORTED` for valid syntax outside the supported subset, and `PYTHON_EXCEPTION` for syntax or compilation-time Python errors. `RUN` returns one of `COMPLETED`, `PYTHON_EXCEPTION`, `TIMESLICE`, `CANCELLED` or `INTERNAL_ERROR`.
+`COMPILE_AND_START` returns `OK` for a compiled program, `UNSUPPORTED` for valid syntax outside the supported subset, and `PYTHON_EXCEPTION` for syntax or compilation-time Python errors. A runtime `LIMIT` is not a catchable Python exception.
 
 ## Ownership and handle lifetime
 
-- JavaScript writes config, source, filename and resume data into `peony_transfer_alloc` blocks. Non-empty input slices must be contained in live blocks. Free each block with its original pointer and length after the consuming call; source and filename are consumed during compilation, and the compiled code owns its needed data.
-- Empty slices use `(ptr, len) == (0, 0)`. A non-empty source, filename or resume slice must lie wholly inside one live transfer block. At most 256 transfer blocks may be live at once.
-- A session handle packs a 24-bit generation in the upper bits and a slot token in the low 8 bits. The low byte is `1..64`; zero is never valid. Destroyed handles fail validation even after their slot is reused.
-- Standard output is buffered per session. Copy or decode borrowed output/error bytes before the next mutating call on that session or before destroying it. `peony_stdout_consume` removes a validated prefix. Compiling a new valid program resets the prior program, output and error state; sessions do not share output or globals.
-- The traceback JSON view is borrowed from the session and remains valid until the next `peony_compile_and_start`, cancellation/reset, or session destruction. Copy it before any of those operations.
+- JavaScript writes config, source, filename, and resume data into `peony_transfer_alloc` blocks. Non-empty input slices must be contained in live blocks. Free each block with its original pointer and length after the consuming call; source and filename are consumed during compilation, and host resume copies its validated UTF-8 value before returning.
+- Empty slices use `(ptr, len) == (0, 0)`. At most 256 transfer blocks may be live at once.
+- A session handle packs a 24-bit generation in the upper bits and a slot token in the low 8 bits. The low byte is `1..64`; zero is never valid. Destroyed handles fail validation after their slot is reused.
+- Standard output is buffered per session. Copy borrowed output/event/error bytes before the next mutating call on that session or before destroying it. `peony_stdout_consume` removes a validated prefix. Starting a valid program resets prior program, output, event, and error state.
+- Event packets are borrowed until the next same-session mutation, reset, or destruction. Traceback JSON follows the same lifetime. Copy any data needed after those operations.
 - `memory.grow()` detaches existing JavaScript typed-array views. Recreate every `Uint8Array`/`DataView` from the current `memory.buffer` after a call that may allocate or grow memory.
-- The fixed session table and transfer table are instance-local. Create separate WASM instances for fully separate tables.
+- The fixed session and transfer tables are instance-local. Separate WASM instances have separate tables.
+
+## JavaScript facade
+
+`web/peony.mjs` exports a dependency-free `Peony.load(url | Response | ArrayBuffer | Uint8Array)` facade. `createSession()` accepts output/input callbacks and validated heap, instruction, quantum, and seed options. `run(source, { filename })` returns a Promise with `completed`, `error`, `cancelled`, or `limit` status, structured exception frames, and counters. It pumps timeslices while yielding to the browser task queue, copies borrowed WASM data before mutation, and starts each run with a fresh Python session. `cancel()` hard-stops the active run; `reset()` aborts an active run and creates a clean session while preserving options.
+
+Generator, map/filter, and sort work at the VM level is resumable between configured quanta. A nested `list(...)` or `tuple(...)` materialization invoked inside an active Python callback remains synchronous until it completes or reaches the configured combined work limit; it does not yield to the host between items. The work limit still bounds that path and returns `LIMIT` rather than trapping.
+
+The language implementation is a Python 3.12-oriented subset. It supports scalar values, functions/closures, branches and loops, sequences, mappings and sets, comprehensions and generators, formatting, assertions, and `try`/`except`/`else`/`finally`. Context-manager entry/exit is implemented, but user Python cannot yet create its own classes or file objects. HTTP, sleep, clock, VFS, classes, imports, async syntax, and yield-based generator functions remain excluded; recognized unsupported syntax returns `UNSUPPORTED` with a diagnostic. Unknown-length starred unpacking has a temporary 65,536-item bound and raises `MemoryError` beyond it.

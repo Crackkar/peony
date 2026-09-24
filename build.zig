@@ -10,8 +10,11 @@ const abi_exports = [_][]const u8{
     "peony_run",
     "peony_resume",
     "peony_cancel",
+    "peony_reset",
     "peony_event_ptr",
     "peony_event_len",
+    "peony_instruction_count",
+    "peony_work_count",
     "peony_stdout_ptr",
     "peony_stdout_len",
     "peony_stdout_consume",
@@ -108,6 +111,7 @@ pub fn build(b: *std.Build) void {
     runtime_vm_module.addImport("runtime_iterator", native_iterator_module);
     runtime_vm_module.addImport("runtime_function", native_function_module);
     runtime_vm_module.addImport("runtime_binder", native_binder_module);
+    runtime_vm_module.addImport("runtime_host", native_runtime.host);
     const compiler_vm_test_module = b.createModule(.{
         .root_source_file = b.path("tests/unit/compiler_vm.zig"),
         .target = target,
@@ -161,6 +165,7 @@ pub fn build(b: *std.Build) void {
     });
     comprehension_test_module.addImport("runtime_vm", runtime_vm_module);
     comprehension_test_module.addImport("runtime_exception", native_runtime.exception);
+    comprehension_test_module.addImport("runtime_host", native_runtime.host);
     const formatting_test_module = b.createModule(.{
         .root_source_file = b.path("tests/unit/formatting.zig"),
         .target = target,
@@ -176,6 +181,19 @@ pub fn build(b: *std.Build) void {
     exceptions_test_module.addImport("runtime_vm", runtime_vm_module);
     exceptions_test_module.addImport("runtime_exception", native_runtime.exception);
     exceptions_test_module.addImport("runtime_value", native_runtime.value);
+    const host_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    host_test_module.addImport("runtime_vm", runtime_vm_module);
+    host_test_module.addImport("runtime_host", native_runtime.host);
+    const host_codec_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/host_codec.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    host_codec_test_module.addImport("runtime_host", native_runtime.host);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -213,6 +231,8 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("comprehension_tests", comprehension_test_module);
     unit_test_root.addImport("formatting_tests", formatting_test_module);
     unit_test_root.addImport("exception_tests", exceptions_test_module);
+    unit_test_root.addImport("host_tests", host_test_module);
+    unit_test_root.addImport("host_codec_tests", host_codec_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -385,6 +405,7 @@ fn createExecutionVmModule(
     vm_module.addImport("runtime_iterator", iterator_module);
     vm_module.addImport("runtime_function", function_module);
     vm_module.addImport("runtime_binder", binder_module);
+    vm_module.addImport("runtime_host", runtime.host);
     return vm_module;
 }
 
@@ -461,6 +482,7 @@ const RuntimeModules = struct {
     slice: *std.Build.Module,
     dict: *std.Build.Module,
     hash: *std.Build.Module,
+    host: *std.Build.Module,
 };
 
 fn createRuntimeModules(
@@ -493,6 +515,11 @@ fn createRuntimeModules(
     });
     exception_module.addImport("runtime_gc", gc_module);
     number_module.addImport("runtime_exception", exception_module);
+    const host_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const slice_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/slice.zig"),
@@ -569,6 +596,7 @@ fn createRuntimeModules(
         .value = value_module,
         .number = number_module,
         .exception = exception_module,
+        .host = host_module,
         .unicode = unicode_module,
         .string = string_module,
         .bytes = bytes_module,
@@ -584,6 +612,7 @@ fn addRuntimeImports(module: *std.Build.Module, runtime: RuntimeModules) void {
     module.addImport("runtime_value", runtime.value);
     module.addImport("runtime_number", runtime.number);
     module.addImport("runtime_exception", runtime.exception);
+    module.addImport("runtime_host", runtime.host);
     module.addImport("runtime_unicode", runtime.unicode);
     module.addImport("runtime_string", runtime.string);
     module.addImport("runtime_bytes", runtime.bytes);

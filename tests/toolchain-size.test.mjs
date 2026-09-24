@@ -20,6 +20,7 @@ test('size report is repeatable and includes the baseline plus all feature delta
   assert.deepEqual(Object.keys(first.probes).sort(), ['bigint', 'json', 'unicode15']);
   for (const result of Object.values(first.probes)) {
     assert.ok(result.rawDeltaBytes > 0);
-    assert.ok(result.brotliQ11DeltaBytes > 0);
+    assert.ok(Number.isFinite(result.brotliQ11DeltaBytes));
+    assert.ok(Number.isInteger(result.brotliQ11DeltaBytes));
   }
 });

@@ -183,6 +183,62 @@ pub fn testRepeatSupportsIntegerLeftOperand() !void {
     try expectOutput("print(2 * [1], 2 * (1,))\n", "[1, 1] (1, 1)\n");
 }
 
+pub fn testRepeatPreflightsNativeWorkAndRecovers() !void {
+    var runtime: runtime_vm.Runtime = undefined;
+    try runtime.init(std.testing.allocator, 8 * 1024 * 1024);
+    defer runtime.deinit();
+    runtime.max_instructions = 30;
+    runtime.configured_quantum = 1000;
+
+    try expectReady(runtime.compileAndStart("items = [0] * 100000\nprint(len(items))\n", "repeat-work-limit.py"));
+    try std.testing.expectEqual(runtime_vm.RunStatus.limit, runtime.run(1000));
+    try std.testing.expect(runtime.workCount() <= runtime.max_instructions);
+    try std.testing.expectEqualStrings("", runtime.stdout());
+
+    try expectReady(runtime.compileAndStart("print(len([0] * 5))\n", "repeat-work-recovery.py"));
+    try std.testing.expectEqual(runtime_vm.RunStatus.completed, runtime.run(1000));
+    try std.testing.expectEqualStrings("5\n", runtime.stdout());
+}
+
+pub fn testRepeatPreservesMemoryErrorBeforeWorkLimit() !void {
+    const source = "items = [0] * 2000\nprint(len(items))\n";
+    var high_limit: runtime_vm.Runtime = undefined;
+    try high_limit.init(std.testing.allocator, 1024 * 1024);
+    defer high_limit.deinit();
+    high_limit.max_instructions = 1_000_000;
+    try expectReady(high_limit.compileAndStart(source, "repeat-memory-precedence.py"));
+    try runToRepeatMultiply(&high_limit);
+    _ = high_limit.heap.collect();
+
+    var low_limit: runtime_vm.Runtime = undefined;
+    try low_limit.init(std.testing.allocator, 1024 * 1024);
+    defer low_limit.deinit();
+    low_limit.max_instructions = 30;
+    try expectReady(low_limit.compileAndStart(source, "repeat-memory-precedence.py"));
+    try runToRepeatMultiply(&low_limit);
+    _ = low_limit.heap.collect();
+
+    try std.testing.expectEqual(high_limit.session_allocator.live_bytes, low_limit.session_allocator.live_bytes);
+    const same_heap_cap = high_limit.session_allocator.live_bytes + 70_000;
+    high_limit.session_allocator.max_bytes = same_heap_cap;
+    low_limit.session_allocator.max_bytes = same_heap_cap;
+
+    try std.testing.expectEqual(runtime_vm.RunStatus.python_exception, high_limit.run(1000));
+    try std.testing.expectEqual(exceptions.PythonExceptionKind.memory_error, (high_limit.pythonException() orelse return error.ExpectedPythonException).kind);
+    try std.testing.expectEqual(runtime_vm.RunStatus.python_exception, low_limit.run(1000));
+    try std.testing.expectEqual(exceptions.PythonExceptionKind.memory_error, (low_limit.pythonException() orelse return error.ExpectedPythonException).kind);
+}
+
+fn runToRepeatMultiply(runtime: *runtime_vm.Runtime) !void {
+    const code = runtime.code orelse return error.ExpectedCode;
+    const multiply_ip = for (code.instructions, 0..) |instruction, index| {
+        if (instruction.opcode() == .binary and instruction.flags() == 2) break index;
+    } else return error.ExpectedRepeatInstruction;
+    while (runtime.instruction_pointer < multiply_ip) {
+        try std.testing.expectEqual(runtime_vm.RunStatus.timeslice, runtime.run(1));
+    }
+}
+
 pub fn testLazyRangeIndexingSlicingAndSequenceBuiltins() !void {
     try expectOutput(
         \\base = 2 ** 100

@@ -12,6 +12,8 @@ const mapping_tests = @import("mapping_tests");
 const comprehension_tests = @import("comprehension_tests");
 const formatting_tests = @import("formatting_tests");
 const exception_tests = @import("exception_tests");
+const host_tests = @import("host_tests");
+const host_codec_tests = @import("host_codec_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -26,6 +28,9 @@ test "ABI v1 appends execution statuses without renumbering existing values" {
     try @import("std").testing.expectEqual(@as(u32, 7), @intFromEnum(status.timeslice));
     try @import("std").testing.expectEqual(@as(u32, 8), @intFromEnum(status.cancelled));
     try @import("std").testing.expectEqual(@as(u32, 9), @intFromEnum(status.internal_error));
+    try @import("std").testing.expectEqual(@as(u32, 10), @intFromEnum(status.host_request));
+    try @import("std").testing.expectEqual(@as(u32, 11), @intFromEnum(status.output_event));
+    try @import("std").testing.expectEqual(@as(u32, 12), @intFromEnum(status.limit));
 }
 
 test "session allocator accounting" {
@@ -324,6 +329,91 @@ test "assertion message survives GC and reset" {
     try exception_tests.testAssertionMessageSurvivesCollectionAndReset();
 }
 
+test "input evaluates its prompt once and suspends for the host" {
+    try host_tests.testInputEvaluatesPromptOnceAndSuspends();
+}
+
+test "resumed input roots the value and dispatches EOF and host errors" {
+    try host_tests.testInputResumeRootsValueAndDispatchesEofAndHostErrors();
+}
+
+test "input resumes inside a nested Python frame at quantum one" {
+    try host_tests.testInputSuspendsInsideNestedFrameAtQuantumOne();
+}
+
+test "print flush returns an output boundary" {
+    try host_tests.testPrintFlushProducesOutputBoundary();
+}
+
+test "large flushed output uses a small output event marker" {
+    try host_tests.testLargeFlushedOutputUsesOnlyAnEventMarker();
+}
+
+test "host packet codec roundtrips deterministically" {
+    try host_codec_tests.testHostPacketRoundTripIsDeterministic();
+    try host_codec_tests.testHostPacketRoundTripWithNoSectionsDoesNotLeak();
+}
+
+test "host packet codec rejects oversized envelopes before copying" {
+    try host_codec_tests.testHostPacketRejectsOversizedEnvelopeBeforeCopying();
+}
+
+test "host packet codec rejects malformed envelopes" {
+    try host_codec_tests.testHostPacketRejectsMalformedEnvelopeWithoutOwnedPartialState();
+}
+
+test "host config codec validates and preserves defaults" {
+    try host_codec_tests.testHostConfigRoundTripAndValidation();
+}
+
+test "generator work yields across run quanta without replay" {
+    try host_tests.testLongGeneratorYieldsAcrossRunQuantumWithoutReplay();
+}
+
+test "map and filter callbacks yield across run quanta" {
+    try host_tests.testLongMapAndFilterCallbacksYieldAcrossRunQuantum();
+}
+
+test "keyed sorting yields across run quanta without replaying keys" {
+    try host_tests.testKeyedSortingYieldsAcrossRunQuantumWithoutRepeatingKeys();
+}
+
+test "long Python callbacks yield and can be cancelled" {
+    try host_tests.testLongPythonCallbackYieldsAndCanBeCancelled();
+}
+
+test "nested callback materialization obeys configured work limit" {
+    try host_tests.testNestedCallbackMaterializationHonorsConfiguredWorkLimit();
+}
+
+test "enumerate and zip resume generator and map children at quantum one" {
+    try host_tests.testEnumerateAndZipResumeGeneratorAndMapChildrenAtQuantumOne();
+}
+
+test "multi-source map preserves values across generator suspension" {
+    try host_tests.testMultiSourceMapPreservesValuesAcrossGeneratorSuspension();
+}
+
+test "plain sorting does not trip a fixed synchronous work ceiling" {
+    try host_tests.testPlainSortUsesResumableWorkBudget();
+}
+
+test "native sort work stops at the configured limit without counter overshoot" {
+    try host_tests.testSortLimitCapsNativeWorkBeforeOvershoot();
+}
+
+test "bytecode continuation cannot overshoot native work limit" {
+    try host_tests.testBytecodeContinuationCannotOvershootNativeWorkLimit();
+}
+
+test "plain sort checkpoints and can be cancelled before its finally" {
+    try host_tests.testPlainSortYieldsInsideSortAndCancellationSkipsFinally();
+}
+
+test "cancellation inside chunked generator skips finally and recovers" {
+    try host_tests.testCancellationInsideChunkedGeneratorStopsWithoutFinally();
+}
+
 test "lists alias and mutate through methods, repr, cycles and equality" {
     try sequence_tests.testListAliasMutationMethodsCyclesAndEquality();
     try sequence_tests.testSequenceRepresentationQuotesEscapesAndBoundsDepth();
@@ -373,6 +463,14 @@ test "Python sequence bounds do not vary with WASM pointer width" {
 
 test "sequence repetition accepts integer left operands" {
     try sequence_tests.testRepeatSupportsIntegerLeftOperand();
+}
+
+test "sequence repetition preflights native work and recovers" {
+    try sequence_tests.testRepeatPreflightsNativeWorkAndRecovers();
+}
+
+test "sequence repetition preserves MemoryError before the work limit" {
+    try sequence_tests.testRepeatPreservesMemoryErrorBeforeWorkLimit();
 }
 
 test "lazy range indexing and sequence builtins retain big integers" {

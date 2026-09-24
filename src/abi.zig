@@ -13,6 +13,9 @@ pub const Status = enum(u32) {
     timeslice = 7,
     cancelled = 8,
     internal_error = 9,
+    host_request = 10,
+    output_event = 11,
+    limit = 12,
 };
 
 pub const SessionHandle = struct {

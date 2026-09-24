@@ -11,7 +11,7 @@ const exceptions = @import("runtime_exception");
 
 const Heap = gc.Heap;
 const Value = value_module.Value;
-const IteratorMode = enum { basic, enumerate, zip, reversed, map, filter, generator };
+pub const IteratorMode = enum { basic, enumerate, zip, reversed, map, filter, generator };
 
 const IteratorInitial = struct {
     mode: IteratorMode = .basic,
@@ -36,7 +36,9 @@ pub const Range = struct {
 };
 
 pub const Iterator = struct {
-    header: gc.Header align(8),
+    // Zig's default struct layout moves this header behind the other
+    // align-8 fields; align-16 pins the GC header at byte offset zero.
+    header: gc.Header align(16),
     mode: IteratorMode = .basic,
     range: ?*Range = null,
     current: Value = Value.noneValue(),
@@ -44,6 +46,7 @@ pub const Iterator = struct {
     sequence_value: Value = Value.noneValue(),
     byte_string: ?*bytes.Bytes = null,
     sequence_index: usize = 0,
+    child_index: usize = 0,
     byte_offset: usize = 0,
     inner: ?*Iterator = null,
     children: []?*Iterator = &.{},
@@ -54,6 +57,8 @@ pub const Iterator = struct {
     reverse_index: usize = 0,
     mapping_iterator: ?*dict_module.DictIterator = null,
     callback: Value = Value.noneValue(),
+    callback_pending: bool = false,
+    finished: bool = false,
     started: bool = false,
     generator_frame: ?*anyopaque = null,
     generator_roots: []gc.Root = &.{},
@@ -62,9 +67,11 @@ pub const Iterator = struct {
     generator_frame_destroy: ?*const fn (*anyopaque, std.mem.Allocator) void = null,
 };
 
+
 pub const NextResult = union(enum) {
     item: Value,
     done,
+    suspended,
     python_exception: exceptions.PythonException,
     engine_error: exceptions.EngineError,
 };
@@ -676,6 +683,7 @@ fn nextEnumerate(heap: *Heap, iterator: *Iterator) NextResult {
             };
         },
         .done => return .done,
+        .suspended => return .{ .engine_error = .internal_invariant },
         .python_exception => |exception| return .{ .python_exception = exception },
         .engine_error => |failure| return .{ .engine_error = failure },
     }
@@ -688,6 +696,7 @@ fn nextZip(heap: *Heap, iterator: *Iterator) NextResult {
         switch (next(heap, child)) {
             .item => |item| iterator.values[index_value] = item,
             .done => return .done,
+            .suspended => return .{ .engine_error = .internal_invariant },
             .python_exception => |exception| return .{ .python_exception = exception },
             .engine_error => |failure| return .{ .engine_error = failure },
         }

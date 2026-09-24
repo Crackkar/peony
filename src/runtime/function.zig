@@ -7,7 +7,7 @@ const bytecode = @import("frontend_bytecode");
 const Value = value_module.Value;
 
 pub const Native = enum {
-    print, range, dict, set, hash, format_builtin, sorted, map, filter, str_constructor,
+    print, input, range, dict, set, hash, format_builtin, sorted, map, filter, str_constructor,
     len, list, tuple, iter, next, enumerate, zip, reversed, slice,
     list_append, list_extend, list_insert, list_pop, list_remove, list_clear, list_index, list_count, list_reverse, list_copy, list_sort,
     str_find, str_index, str_split, str_join, str_strip, str_upper, str_lower, str_replace, str_count, str_startswith, str_endswith, str_encode, str_format,
