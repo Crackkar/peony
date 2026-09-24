@@ -27,6 +27,7 @@ const IteratorInitial = struct {
     reverse_index: usize = 0,
     mapping_iterator: ?*dict_module.DictIterator = null,
     callback: Value = Value.noneValue(),
+    user_object: ?Value = null,
 };
 
 pub const Range = struct {
@@ -58,6 +59,7 @@ pub const Iterator = struct {
     reverse_index: usize = 0,
     mapping_iterator: ?*dict_module.DictIterator = null,
     callback: Value = Value.noneValue(),
+    user_object: ?Value = null,
     callback_pending: bool = false,
     finished: bool = false,
     started: bool = false,
@@ -103,6 +105,7 @@ fn traceIterator(header: *gc.Header, tracer: *gc.Tracer) void {
     for (iterator.enumerate_values) |value| tracer.visit(value.asObject());
     tracer.visit(iterator.reverse_source.asObject());
     tracer.visit(iterator.callback.asObject());
+    if (iterator.user_object) |user| tracer.visit(user.asObject());
     if (iterator.generator_yielded) |value| tracer.visit(value.asObject());
     for (iterator.generator_roots) |root| tracer.visit(root.object);
 }
@@ -595,6 +598,10 @@ pub fn createGenerator(heap: *Heap, callback: Value, outer: Value) exceptions.Re
     return createInitialized(heap, .{ .mode = .generator, .inner = source_iterator, .callback = callback });
 }
 
+pub fn createUserIterator(heap: *Heap, user: Value) exceptions.Result(*Iterator) {
+    return createInitialized(heap, .{ .user_object = user });
+}
+
 pub fn deferredKind(selected: *const Iterator) ?enum { map, filter, generator } {
     return switch (selected.mode) {
         .map => .map,
@@ -621,6 +628,7 @@ fn createInitialized(heap: *Heap, initial: IteratorInitial) exceptions.Result(*I
         .reverse_index = initial.reverse_index,
         .mapping_iterator = initial.mapping_iterator,
         .callback = initial.callback,
+        .user_object = initial.user_object,
     };
     return .{ .value = iterator };
 }

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const unicodeBlob = path.join(root, 'zig-cache', 'size-probes', 'unicode15-property-prototype.bin');
+const unicodeBlob = path.join(root, '.zig-cache', 'size-probes', 'unicode15-property-prototype.bin');
 const quality = 11;
 const probes = ['bigint', 'json', 'unicode15'];
 const toolchain = exec('zig', ['version']);
@@ -15,18 +15,18 @@ if (toolchain !== '0.16.0') {
 }
 
 await mkdir(path.dirname(unicodeBlob), { recursive: true });
-exec('python', ['tools/generate_unicode15_probe.py', 'zig-cache/size-probes/unicode15-property-prototype.bin']);
+exec('python', ['tools/generate_unicode15_probe.py', '.zig-cache/size-probes/unicode15-property-prototype.bin']);
 await prepareProbeSources();
 exec('zig', ['build', 'wasm']);
 
 for (const name of probes) exec('zig', ['build', `probe-${name}`]);
 
-const baseline = await measure('zig-out/bin/peony.wasm');
+const baseline = await measure('zig-out/peony.wasm');
 const results = {};
 for (const name of probes) {
-  const probe = await measure(`zig-out/bin/peony-probe-${name}.wasm`);
+  const probe = await measure(`zig-out/peony-probe-${name}.wasm`);
   results[name] = {
-    artifact: `zig-out/bin/peony-probe-${name}.wasm`,
+    artifact: `zig-out/peony-probe-${name}.wasm`,
     rawBytes: probe.rawBytes,
     brotliQ11Bytes: probe.brotliQ11Bytes,
     rawDeltaBytes: probe.rawBytes - baseline.rawBytes,
@@ -39,14 +39,14 @@ const report = {
   unicodeVersion: '15.0.0',
   brotliQuality: quality,
   baseline: {
-    artifact: 'zig-out/bin/peony.wasm',
+    artifact: 'zig-out/peony.wasm',
     rawBytes: baseline.rawBytes,
     brotliQ11Bytes: baseline.brotliQ11Bytes,
   },
   probes: results,
   commands: [
     'zig version',
-    'python tools/generate_unicode15_probe.py zig-cache/size-probes/unicode15-property-prototype.bin',
+    'python tools/generate_unicode15_probe.py .zig-cache/size-probes/unicode15-property-prototype.bin',
     'zig build wasm',
     ...probes.map((name) => `zig build probe-${name}`),
     'node tools/size_report.mjs [--json]',
@@ -86,7 +86,7 @@ async function measure(relativePath) {
 }
 
 async function prepareProbeSources() {
-  const probeDir = path.join(root, 'zig-cache', 'size-probes');
+  const probeDir = path.join(root, '.zig-cache', 'size-probes');
   const probeRuntimeDir = path.join(probeDir, 'runtime');
   const runtimeSource = await readFile(path.join(root, 'src', 'wasm.zig'), 'utf8');
   await copyFile(path.join(root, 'src', 'abi.zig'), path.join(probeDir, 'abi.zig'));

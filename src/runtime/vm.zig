@@ -20,6 +20,7 @@ const format_rules = @import("format.zig");
 const host = @import("runtime_host");
 const vfs_module = @import("runtime_vfs");
 const file_module = @import("runtime_file");
+const class_module = @import("runtime_class");
 
 const Value = value_module.Value;
 const Code = bytecode.Code;
@@ -96,11 +97,14 @@ const Frame = struct {
     previous: ?*Frame = null,
     return_destination: ?u16 = null,
     generator_owner: ?*iterator.Iterator = null,
+    return_override: ?Value = null,
+    override_requires_none: bool = false,
     ip: usize = 0,
     registers: []Value = &.{},
     locals: []Value = &.{},
     local_cells: []?*functions.Cell = &.{},
     free_cells: []?*functions.Cell = &.{},
+    class_namespace: ?*class_module.Class = null,
     roots: []gc.Root = &.{},
     root_frame: gc.RootFrame = .{},
     try_blocks: std.ArrayList(TryBlock) = .empty,
@@ -118,8 +122,16 @@ const Frame = struct {
         return self.cellRootStart() + self.local_cells.len;
     }
 
-    fn unwindRootStart(self: *const Frame) usize {
+    fn classRootIndex(self: *const Frame) usize {
         return self.freeRootStart() + self.free_cells.len;
+    }
+
+    fn returnOverrideRootIndex(self: *const Frame) usize {
+        return self.classRootIndex() + 1;
+    }
+
+    fn unwindRootStart(self: *const Frame) usize {
+        return self.returnOverrideRootIndex() + 1;
     }
 };
 
@@ -209,6 +221,8 @@ pub const Runtime = struct {
     print_builtin_root: gc.Root = .{ .object = null },
     input_builtin_root: gc.Root = .{ .object = null },
     range_builtin_root: gc.Root = .{ .object = null },
+    object_class_root: gc.Root = .{ .object = null },
+    type_class_root: gc.Root = .{ .object = null },
     exception_frame: gc.RootFrame = .{},
     exception_root: gc.Root = .{ .object = null },
     emergency_exception_root: gc.Root = .{ .object = null },
@@ -297,6 +311,8 @@ pub const Runtime = struct {
         self.builtin_frame.add(&self.print_builtin_root);
         self.builtin_frame.add(&self.input_builtin_root);
         self.builtin_frame.add(&self.range_builtin_root);
+        self.builtin_frame.add(&self.object_class_root);
+        self.builtin_frame.add(&self.type_class_root);
         self.exception_frame.push(&self.heap.roots);
         self.exception_frame.add(&self.exception_root);
         self.exception_frame.add(&self.emergency_exception_root);
@@ -759,7 +775,8 @@ pub const Runtime = struct {
         const cell_roots = std.math.add(usize, frame.local_cells.len, frame.free_cells.len) catch return error.OutOfMemory;
         const unwind_root_count = std.math.mul(usize, code.try_sites.len, 2) catch return error.OutOfMemory;
         const root_prefix = std.math.add(usize, first_roots, cell_roots) catch return error.OutOfMemory;
-        const root_count = std.math.add(usize, root_prefix, unwind_root_count) catch return error.OutOfMemory;
+        const with_special_roots = std.math.add(usize, root_prefix, 2) catch return error.OutOfMemory;
+        const root_count = std.math.add(usize, with_special_roots, unwind_root_count) catch return error.OutOfMemory;
         frame.roots = try allocator.alloc(gc.Root, root_count);
         @memset(frame.roots, .{ .object = null });
         frame.root_frame.push(&self.heap.roots);
@@ -1031,13 +1048,23 @@ pub const Runtime = struct {
         return self.setFrameInstruction(frame, target);
     }
 
-    fn performReturn(self: *Runtime, result: Value) bool {
+    fn performReturn(self: *Runtime, result: Value, line: u32, column: u32) bool {
+        const returning_frame = self.top_frame orelse return self.engineFault();
+        var result_value = result;
+        if (returning_frame.return_override) |override| {
+            if (returning_frame.override_requires_none and result.tag() != .none) {
+                self.setException(.{ .kind = .type_error, .message = "__init__() should return None" }, line, column, null);
+                return false;
+            }
+            _ = override;
+            result_value = returning_frame.return_override.?;
+        }
         if (self.sync_task) |*task| {
             if (task.callback_in_progress and framePreviousIsTask(self.top_frame, task.frame)) {
-                task.callback_result = result;
+                task.callback_result = result_value;
                 task.callback_completed = true;
                 task.callback_in_progress = false;
-                self.sync_roots[6].object = result.asObject();
+                self.sync_roots[6].object = result_value.asObject();
                 self.releaseSyncCallbackDepth(task);
             }
         }
@@ -1052,7 +1079,7 @@ pub const Runtime = struct {
         if (self.top_frame) |caller| {
             const destination = return_destination orelse return self.engineFault();
             if (!self.validRegister(destination)) return self.engineFault();
-            self.setRegister(destination, result);
+            self.setRegister(destination, result_value);
             _ = caller;
         } else if (return_destination != null) return self.engineFault();
         return true;
@@ -1063,7 +1090,7 @@ pub const Runtime = struct {
         return frame.previous == task_frame;
     }
 
-    fn beginReturnTransfer(self: *Runtime, frame: *Frame, result: Value) bool {
+    fn beginReturnTransfer(self: *Runtime, frame: *Frame, result: Value, line: u32, column: u32) bool {
         while (frame.try_blocks.items.len != 0) {
             const block = &frame.try_blocks.items[frame.try_blocks.items.len - 1];
             const site = frame.code.try_sites[block.site_index];
@@ -1086,7 +1113,7 @@ pub const Runtime = struct {
             _ = self.popTryBlock(frame, true);
             if (self.engine_failed) return false;
         }
-        return self.performReturn(result);
+        return self.performReturn(result, line, column);
     }
 
     fn enterTry(self: *Runtime, site_index: u32, line: u32, column: u32) bool {
@@ -1121,6 +1148,13 @@ pub const Runtime = struct {
                 return true;
             }
         }
+        if (manager_value.asObject()) |header| if (class_module.instanceFromHeader(header) != null) {
+            if (self.invokeSpecialSync(manager_value, "__enter__", &.{}, line, column)) |entered| {
+                self.setRegister(destination, entered);
+                return true;
+            }
+            if (self.last_exception != null or self.engine_failed) return false;
+        };
         const manager = testContextManager(manager_value) orelse {
             self.setException(.{ .kind = .type_error, .message = "object does not support the context manager protocol" }, line, column, null);
             return false;
@@ -1135,7 +1169,7 @@ pub const Runtime = struct {
         return true;
     }
 
-    fn executeWithExit(self: *Runtime, manager_value: Value, line: u32, column: u32) bool {
+    fn executeWithExit(self: *Runtime, destination: u16, manager_value: Value, line: u32, column: u32) bool {
         const frame = self.top_frame orelse return self.engineFault();
         if (frame.try_blocks.items.len == 0) return self.engineFault();
         const block = &frame.try_blocks.items[frame.try_blocks.items.len - 1];
@@ -1146,6 +1180,53 @@ pub const Runtime = struct {
                 return true;
             }
         }
+        if (manager_value.asObject()) |header| if (class_module.instanceFromHeader(header) != null) {
+            const pending = if (block.pending == .exception) block.pending_exception else null;
+            const exc_type = if (pending) |exception| Value.exceptionClass(@intCast(@intFromEnum(exception.kind))) else Value.noneValue();
+            const exc_value = if (pending) |exception| blk: {
+                if (self.active_exception) |active| {
+                    if (active.kind == exception.kind) break :blk Value.object(&active.header);
+                }
+                break :blk Value.noneValue();
+            } else Value.noneValue();
+            const arguments = [_]Value{ exc_type, exc_value, Value.noneValue() };
+            const saved_active = self.active_exception;
+            const saved_exception_root = self.exception_root.object;
+            const saved_last = self.last_exception;
+            if (pending != null) {
+                // Keep the old exception rooted in the try block, but don't let
+                // it make successful special-method lookups inside __exit__
+                // appear to fail.
+                self.last_exception = null;
+                self.clearErrorText();
+            }
+            if (self.invokeSpecialSync(manager_value, "__exit__", &arguments, line, column)) |result| {
+                if (pending != null) {
+                    const suppress = self.valueTruthy(result, line, column) orelse return false;
+                    if (suppress) {
+                        block.pending = .none;
+                        block.pending_exception = null;
+                        frame.roots[tryRootIndex(frame, block.slot_index, false)].object = null;
+                        self.active_exception = null;
+                        self.exception_root.object = null;
+                        self.last_exception = null;
+                        self.clearErrorText();
+                    } else {
+                        self.active_exception = saved_active;
+                        self.exception_root.object = saved_exception_root;
+                        self.last_exception = saved_last;
+                    }
+                }
+                self.setRegister(destination, result);
+                return true;
+            }
+            if (pending != null and self.last_exception == null) {
+                self.active_exception = saved_active;
+                self.exception_root.object = saved_exception_root;
+                self.last_exception = saved_last;
+            }
+            if (self.last_exception != null or self.engine_failed) return false;
+        };
         const manager = testContextManager(manager_value) orelse {
             self.setException(.{ .kind = .type_error, .message = "object does not support the context manager protocol" }, line, column, null);
             return false;
@@ -1293,7 +1374,7 @@ pub const Runtime = struct {
             .return_value => {
                 _ = self.popTryBlock(frame, true);
                 if (self.engine_failed) return false;
-                return self.beginReturnTransfer(frame, result);
+                return self.beginReturnTransfer(frame, result, line, column);
             },
             .jump => {
                 const target = block_copy.pending_target;
@@ -1304,8 +1385,6 @@ pub const Runtime = struct {
             .none => {
                 _ = self.popTryBlock(frame, true);
                 if (self.engine_failed) return false;
-                _ = line;
-                _ = column;
                 return self.setFrameInstruction(frame, site.end_ip);
             },
         }
@@ -1555,16 +1634,64 @@ pub const Runtime = struct {
                 if (!self.appendCallKeyword(keywords, &keyword_count, name, value, line, column)) return false;
             }
         }
-        const positional = positional_object.items.items;
-        const callee = self.registers[instruction.a()];
+        var positional = positional_object.items.items;
+        var callee = self.registers[instruction.a()];
         if (callee.asExceptionClass()) |class_index| {
+            if (class_index == std.math.maxInt(u8)) return self.nativeTypeError(line, column, "'NotImplementedType' object is not callable");
             if (class_index >= exceptions.allKinds.len) return self.engineFault();
             return self.executeExceptionConstructor(instruction.a(), exceptions.allKinds[class_index], positional, keywords[0..keyword_count], line, column);
         }
-        const header = callee.asObject() orelse {
+        var header = callee.asObject() orelse {
             self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
             return false;
         };
+        var constructor_instance: ?Value = null;
+        if (class_module.classFromHeader(header)) |user_class| {
+            if (self.typeClass()) |type_class| {
+                if (user_class == type_class) {
+                    if (keyword_count != 0 or positional.len != 1) return self.nativeTypeError(line, column, "type() takes exactly one argument");
+                    const type_header = self.type_class_root.object orelse return self.engineFault();
+                    const value_header = positional[0].asObject() orelse {
+                        self.setRegister(instruction.a(), Value.object(type_header));
+                        return true;
+                    };
+                    if (class_module.instanceFromHeader(value_header)) |instance| {
+                        self.setRegister(instruction.a(), Value.object(&instance.class.header));
+                        return true;
+                    }
+                    self.setRegister(instruction.a(), Value.object(type_header));
+                    return true;
+                }
+            }
+            const instance_result = class_module.createInstance(&self.heap, user_class);
+            const instance = switch (instance_result) {
+                .value => |selected| selected,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            const instance_value = Value.object(&instance.header);
+            call_roots[1].object = &instance.header;
+            const initializer = class_module.classAttribute(user_class, "__init__") orelse {
+                if (positional.len != 0 or keyword_count != 0) return self.nativeTypeError(line, column, "object takes no arguments");
+                self.setRegister(instruction.a(), instance_value);
+                return true;
+            };
+            const method = switch (class_module.createBoundMethod(&self.heap, initializer, instance_value)) {
+                .value => |selected| selected,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            self.setRegister(instruction.a(), Value.object(&method.header));
+            constructor_instance = instance_value;
+            callee = Value.object(&method.header);
+            header = &method.header;
+        }
         if (exceptions.classFromHeader(header)) |exception_class| {
             if (keyword_count != 0 or positional.len > 1) {
                 self.setException(.{ .kind = .type_error, .message = "exception constructor takes at most one message" }, line, column, null);
@@ -1583,6 +1710,22 @@ pub const Runtime = struct {
                 .engine_error => return self.engineFault(),
             }
             return true;
+        }
+        if (class_module.boundMethodFromHeader(header)) |bound_method| {
+            positional_object.items.insert(allocator, 0, bound_method.receiver) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            };
+            positional = positional_object.items.items;
+            header = bound_method.callable.asObject() orelse return self.engineFault();
+        }
+        if (class_module.instanceFromHeader(header)) |instance| {
+            if (class_module.classAttribute(instance.class, "__call__") != null) {
+                if (keyword_count != 0) return self.nativeTypeError(line, column, "callable instance keyword arguments are not supported yet");
+                const result = self.invokeSpecialSync(Value.object(header), "__call__", positional, line, column) orelse return false;
+                self.setRegister(instruction.a(), result);
+                return true;
+            }
         }
         const function = functions.functionFromHeader(header) orelse {
             self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
@@ -1671,6 +1814,11 @@ pub const Runtime = struct {
         call_roots_active = false;
         frame.root_frame.push(&self.heap.roots);
         for (frame.roots) |*root| frame.root_frame.add(root);
+        if (constructor_instance) |instance| {
+            frame.return_override = instance;
+            frame.override_requires_none = true;
+            frame.roots[frame.returnOverrideRootIndex()].object = instance.asObject();
+        }
         bound_root_frame.push(&self.heap.roots);
         for (bound_roots) |*root| bound_root_frame.add(root);
         bound_roots_active = true;
@@ -1941,6 +2089,181 @@ pub const Runtime = struct {
         column: u32,
     ) bool {
         switch (native) {
+            .isinstance_builtin => {
+                if (positional.len != 2 or keywords.len != 0) return self.nativeArity(line, column);
+                const target_header = positional[1].asObject() orelse return self.nativeTypeError(line, column, "isinstance() arg 2 must be a type");
+                const target = class_module.classFromHeader(target_header) orelse return self.nativeTypeError(line, column, "isinstance() arg 2 must be a type");
+                const actual_header = positional[0].asObject() orelse {
+                    const is_exception_type = if (positional[0].asExceptionClass()) |index| index < exceptions.allKinds.len else false;
+                    self.setRegister(destination, if (target == self.typeClass() and is_exception_type) Value.trueValue() else Value.falseValue());
+                    return true;
+                };
+                const actual = if (class_module.instanceFromHeader(actual_header)) |instance| instance.class else if (class_module.classFromHeader(actual_header) != null) self.typeClass() else null;
+                self.setRegister(destination, if (actual) |selected| if (mroContains(selected, target)) Value.trueValue() else Value.falseValue() else Value.falseValue());
+                return true;
+            },
+            .issubclass_builtin => {
+                if (positional.len != 2 or keywords.len != 0) return self.nativeArity(line, column);
+                const left_header = positional[0].asObject() orelse return self.nativeTypeError(line, column, "issubclass() arg 1 must be a class");
+                const right_header = positional[1].asObject() orelse return self.nativeTypeError(line, column, "issubclass() arg 2 must be a class");
+                const left = class_module.classFromHeader(left_header) orelse return self.nativeTypeError(line, column, "issubclass() arg 1 must be a class");
+                const right = class_module.classFromHeader(right_header) orelse return self.nativeTypeError(line, column, "issubclass() arg 2 must be a class");
+                self.setRegister(destination, if (mroContains(left, right)) Value.trueValue() else Value.falseValue());
+                return true;
+            },
+            .callable_builtin => {
+                if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
+                self.setRegister(destination, if (self.isCallable(positional[0])) Value.trueValue() else Value.falseValue());
+                return true;
+            },
+            .bool_constructor => {
+                if (positional.len > 1 or keywords.len != 0) return self.nativeArity(line, column);
+                const truth = if (positional.len == 0) false else self.valueTruthy(positional[0], line, column) orelse return false;
+                self.setRegister(destination, if (truth) Value.trueValue() else Value.falseValue());
+                return true;
+            },
+            .getattr_builtin => {
+                if ((positional.len != 2 and positional.len != 3) or keywords.len != 0) return self.nativeArity(line, column);
+                const name = self.valueString(positional[1]) orelse return self.nativeTypeError(line, column, "attribute name must be string");
+                if (self.lookupAttributeValue(positional[0], name, line, column)) |value| {
+                    self.setRegister(destination, value);
+                    return true;
+                }
+                if (self.last_exception) |exception| {
+                    if (positional.len != 3 or exception.kind != .attribute_error) return false;
+                    self.suppressAttributeError();
+                }
+                if (positional.len == 3) {
+                    self.setRegister(destination, positional[2]);
+                    return true;
+                }
+                return self.nativeAttributeError(line, column, "object has no such attribute");
+            },
+            .hasattr_builtin => {
+                if (positional.len != 2 or keywords.len != 0) return self.nativeArity(line, column);
+                const name = self.valueString(positional[1]) orelse return self.nativeTypeError(line, column, "attribute name must be string");
+                if (self.lookupAttributeValue(positional[0], name, line, column)) |_| {
+                    self.setRegister(destination, Value.trueValue());
+                    return true;
+                }
+                if (self.last_exception) |exception| {
+                    if (exception.kind != .attribute_error) return false;
+                    self.suppressAttributeError();
+                }
+                self.setRegister(destination, Value.falseValue());
+                return true;
+            },
+            .setattr_builtin => {
+                if (positional.len != 3 or keywords.len != 0) return self.nativeArity(line, column);
+                const name = self.valueString(positional[1]) orelse return self.nativeTypeError(line, column, "attribute name must be string");
+                if (!self.setUserAttribute(positional[0], name, positional[2], line, column)) return false;
+                self.setRegister(destination, Value.noneValue());
+                return true;
+            },
+            .delattr_builtin => {
+                if (positional.len != 2 or keywords.len != 0) return self.nativeArity(line, column);
+                const name = self.valueString(positional[1]) orelse return self.nativeTypeError(line, column, "attribute name must be string");
+                if (!self.deleteUserAttribute(positional[0], name, line, column)) return false;
+                self.setRegister(destination, Value.noneValue());
+                return true;
+            },
+            .repr_builtin => {
+                if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
+                const owned = self.renderValueOwned(positional[0], true, line, column) orelse return false;
+                defer self.heap.allocator.free(owned);
+                return self.storeStringResult(destination, string.create(&self.heap, owned), line, column);
+            },
+            .property_builtin => {
+                if (positional.len > 4 or keywords.len != 0) return self.nativeArity(line, column);
+                const getter = if (positional.len > 0) positional[0] else Value.noneValue();
+                const setter = if (positional.len > 1) positional[1] else Value.noneValue();
+                const deleter = if (positional.len > 2) positional[2] else Value.noneValue();
+                const descriptor = switch (class_module.createDescriptor(&self.heap, .property, getter)) {
+                    .value => |selected| selected,
+                    .python_exception => |exception| {
+                        self.setException(exception, line, column, null);
+                        return false;
+                    },
+                    .engine_error => return self.engineFault(),
+                };
+                descriptor.setter = setter;
+                descriptor.deleter = deleter;
+                self.setRegister(destination, Value.object(&descriptor.header));
+                return true;
+            },
+            .staticmethod_builtin, .classmethod_builtin => {
+                if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
+                const kind: class_module.DescriptorKind = if (native == .staticmethod_builtin) .staticmethod else .classmethod;
+                return switch (class_module.createDescriptor(&self.heap, kind, positional[0])) {
+                    .value => |descriptor| blk: {
+                        self.setRegister(destination, Value.object(&descriptor.header));
+                        break :blk true;
+                    },
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk false;
+                    },
+                    .engine_error => self.engineFault(),
+                };
+            },
+            .descriptor_setter, .descriptor_deleter => {
+                if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
+                const descriptor_header = bound_self.asObject() orelse return self.engineFault();
+                const descriptor = class_module.descriptorFromHeader(descriptor_header) orelse return self.engineFault();
+                if (descriptor.kind != .property) return self.engineFault();
+                const copy = class_module.copyProperty(
+                    &self.heap,
+                    descriptor,
+                    if (native == .descriptor_setter) positional[0] else null,
+                    if (native == .descriptor_deleter) positional[0] else null,
+                );
+                return switch (copy) {
+                    .value => |selected| blk: {
+                        self.setRegister(destination, Value.object(&selected.header));
+                        break :blk true;
+                    },
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk false;
+                    },
+                    .engine_error => self.engineFault(),
+                };
+            },
+            .super_builtin => {
+                if (keywords.len != 0 or (positional.len != 0 and positional.len != 2)) return self.nativeArity(line, column);
+                var start_class: *class_module.Class = undefined;
+                var receiver: Value = undefined;
+                if (positional.len == 2) {
+                    const start_header = positional[0].asObject() orelse return self.nativeTypeError(line, column, "super() argument 1 must be a type");
+                    start_class = class_module.classFromHeader(start_header) orelse return self.nativeTypeError(line, column, "super() argument 1 must be a type");
+                    receiver = positional[1];
+                } else {
+                    const frame = self.top_frame orelse return self.nativeTypeError(line, column, "super(): no current frame");
+                    const class_cell = self.findCell("__class__") orelse return self.nativeTypeError(line, column, "super(): no __class__ cell");
+                    const class_header = class_cell.value.asObject() orelse return self.nativeTypeError(line, column, "super(): __class__ is not a type");
+                    start_class = class_module.classFromHeader(class_header) orelse return self.nativeTypeError(line, column, "super(): __class__ is not a type");
+                    if (frame.code.parameter_names.len == 0) return self.nativeTypeError(line, column, "super(): no arguments");
+                    receiver = frameNameValue(frame, frame.code.parameter_names[0]) orelse return self.nativeTypeError(line, column, "super(): first argument is unbound");
+                }
+                const owner = if (receiver.asObject()) |receiver_header| blk: {
+                    if (class_module.instanceFromHeader(receiver_header)) |instance| break :blk instance.class;
+                    if (class_module.classFromHeader(receiver_header)) |class| break :blk class;
+                    break :blk null;
+                } else null;
+                const owner_class = owner orelse return self.nativeTypeError(line, column, "super(type, obj): obj must be an instance or subtype of type");
+                if (!mroContains(owner_class, start_class)) return self.nativeTypeError(line, column, "super(type, obj): obj must be an instance or subtype of type");
+                return switch (class_module.createSuper(&self.heap, start_class, receiver, owner_class)) {
+                    .value => |selected| blk: {
+                        self.setRegister(destination, Value.object(&selected.header));
+                        break :blk true;
+                    },
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk false;
+                    },
+                    .engine_error => self.engineFault(),
+                };
+            },
             .hash => {
                 if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
                 const key_hash = self.pythonHash(positional[0], line, column) orelse return false;
@@ -2145,6 +2468,15 @@ pub const Runtime = struct {
                 if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
                 const value = positional[0];
                 if (sequence.length(value)) |length_value| return self.setSmallInt(destination, length_value, line, column);
+                if (value.asObject()) |value_header| if (class_module.instanceFromHeader(value_header) != null) {
+                    const result = self.invokeSpecialSync(value, "__len__", &.{}, line, column) orelse {
+                        if (self.last_exception == null) return self.nativeTypeError(line, column, "object has no length");
+                        return false;
+                    };
+                    if (!number.isIntegerValue(result)) return self.nativeTypeError(line, column, "'__len__' should return an integer");
+                    self.setRegister(destination, result);
+                    return true;
+                };
                 if (dict_module.sizeOf(value)) |mapping_length| {
                     const length_value = std.math.cast(i64, mapping_length) orelse {
                         self.setException(.{ .kind = .overflow_error, .message = "Python int too large to convert to C ssize_t" }, line, column, null);
@@ -2181,6 +2513,9 @@ pub const Runtime = struct {
                     if (native == .list) return self.storeListResult(destination, sequence.createList(&self.heap, &.{}), line, column);
                     return self.storeTupleResult(destination, sequence.createTuple(&self.heap, &.{}), line, column);
                 }
+                if (positional[0].asObject()) |source_header| if (class_module.instanceFromHeader(source_header)) |source_instance| {
+                    if (class_module.classAttribute(source_instance.class, "__iter__") != null) return self.materializeSequenceImmediate(destination, positional[0], native == .tuple, line, column);
+                };
                 if (self.sync_callback_depth != 0 or self.resuming_generator != null) {
                     return self.materializeSequenceImmediate(destination, positional[0], native == .tuple, line, column);
                 }
@@ -3361,6 +3696,19 @@ pub const Runtime = struct {
         return false;
     }
 
+    fn nativeAttributeError(self: *Runtime, line: u32, column: u32, message: []const u8) bool {
+        self.setException(.{ .kind = .attribute_error, .message = message }, line, column, null);
+        return false;
+    }
+
+    fn suppressAttributeError(self: *Runtime) void {
+        const handled = if (self.active_exception) |suppressed| suppressed.context else null;
+        self.last_exception = null;
+        self.active_exception = handled;
+        self.exception_root.object = if (handled) |instance| &instance.header else null;
+        self.clearErrorText();
+    }
+
     fn nativeArity(self: *Runtime, line: u32, column: u32) bool {
         return self.nativeTypeError(line, column, "incorrect number of arguments");
     }
@@ -3436,7 +3784,24 @@ pub const Runtime = struct {
     }
 
     fn createIteratorResult(self: *Runtime, destination: u16, value: Value, line: u32, column: u32) bool {
-        return self.storeIteratorOutcome(destination, iterator.createIterator(&self.heap, value), line, column);
+        return self.storeIteratorOutcome(destination, self.createVmIterator(value, line, column), line, column);
+    }
+
+    fn createVmIterator(self: *Runtime, value: Value, line: u32, column: u32) exceptions.Result(*iterator.Iterator) {
+        if (value.asObject()) |header| if (class_module.instanceFromHeader(header) != null) {
+            const iterated = self.invokeSpecialSync(value, "__iter__", &.{}, line, column) orelse {
+                if (self.last_exception) |exception| return .{ .python_exception = exception };
+                return .{ .python_exception = .{ .kind = .type_error, .message = "object is not iterable" } };
+            };
+            if (iterated.asObject()) |iterated_header| {
+                if (iterator.iteratorFromHeader(iterated_header)) |selected| return .{ .value = selected };
+                if (class_module.instanceFromHeader(iterated_header) != null and class_module.classAttribute(class_module.instanceFromHeader(iterated_header).?.class, "__next__") != null) {
+                    return iterator.createUserIterator(&self.heap, iterated);
+                }
+            }
+            return .{ .python_exception = .{ .kind = .type_error, .message = "iter() returned a non-iterator" } };
+        };
+        return iterator.createIterator(&self.heap, value);
     }
 
     fn storeIteratorOutcome(self: *Runtime, destination: u16, outcome: exceptions.Result(*iterator.Iterator), line: u32, column: u32) bool {
@@ -3454,6 +3819,23 @@ pub const Runtime = struct {
     }
 
     fn nextIteratorValue(self: *Runtime, selected: *iterator.Iterator, destination: u16, line: u32, column: u32) iterator.NextResult {
+        if (selected.user_object) |user| {
+            const item = self.invokeSpecialSync(user, "__next__", &.{}, line, column) orelse {
+                if (self.last_exception) |exception| {
+                    if (exception.kind == .stop_iteration) {
+                        self.last_exception = null;
+                        self.active_exception = null;
+                        self.exception_root.object = null;
+                        self.clearErrorText();
+                        selected.finished = true;
+                        return .done;
+                    }
+                    return .{ .python_exception = exception };
+                }
+                return .{ .engine_error = .internal_invariant };
+            };
+            return .{ .item = item };
+        }
         switch (selected.mode) {
             .enumerate => return self.nextEnumerateIteratorValue(selected, destination, line, column),
             .zip => return self.nextZipIteratorValue(selected, destination, line, column),
@@ -3836,7 +4218,7 @@ pub const Runtime = struct {
             if (task.frame != frame or task.call_ip != call_ip or task.operation != .sorted) return self.engineFault();
             return self.advanceSyncTask();
         }
-        const selected = switch (iterator.createIterator(&self.heap, source)) {
+        const selected = switch (self.createVmIterator(source, line, column)) {
             .value => |object| object,
             .python_exception => |exception| {
                 self.setException(exception, line, column, null);
@@ -4141,7 +4523,7 @@ pub const Runtime = struct {
             if (task.frame != frame or task.call_ip != call_ip or task.operation != .materialize) return self.engineFault();
             return self.advanceSyncTask();
         }
-        const iterator_value = switch (iterator.createIterator(&self.heap, source)) {
+        const iterator_value = switch (self.createVmIterator(source, line, column)) {
             .value => |object| object,
             .python_exception => |exception| {
                 self.setException(exception, line, column, null);
@@ -4203,7 +4585,7 @@ pub const Runtime = struct {
             }
         }
 
-        const iterator_value = switch (iterator.createIterator(&self.heap, source)) {
+        const iterator_value = switch (self.createVmIterator(source, line, column)) {
             .value => |object| object,
             .python_exception => |exception| {
                 self.setException(exception, line, column, null);
@@ -4315,7 +4697,14 @@ pub const Runtime = struct {
         const left_numeric = number.isIntegerValue(left) or left.asFloat() != null;
         const right_numeric = number.isIntegerValue(right) or right.asFloat() != null;
         if (left_numeric or right_numeric) {
-            if (!left_numeric or !right_numeric) return false;
+            if (!left_numeric) {
+                if (left.asObject()) |header| if (class_module.instanceFromHeader(header) != null) return self.compareWithUserEquality(left, right, line, column);
+                return false;
+            }
+            if (!right_numeric) {
+                if (right.asObject()) |header| if (class_module.instanceFromHeader(header) != null) return self.compareWithUserEquality(right, left, line, column);
+                return false;
+            }
             return switch (number.equal(left, right)) {
                 .value => |equal| equal,
                 .python_exception => |exception| blk: {
@@ -4328,6 +4717,17 @@ pub const Runtime = struct {
                 },
             };
         }
+        if (left.asObject()) |left_header| if (class_module.instanceFromHeader(left_header) != null) {
+            if (self.invokeSpecialSync(left, "__eq__", &.{right}, line, column)) |result| {
+                if (result.asExceptionClass() == null or result.asExceptionClass().? != std.math.maxInt(u8)) return self.valueTruthy(result, line, column);
+            } else if (self.last_exception != null) return null;
+            if (right.asObject()) |right_header| if (class_module.instanceFromHeader(right_header) != null) {
+                if (self.invokeSpecialSync(right, "__eq__", &.{left}, line, column)) |result| {
+                    if (result.asExceptionClass() == null or result.asExceptionClass().? != std.math.maxInt(u8)) return self.valueTruthy(result, line, column);
+                } else if (self.last_exception != null) return null;
+            };
+            return false;
+        };
         if (left.asObject()) |left_header| {
             if (right.asObject()) |right_header| {
                 if (string.fromHeader(left_header)) |left_text| if (string.fromHeader(right_header)) |right_text| return string.equal(left_text, right_text);
@@ -4365,11 +4765,24 @@ pub const Runtime = struct {
                     }
                     return true;
                 };
+                if (class_module.instanceFromHeader(right_header) != null) return self.compareWithUserEquality(right, left, line, column);
             }
             return false;
         }
-        if (right.asObject() != null) return false;
+        if (right.asObject()) |right_header| {
+            if (class_module.instanceFromHeader(right_header) != null) return self.compareWithUserEquality(right, left, line, column);
+            return false;
+        }
         return left.tag() == right.tag();
+    }
+
+    fn compareWithUserEquality(self: *Runtime, instance: Value, other: Value, line: u32, column: u32) ?bool {
+        if (self.invokeSpecialSync(instance, "__eq__", &.{other}, line, column)) |result| {
+            if (result.asExceptionClass() != null and result.asExceptionClass().? == std.math.maxInt(u8)) return false;
+            return self.valueTruthy(result, line, column);
+        }
+        if (self.last_exception != null) return null;
+        return false;
     }
 
     fn sortList(self: *Runtime, list: *sequence.List, reverse: bool, line: u32, column: u32) bool {
@@ -4471,6 +4884,8 @@ pub const Runtime = struct {
     fn isCallable(self: *const Runtime, value: Value) bool {
         _ = self;
         const header = value.asObject() orelse return false;
+        if (class_module.classFromHeader(header) != null or class_module.boundMethodFromHeader(header) != null) return true;
+        if (class_module.instanceFromHeader(header)) |instance| return class_module.classAttribute(instance.class, "__call__") != null;
         const function = functions.functionFromHeader(header) orelse return false;
         return function.native != null or function.code != null;
     }
@@ -4558,6 +4973,17 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
             return null;
         };
+        if (class_module.boundMethodFromHeader(header)) |bound| {
+            const allocator = self.heap.allocator;
+            const expanded = allocator.alloc(Value, args.len + 1) catch {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return null;
+            };
+            defer allocator.free(expanded);
+            expanded[0] = bound.receiver;
+            @memcpy(expanded[1..], args);
+            return self.invokeCallableSync(bound.callable, expanded, destination, line, column);
+        }
         const function = functions.functionFromHeader(header) orelse {
             self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
             return null;
@@ -4567,6 +4993,79 @@ pub const Runtime = struct {
             return self.registers[destination];
         }
         return self.invokePythonSync(callable, args, destination, line, column);
+    }
+
+    fn invokeSpecialSync(self: *Runtime, receiver: Value, name: []const u8, arguments: []const Value, line: u32, column: u32) ?Value {
+        const header = receiver.asObject() orelse return null;
+        const instance = class_module.instanceFromHeader(header) orelse return null;
+        const callable = class_module.classAttribute(instance.class, name) orelse return null;
+        const caller = self.top_frame orelse {
+            _ = self.engineFault();
+            return null;
+        };
+        const scratch: u16 = if (caller.code.register_count == 0) return null else @intCast(caller.code.register_count - 1);
+        const saved = self.registers[scratch];
+        var roots = [_]gc.Root{
+            .{ .object = saved.asObject() },
+            .{ .object = receiver.asObject() },
+            .{ .object = callable.asObject() },
+            .{ .object = null },
+        };
+        var frame = gc.RootFrame{};
+        frame.push(&self.heap.roots);
+        for (&roots) |*root| frame.add(root);
+        defer frame.pop();
+        const allocator = self.heap.allocator;
+        const expanded = allocator.alloc(Value, arguments.len + 1) catch {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return null;
+        };
+        defer allocator.free(expanded);
+        expanded[0] = receiver;
+        @memcpy(expanded[1..], arguments);
+        const result = self.invokeCallableSync(callable, expanded, scratch, line, column) orelse {
+            self.restoreFrameRegister(caller, scratch, saved);
+            return null;
+        };
+        roots[3].object = result.asObject();
+        self.restoreFrameRegister(caller, scratch, saved);
+        return result;
+    }
+
+    fn invokeValueSync(self: *Runtime, callable: Value, arguments: []const Value, line: u32, column: u32) ?Value {
+        const caller = self.top_frame orelse {
+            _ = self.engineFault();
+            return null;
+        };
+        if (caller.code.register_count == 0) {
+            _ = self.engineFault();
+            return null;
+        }
+        const scratch: u16 = @intCast(caller.code.register_count - 1);
+        const saved = self.registers[scratch];
+        var roots = [_]gc.Root{ .{ .object = saved.asObject() }, .{ .object = callable.asObject() }, .{ .object = null } };
+        var frame = gc.RootFrame{};
+        frame.push(&self.heap.roots);
+        for (&roots) |*root| frame.add(root);
+        defer frame.pop();
+        const result = self.invokeCallableSync(callable, arguments, scratch, line, column) orelse {
+            self.restoreFrameRegister(caller, scratch, saved);
+            return null;
+        };
+        roots[2].object = result.asObject();
+        self.restoreFrameRegister(caller, scratch, saved);
+        return result;
+    }
+
+    fn restoreFrameRegister(self: *Runtime, frame: *Frame, index: u16, value: Value) void {
+        const position: usize = index;
+        if (position >= frame.registers.len or position >= frame.roots.len) {
+            _ = self.engineFault();
+            return;
+        }
+        frame.registers[position] = value;
+        frame.roots[position].object = value.asObject();
+        if (self.top_frame == frame) self.activateFrame(frame);
     }
 
     fn invokePythonSync(self: *Runtime, callable: Value, args: []const Value, destination: u16, line: u32, column: u32) ?Value {
@@ -4638,6 +5137,18 @@ pub const Runtime = struct {
         if (function.cells.len != function_code.free_names.len) {
             _ = self.engineFault();
             return null;
+        }
+        if (function_code.flags & bytecode.code_flags.class_body != 0) {
+            const class_header = function.bound_self.asObject() orelse {
+                _ = self.engineFault();
+                return null;
+            };
+            const class = class_module.classFromHeader(class_header) orelse {
+                _ = self.engineFault();
+                return null;
+            };
+            frame.class_namespace = class;
+            frame.roots[frame.classRootIndex()].object = &class.header;
         }
         for (function.cells, 0..) |cell, index| {
             frame.free_cells[index] = cell;
@@ -4897,6 +5408,75 @@ pub const Runtime = struct {
         return true;
     }
 
+    fn executeMakeClass(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        const parent_code = self.activeCode() orelse return self.engineFault();
+        if (!self.validRegister(instruction.a())) return self.engineFault();
+        const site_index: usize = instruction.index32();
+        if (site_index >= parent_code.class_sites.len) return self.engineFault();
+        const site = parent_code.class_sites[site_index];
+        if (site.code_index >= parent_code.nested_codes.len or site.name_index >= parent_code.names.len) return self.engineFault();
+        const body_code = parent_code.nested_codes[site.code_index];
+        const name = parent_code.names[site.name_index];
+        const base_start: usize = site.base_start;
+        const base_count: usize = site.base_count;
+        if (base_start > parent_code.argument_registers.len or base_count > parent_code.argument_registers.len - base_start) return self.engineFault();
+        const bases = self.heap.allocator.alloc(*class_module.Class, base_count) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer self.heap.allocator.free(bases);
+        for (parent_code.argument_registers[base_start..][0..base_count], 0..) |register, index| {
+            if (!self.validRegister(register)) return self.engineFault();
+            const header = self.registers[register].asObject() orelse return self.nativeTypeError(line, column, "class bases must be types");
+            bases[index] = class_module.classFromHeader(header) orelse return self.nativeTypeError(line, column, "class bases must be types");
+        }
+        if (!self.ensureBuiltinClasses(line, column)) return false;
+        const object_header = self.object_class_root.object orelse return self.engineFault();
+        const object_class = class_module.classFromHeader(object_header) orelse return self.engineFault();
+        const created_class = class_module.createClass(&self.heap, name, bases, object_class);
+        const class = switch (created_class) {
+            .value => |selected| selected,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        const class_value = Value.object(&class.header);
+        self.setRegister(instruction.a(), class_value);
+
+        const captured = self.heap.allocator.alloc(*functions.Cell, body_code.free_names.len) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        defer self.heap.allocator.free(captured);
+        for (body_code.free_names, 0..) |free_name, index| {
+            captured[index] = self.findCell(free_name) orelse return self.engineFault();
+        }
+        const frame = self.allocateFrame(body_code, instruction.a()) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        frame.class_namespace = class;
+        frame.return_override = class_value;
+        frame.roots[frame.classRootIndex()].object = &class.header;
+        frame.roots[frame.returnOverrideRootIndex()].object = &class.header;
+        for (captured, 0..) |cell, index| {
+            frame.free_cells[index] = cell;
+            frame.roots[frame.freeRootStart() + index].object = &cell.header;
+        }
+        for (body_code.cell_names, 0..) |cell_name, index| {
+            const cell = functions.createCell(&self.heap, if (std.mem.eql(u8, cell_name, "__class__")) class_value else Value.unboundValue()) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            };
+            frame.local_cells[index] = cell;
+            frame.roots[frame.cellRootStart() + index].object = &cell.header;
+            if (std.mem.eql(u8, cell_name, "__class__")) class.class_cell = cell;
+        }
+        return true;
+    }
+
     fn setBinderException(self: *Runtime, err: anyerror, line: u32, column: u32) void {
         const message: []const u8 = if (err == error.TooManyPositional) "too many positional arguments" else if (err == error.MissingArgument) "missing required argument" else if (err == error.MultipleValues) "multiple values for an argument" else if (err == error.PositionalOnlyAsKeyword) "positional-only argument passed as a keyword" else if (err == error.UnexpectedKeyword) "unexpected keyword argument" else if (err == error.OutOfMemory) "session memory limit exceeded" else "invalid call arguments";
         const kind: PythonExceptionKind = if (err == error.OutOfMemory) .memory_error else .type_error;
@@ -4917,9 +5497,11 @@ pub const Runtime = struct {
     }
 
     fn findCell(self: *Runtime, name: []const u8) ?*functions.Cell {
-        const frame = self.top_frame orelse return null;
-        if (indexOfName(frame.code.cell_names, name)) |index| return frame.local_cells[index];
-        if (indexOfName(frame.code.free_names, name)) |index| return frame.free_cells[index];
+        var frame = self.top_frame;
+        while (frame) |active| : (frame = active.previous) {
+            if (indexOfName(active.code.cell_names, name)) |index| return active.local_cells[index];
+            if (indexOfName(active.code.free_names, name)) |index| return active.free_cells[index];
+        }
         return null;
     }
 
@@ -4948,6 +5530,44 @@ pub const Runtime = struct {
             },
         };
         if (value.tag() == .unbound or value.tag() == .deleted) {
+            if (frame.class_namespace) |class| {
+                if (class_module.ownClassAttribute(class, name)) |class_value| {
+                    self.setRegister(destination, class_value);
+                    return true;
+                }
+                if (self.globalValue(name)) |fallback| {
+                    self.setRegister(destination, fallback);
+                    return true;
+                }
+                if (std.mem.eql(u8, name, "object") or std.mem.eql(u8, name, "type")) {
+                    if (!self.ensureBuiltinClasses(line, column)) return false;
+                    const root = if (std.mem.eql(u8, name, "object")) self.object_class_root.object else self.type_class_root.object;
+                    self.setRegister(destination, Value.object(root orelse return self.engineFault()));
+                    return true;
+                }
+                if (self.builtinValue(name)) |fallback| {
+                    self.setRegister(destination, fallback);
+                    return true;
+                }
+                if (builtinNative(name)) |native| {
+                    return switch (functions.createNative(&self.heap, native)) {
+                        .value => |function| blk: {
+                            self.setRegister(destination, Value.object(&function.header));
+                            break :blk true;
+                        },
+                        .python_exception => |exception| blk: {
+                            self.setException(exception, line, column, null);
+                            break :blk false;
+                        },
+                    };
+                }
+                if (exceptions.builtinKind(name)) |exception_kind| {
+                    self.setRegister(destination, Value.exceptionClass(@intCast(@intFromEnum(exception_kind))));
+                    return true;
+                }
+                self.setException(.{ .kind = .name_error, .message = "name is not defined" }, line, column, name);
+                return false;
+            }
             const kind_error: PythonExceptionKind = if (kind == .free) .name_error else .unbound_local_error;
             self.setException(.{ .kind = kind_error, .message = "local variable is not bound" }, line, column, null);
             return false;
@@ -4956,7 +5576,7 @@ pub const Runtime = struct {
         return true;
     }
 
-    fn storeLocal(self: *Runtime, source: u16, name: []const u8, binding: u8) bool {
+    fn storeLocal(self: *Runtime, source: u16, name: []const u8, binding: u8, line: u32, column: u32) bool {
         const frame = self.top_frame orelse return self.engineFault();
         const kind: bytecode.LocalBinding = switch (binding) {
             0 => .local,
@@ -4968,6 +5588,12 @@ pub const Runtime = struct {
         switch (kind) {
             .local => {
                 const index = indexOfName(frame.code.local_names, name) orelse return self.engineFault();
+                if (frame.class_namespace) |class| {
+                    class_module.setClassAttribute(&self.heap, class, name, value) catch {
+                        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                        return false;
+                    };
+                }
                 frame.locals[index] = value;
                 frame.roots[frame.localRootStart() + index].object = value.asObject();
             },
@@ -5011,7 +5637,7 @@ pub const Runtime = struct {
             },
             .with_exit => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
-                return self.executeWithExit(self.registers[instruction.a()], line, column);
+                return self.executeWithExit(instruction.a(), self.registers[instruction.a()], line, column);
             },
             .try_else => {
                 const frame = self.top_frame orelse return self.engineFault();
@@ -5086,7 +5712,13 @@ pub const Runtime = struct {
             .load_global => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
                 const name = self.codeName(instruction.index32()) orelse return self.engineFault();
-                if (self.globalValue(name) orelse self.builtinValue(name)) |value| {
+                if (self.globalValue(name)) |value| {
+                    self.setRegister(instruction.a(), value);
+                } else if (std.mem.eql(u8, name, "object") or std.mem.eql(u8, name, "type")) {
+                    if (!self.ensureBuiltinClasses(line, column)) return false;
+                    const root = if (std.mem.eql(u8, name, "object")) self.object_class_root.object else self.type_class_root.object;
+                    self.setRegister(instruction.a(), Value.object(root orelse return self.engineFault()));
+                } else if (self.builtinValue(name)) |value| {
                     self.setRegister(instruction.a(), value);
                 } else if (builtinNative(name)) |native| {
                     switch (functions.createNative(&self.heap, native)) {
@@ -5119,7 +5751,7 @@ pub const Runtime = struct {
             .store_local => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
                 const name = self.codeName(instruction.index32()) orelse return self.engineFault();
-                if (!self.storeLocal(instruction.a(), name, instruction.flags())) return false;
+                if (!self.storeLocal(instruction.a(), name, instruction.flags(), line, column)) return false;
             },
             .move => {
                 if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
@@ -5162,13 +5794,16 @@ pub const Runtime = struct {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
                 const result = self.registers[instruction.a()];
                 const frame = self.top_frame orelse return self.engineFault();
-                return self.beginReturnTransfer(frame, result);
+                return self.beginReturnTransfer(frame, result, line, column);
             },
             .call => {
                 if (!self.validRegister(instruction.a()) or !self.executeCall(instruction, line, column)) return false;
             },
             .make_function => {
                 if (!self.validRegister(instruction.a()) or !self.executeMakeFunction(instruction, line, column)) return false;
+            },
+            .make_class => {
+                if (!self.validRegister(instruction.a()) or !self.executeMakeClass(instruction, line, column)) return false;
             },
             .make_sequence => return self.executeMakeSequence(instruction, line, column),
             .list_append_value => {
@@ -5215,6 +5850,8 @@ pub const Runtime = struct {
             },
             .make_slice => return self.executeMakeSlice(instruction, line, column),
             .get_attribute => return self.executeGetAttribute(instruction, line, column),
+            .set_attribute => return self.executeSetAttribute(instruction, line, column),
+            .delete_attribute => return self.executeDeleteAttribute(instruction, line, column),
             .get_item => return self.executeGetItem(instruction, line, column),
             .set_item => return self.executeSetItem(instruction, line, column),
             .delete_item => return self.executeDeleteItem(instruction, line, column),
@@ -5281,14 +5918,7 @@ pub const Runtime = struct {
             },
             .get_iterator => {
                 if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
-                switch (iterator.createIterator(&self.heap, self.registers[instruction.b()])) {
-                    .value => |result| self.setRegister(instruction.a(), Value.object(&result.header)),
-                    .python_exception => |exception| {
-                        self.setException(exception, line, column, null);
-                        return false;
-                    },
-                    .engine_error => return self.engineFault(),
-                }
+                return self.storeIteratorOutcome(instruction.a(), self.createVmIterator(self.registers[instruction.b()], line, column), line, column);
             },
             .for_next => {
                 if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b()) or !self.validRegister(instruction.c())) return self.engineFault();
@@ -5488,6 +6118,44 @@ pub const Runtime = struct {
     }
 
     fn pythonHash(self: *Runtime, value: Value, line: u32, column: u32) ?u64 {
+        if (value.asObject()) |header| if (class_module.instanceFromHeader(header)) |instance| {
+            if (class_module.ownClassAttribute(instance.class, "__eq__") != null and
+                class_module.ownClassAttribute(instance.class, "__hash__") == null)
+            {
+                self.setException(.{ .kind = .type_error, .message = "unhashable type: 'instance'" }, line, column, null);
+                return null;
+            }
+            if (class_module.classAttribute(instance.class, "__hash__")) |hash_method| {
+                if (hash_method.tag() == .none) {
+                    self.setException(.{ .kind = .type_error, .message = "unhashable type: 'instance'" }, line, column, null);
+                    return null;
+                }
+                const result = self.invokeValueSync(hash_method, &.{value}, line, column) orelse return null;
+                if (!number.isIntegerValue(result)) {
+                    self.setException(.{ .kind = .type_error, .message = "__hash__ method should return an integer" }, line, column, null);
+                    return null;
+                }
+                if (number.toInt(i64, result)) |signed_hash| {
+                    const normalized_hash = if (signed_hash == -1) @as(i64, -2) else signed_hash;
+                    return @bitCast(normalized_hash);
+                }
+                return switch (hash_module.pythonHash(&self.heap, result, self.hash_seed)) {
+                    .value => |hash_value| hash_value,
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk null;
+                    },
+                    .engine_error => blk: {
+                        _ = self.engineFault();
+                        break :blk null;
+                    },
+                };
+            }
+            if (class_module.classAttribute(instance.class, "__eq__") != null) {
+                self.setException(.{ .kind = .type_error, .message = "unhashable type: 'instance'" }, line, column, null);
+                return null;
+            }
+        };
         return switch (hash_module.pythonHash(&self.heap, value, self.hash_seed)) {
             .value => |value_hash| value_hash,
             .python_exception => |exception| blk: {
@@ -5559,6 +6227,204 @@ pub const Runtime = struct {
         };
     }
 
+    fn lookupAttributeValue(self: *Runtime, receiver: Value, name: []const u8, line: u32, column: u32) ?Value {
+        const header = receiver.asObject() orelse return null;
+        if (file_module.fromHeader(header)) |file| {
+            if (std.mem.eql(u8, name, "closed")) return if (file.closed) Value.trueValue() else Value.falseValue();
+            if (std.mem.eql(u8, name, "name")) return self.stringValueResult(string.create(&self.heap, file.path), line, column);
+            if (std.mem.eql(u8, name, "mode")) return self.stringValueResult(string.create(&self.heap, file.mode_text), line, column);
+            if (std.mem.eql(u8, name, "encoding")) {
+                if (file.mode.binary) return Value.noneValue();
+                return self.stringValueResult(string.create(&self.heap, "UTF-8"), line, column);
+            }
+        }
+        if (class_module.superFromHeader(header)) |super_value| {
+            const attribute = class_module.superClassAttribute(super_value.owner_class, super_value.start_class, name) orelse return null;
+            if (attribute.asObject()) |attribute_header| {
+                if (class_module.descriptorFromHeader(attribute_header)) |descriptor| {
+                    if (descriptor.kind == .property) {
+                        if (descriptor.getter.tag() == .none) {
+                            _ = self.nativeAttributeError(line, column, "unreadable attribute");
+                            return null;
+                        }
+                        return self.invokeValueSync(descriptor.getter, &.{super_value.instance}, line, column);
+                    }
+                    if (descriptor.kind == .classmethod) return switch (class_module.createBoundMethod(&self.heap, descriptor.callable, Value.object(&super_value.owner_class.header))) {
+                        .value => |method| Value.object(&method.header),
+                        .python_exception => |exception| blk: {
+                            self.setException(exception, line, column, null);
+                            break :blk null;
+                        },
+                        .engine_error => blk: {
+                            _ = self.engineFault();
+                            break :blk null;
+                        },
+                    };
+                    if (descriptor.kind == .staticmethod) return descriptor.callable;
+                }
+                if (functions.functionFromHeader(attribute_header) != null) return switch (class_module.createBoundMethod(&self.heap, attribute, super_value.instance)) {
+                    .value => |method| Value.object(&method.header),
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk null;
+                    },
+                    .engine_error => blk: {
+                        _ = self.engineFault();
+                        break :blk null;
+                    },
+                };
+            }
+            return attribute;
+        }
+        if (class_module.instanceFromHeader(header)) |instance| {
+            if (std.mem.eql(u8, name, "__class__")) return Value.object(&instance.class.header);
+            if (class_module.classAttribute(instance.class, name)) |attribute| if (attribute.asObject()) |attribute_header| if (class_module.descriptorFromHeader(attribute_header)) |descriptor| {
+                if (descriptor.kind == .property) {
+                    if (descriptor.getter.tag() == .none) {
+                        _ = self.nativeAttributeError(line, column, "unreadable attribute");
+                        return null;
+                    }
+                    return self.invokeValueSync(descriptor.getter, &.{receiver}, line, column);
+                }
+            };
+            if (class_module.instanceAttribute(instance, name)) |value| return value;
+            if (class_module.classAttribute(instance.class, name)) |attribute| {
+                if (attribute.asObject()) |attribute_header| {
+                    if (class_module.descriptorFromHeader(attribute_header)) |descriptor| switch (descriptor.kind) {
+                        .property => {
+                            if (descriptor.getter.tag() == .none) {
+                                _ = self.nativeAttributeError(line, column, "unreadable attribute");
+                                return null;
+                            }
+                            return self.invokeValueSync(descriptor.getter, &.{receiver}, line, column);
+                        },
+                        .staticmethod => return descriptor.callable,
+                        .classmethod => return switch (class_module.createBoundMethod(&self.heap, descriptor.callable, Value.object(&instance.class.header))) {
+                            .value => |method| Value.object(&method.header),
+                            .python_exception => |exception| blk: {
+                                self.setException(exception, line, column, null);
+                                break :blk null;
+                            },
+                            .engine_error => blk: {
+                                _ = self.engineFault();
+                                break :blk null;
+                            },
+                        },
+                    };
+                    if (class_module.classFromHeader(attribute_header) != null) return attribute;
+                    if (functions.functionFromHeader(attribute_header) != null) return switch (class_module.createBoundMethod(&self.heap, attribute, receiver)) {
+                        .value => |method| Value.object(&method.header),
+                        .python_exception => |exception| blk: {
+                            self.setException(exception, line, column, null);
+                            break :blk null;
+                        },
+                        .engine_error => blk: {
+                            _ = self.engineFault();
+                            break :blk null;
+                        },
+                    };
+                }
+                return attribute;
+            }
+            return null;
+        }
+        if (class_module.classFromHeader(header)) |class| {
+            if (std.mem.eql(u8, name, "__name__")) return switch (string.create(&self.heap, class.name)) {
+                .value => |text| Value.object(&text.header),
+                .python_exception => |exception| blk: {
+                    self.setException(exception, line, column, null);
+                    break :blk null;
+                },
+                .engine_error => blk: {
+                    _ = self.engineFault();
+                    break :blk null;
+                },
+            };
+            if (class_module.classAttribute(class, name)) |attribute| {
+                if (attribute.asObject()) |attribute_header| if (class_module.descriptorFromHeader(attribute_header)) |descriptor| {
+                    if (descriptor.kind == .classmethod) return switch (class_module.createBoundMethod(&self.heap, descriptor.callable, receiver)) {
+                        .value => |method| Value.object(&method.header),
+                        .python_exception => |exception| blk: {
+                            self.setException(exception, line, column, null);
+                            break :blk null;
+                        },
+                        .engine_error => blk: {
+                            _ = self.engineFault();
+                            break :blk null;
+                        },
+                    };
+                    if (descriptor.kind == .staticmethod) return descriptor.callable;
+                };
+                return attribute;
+            }
+            return null;
+        }
+        if (class_module.descriptorFromHeader(header)) |descriptor| if (descriptor.kind == .property) {
+            const native: ?functions.Native = if (std.mem.eql(u8, name, "setter")) .descriptor_setter else if (std.mem.eql(u8, name, "deleter")) .descriptor_deleter else null;
+            if (native) |kind| return switch (functions.createBoundNative(&self.heap, kind, receiver)) {
+                .value => |function| Value.object(&function.header),
+                .python_exception => |exception| blk: {
+                    self.setException(exception, line, column, null);
+                    break :blk null;
+                },
+            };
+        };
+        if (attributeNative(receiver, name)) |native| return switch (functions.createBoundNative(&self.heap, native, receiver)) {
+            .value => |function| Value.object(&function.header),
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk null;
+            },
+        };
+        return null;
+    }
+
+    fn setUserAttribute(self: *Runtime, receiver: Value, name: []const u8, value: Value, line: u32, column: u32) bool {
+        const header = receiver.asObject() orelse return self.nativeAttributeError(line, column, "attribute assignment requires an object");
+        if (class_module.instanceFromHeader(header)) |instance| {
+            if (class_module.classAttribute(instance.class, name)) |class_value| if (class_value.asObject()) |class_header| if (class_module.descriptorFromHeader(class_header)) |descriptor| {
+                if (descriptor.kind == .property) {
+                    if (descriptor.setter.tag() == .none) return self.nativeAttributeError(line, column, "property has no setter");
+                    _ = self.invokeValueSync(descriptor.setter, &.{ receiver, value }, line, column) orelse return false;
+                    return true;
+                }
+            };
+            class_module.setInstanceAttribute(&self.heap, instance, name, value) catch {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            };
+            return true;
+        }
+        if (class_module.classFromHeader(header)) |class| {
+            class_module.setClassAttribute(&self.heap, class, name, value) catch {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            };
+            return true;
+        }
+        return self.nativeAttributeError(line, column, "object has no writable attributes");
+    }
+
+    fn deleteUserAttribute(self: *Runtime, receiver: Value, name: []const u8, line: u32, column: u32) bool {
+        const header = receiver.asObject() orelse return self.nativeAttributeError(line, column, "attribute deletion requires an object");
+        if (class_module.instanceFromHeader(header)) |instance| {
+            if (class_module.classAttribute(instance.class, name)) |class_value| if (class_value.asObject()) |class_header| if (class_module.descriptorFromHeader(class_header)) |descriptor| {
+                if (descriptor.kind == .property) {
+                    if (descriptor.deleter.tag() == .none) return self.nativeAttributeError(line, column, "property has no deleter");
+                    _ = self.invokeValueSync(descriptor.deleter, &.{receiver}, line, column) orelse return false;
+                    return true;
+                }
+            };
+            if (class_module.deleteInstanceAttribute(&self.heap, instance, name)) return true;
+            return self.nativeAttributeError(line, column, "object has no such attribute");
+        }
+        if (class_module.classFromHeader(header)) |class| {
+            if (class_module.deleteClassAttribute(&self.heap, class, name)) return true;
+            return self.nativeAttributeError(line, column, "type has no such attribute");
+        }
+        return self.nativeAttributeError(line, column, "object has no deletable attributes");
+    }
+
     fn executeGetAttribute(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
         if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
         const name = self.codeName(instruction.c()) orelse return self.engineFault();
@@ -5578,6 +6444,90 @@ pub const Runtime = struct {
                 return self.storeStringResult(instruction.a(), string.create(&self.heap, "UTF-8"), line, column);
             }
         };
+        if (receiver.asObject()) |user_header| {
+            if (class_module.superFromHeader(user_header)) |super_value| {
+                const attribute = class_module.superClassAttribute(super_value.owner_class, super_value.start_class, name) orelse {
+                    return self.nativeAttributeError(line, column, "super object has no such attribute");
+                };
+                if (attribute.asObject()) |attribute_header| {
+                    if (class_module.descriptorFromHeader(attribute_header)) |descriptor| {
+                        if (descriptor.kind == .property) {
+                            if (descriptor.getter.tag() == .none) return self.nativeAttributeError(line, column, "unreadable attribute");
+                            const result = self.invokeValueSync(descriptor.getter, &.{super_value.instance}, line, column) orelse return false;
+                            self.setRegister(instruction.a(), result);
+                            return true;
+                        }
+                        if (descriptor.kind == .classmethod) return self.createBoundMethodResult(instruction.a(), descriptor.callable, Value.object(&super_value.owner_class.header), line, column);
+                        if (descriptor.kind == .staticmethod) {
+                            self.setRegister(instruction.a(), descriptor.callable);
+                            return true;
+                        }
+                    }
+                    if (functions.functionFromHeader(attribute_header) != null) return self.createBoundMethodResult(instruction.a(), attribute, super_value.instance, line, column);
+                }
+                self.setRegister(instruction.a(), attribute);
+                return true;
+            }
+            if (class_module.instanceFromHeader(user_header)) |instance| {
+                if (std.mem.eql(u8, name, "__class__")) {
+                    self.setRegister(instruction.a(), Value.object(&instance.class.header));
+                    return true;
+                }
+                if (class_module.classAttribute(instance.class, name)) |attribute| if (attribute.asObject()) |attribute_header| if (class_module.descriptorFromHeader(attribute_header)) |descriptor| {
+                    if (descriptor.kind == .property) {
+                        if (descriptor.getter.tag() == .none) return self.nativeAttributeError(line, column, "unreadable attribute");
+                        const arguments = [_]Value{receiver};
+                        const result = self.invokeValueSync(descriptor.getter, &arguments, line, column) orelse return false;
+                        self.setRegister(instruction.a(), result);
+                        return true;
+                    }
+                };
+                if (class_module.instanceAttribute(instance, name)) |own| {
+                    self.setRegister(instruction.a(), own);
+                    return true;
+                }
+                if (class_module.classAttribute(instance.class, name)) |attribute| {
+                    if (attribute.asObject()) |attribute_header| {
+                        if (class_module.descriptorFromHeader(attribute_header)) |descriptor| {
+                            switch (descriptor.kind) {
+                                .property => {
+                                    if (descriptor.getter.tag() == .none) return self.nativeAttributeError(line, column, "unreadable attribute");
+                                    const arguments = [_]Value{receiver};
+                                    const result = self.invokeValueSync(descriptor.getter, &arguments, line, column) orelse return false;
+                                    self.setRegister(instruction.a(), result);
+                                    return true;
+                                },
+                                .staticmethod => {
+                                    self.setRegister(instruction.a(), descriptor.callable);
+                                    return true;
+                                },
+                                .classmethod => return self.createBoundMethodResult(instruction.a(), descriptor.callable, Value.object(&instance.class.header), line, column),
+                            }
+                        }
+                        if (class_module.classFromHeader(attribute_header) != null) {
+                            self.setRegister(instruction.a(), attribute);
+                            return true;
+                        }
+                        if (functions.functionFromHeader(attribute_header) != null) return self.createBoundMethodResult(instruction.a(), attribute, receiver, line, column);
+                    }
+                    self.setRegister(instruction.a(), attribute);
+                    return true;
+                }
+            } else if (class_module.classFromHeader(user_header)) |class| {
+                if (std.mem.eql(u8, name, "__name__")) return self.storeStringResult(instruction.a(), string.create(&self.heap, class.name), line, column);
+                if (class_module.classAttribute(class, name)) |attribute| {
+                    if (attribute.asObject()) |attribute_header| if (class_module.descriptorFromHeader(attribute_header)) |descriptor| {
+                        if (descriptor.kind == .classmethod) return self.createBoundMethodResult(instruction.a(), descriptor.callable, receiver, line, column);
+                        if (descriptor.kind == .staticmethod) {
+                            self.setRegister(instruction.a(), descriptor.callable);
+                            return true;
+                        }
+                    };
+                    self.setRegister(instruction.a(), attribute);
+                    return true;
+                }
+            }
+        }
         const native = attributeNative(receiver, name) orelse {
             self.setException(.{ .kind = .attribute_error, .message = "object has no such attribute" }, line, column, null);
             return false;
@@ -5589,6 +6539,76 @@ pub const Runtime = struct {
                 return false;
             },
         }
+        return true;
+    }
+
+    fn createBoundMethodResult(self: *Runtime, destination: u16, callable: Value, receiver: Value, line: u32, column: u32) bool {
+        return switch (class_module.createBoundMethod(&self.heap, callable, receiver)) {
+            .value => |method| blk: {
+                self.setRegister(destination, Value.object(&method.header));
+                break :blk true;
+            },
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk false;
+            },
+            .engine_error => self.engineFault(),
+        };
+    }
+
+    fn executeSetAttribute(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
+        const name = self.codeName(instruction.c()) orelse return self.engineFault();
+        const receiver = self.registers[instruction.a()];
+        const value = self.registers[instruction.b()];
+        const header = receiver.asObject() orelse return self.nativeAttributeError(line, column, "attribute assignment requires an object");
+        if (class_module.instanceFromHeader(header)) |instance| {
+            if (class_module.classAttribute(instance.class, name)) |class_value| if (class_value.asObject()) |class_header| if (class_module.descriptorFromHeader(class_header)) |descriptor| {
+                if (descriptor.kind == .property) {
+                    if (descriptor.setter.tag() == .none) return self.nativeAttributeError(line, column, "property has no setter");
+                    const arguments = [_]Value{ receiver, value };
+                    _ = self.invokeValueSync(descriptor.setter, &arguments, line, column) orelse return false;
+                    return true;
+                }
+            };
+            class_module.setInstanceAttribute(&self.heap, instance, name, value) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            };
+            return true;
+        }
+        if (class_module.classFromHeader(header)) |class| {
+            class_module.setClassAttribute(&self.heap, class, name, value) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            };
+            return true;
+        }
+        return self.nativeAttributeError(line, column, "object does not allow attribute assignment");
+    }
+
+    fn executeDeleteAttribute(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        if (!self.validRegister(instruction.a())) return self.engineFault();
+        const name = self.codeName(instruction.c()) orelse return self.engineFault();
+        const receiver = self.registers[instruction.a()];
+        const header = receiver.asObject() orelse return self.nativeAttributeError(line, column, "attribute deletion requires an object");
+        if (class_module.instanceFromHeader(header)) |instance| {
+            if (class_module.classAttribute(instance.class, name)) |class_value| if (class_value.asObject()) |class_header| if (class_module.descriptorFromHeader(class_header)) |descriptor| {
+                if (descriptor.kind == .property) {
+                    if (descriptor.deleter.tag() == .none) return self.nativeAttributeError(line, column, "property has no deleter");
+                    const arguments = [_]Value{receiver};
+                    _ = self.invokeValueSync(descriptor.deleter, &arguments, line, column) orelse return false;
+                    return true;
+                }
+            };
+        }
+        const deleted = if (class_module.instanceFromHeader(header)) |instance|
+            class_module.deleteInstanceAttribute(&self.heap, instance, name)
+        else if (class_module.classFromHeader(header)) |class|
+            class_module.deleteClassAttribute(&self.heap, class, name)
+        else
+            return self.nativeAttributeError(line, column, "object does not allow attribute deletion");
+        if (!deleted) return self.nativeAttributeError(line, column, "attribute does not exist");
         return true;
     }
 
@@ -5649,6 +6669,15 @@ pub const Runtime = struct {
                 },
                 .failed => self.last_exception == null and self.engineFault(),
             };
+        }
+        if (class_module.instanceFromHeader(header) != null) {
+            const arguments = [_]Value{index_value};
+            const result = self.invokeSpecialSync(container, "__getitem__", &arguments, line, column) orelse {
+                if (self.last_exception == null) return self.nativeTypeError(line, column, "object is not subscriptable");
+                return false;
+            };
+            self.setRegister(instruction.a(), result);
+            return true;
         }
         self.setException(.{ .kind = .type_error, .message = "object is not subscriptable" }, line, column, null);
         return false;
@@ -5799,6 +6828,20 @@ pub const Runtime = struct {
         };
     }
 
+    fn stringValueResult(self: *Runtime, result: string.StringResult, line: u32, column: u32) ?Value {
+        return switch (result) {
+            .value => |text| Value.object(&text.header),
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk null;
+            },
+            .engine_error => blk: {
+                _ = self.engineFault();
+                break :blk null;
+            },
+        };
+    }
+
     fn storeBytesResult(self: *Runtime, destination: u16, result: byte_module.BytesResult, line: u32, column: u32) bool {
         return switch (result) {
             .value => |data| blk: {
@@ -5822,6 +6865,12 @@ pub const Runtime = struct {
         if (dict_module.dictFromHeader(container)) |mapping| {
             if (mapping.is_set) return self.nativeTypeError(line, column, "'set' object does not support item assignment");
             return self.setMappingValue(mapping, self.registers[instruction.c()], self.registers[instruction.a()], line, column);
+        }
+        if (class_module.instanceFromHeader(container) != null) {
+            const arguments = [_]Value{ self.registers[instruction.c()], self.registers[instruction.a()] };
+            if (self.invokeSpecialSync(self.registers[instruction.b()], "__setitem__", &arguments, line, column)) |_| return true;
+            if (self.last_exception == null) return self.nativeTypeError(line, column, "object does not support item assignment");
+            return false;
         }
         const list = sequence.listFromHeader(container) orelse {
             self.setException(.{ .kind = .type_error, .message = "object does not support item assignment" }, line, column, null);
@@ -5861,6 +6910,12 @@ pub const Runtime = struct {
                 .failed => self.last_exception == null and self.engineFault(),
             };
         }
+        if (class_module.instanceFromHeader(container) != null) {
+            const arguments = [_]Value{self.registers[instruction.c()]};
+            if (self.invokeSpecialSync(self.registers[instruction.b()], "__delitem__", &arguments, line, column)) |_| return true;
+            if (self.last_exception == null) return self.nativeTypeError(line, column, "object does not support item deletion");
+            return false;
+        }
         const list = sequence.listFromHeader(container) orelse {
             self.setException(.{ .kind = .type_error, .message = "object does not support item deletion" }, line, column, null);
             return false;
@@ -5881,6 +6936,16 @@ pub const Runtime = struct {
 
     fn executeDeleteLocal(self: *Runtime, name: []const u8, binding: u8, line: u32, column: u32) bool {
         const frame = self.top_frame orelse return self.engineFault();
+        if (frame.class_namespace) |class| {
+            const index = indexOfName(frame.code.local_names, name) orelse return self.engineFault();
+            if (!class_module.deleteClassAttribute(&self.heap, class, name)) {
+                self.setException(.{ .kind = .name_error, .message = "name is not defined" }, line, column, name);
+                return false;
+            }
+            frame.locals[index] = Value.deletedValue();
+            frame.roots[frame.localRootStart() + index].object = null;
+            return true;
+        }
         const kind: bytecode.LocalBinding = switch (binding) {
             0 => .local,
             1 => .cell,
@@ -6060,7 +7125,79 @@ pub const Runtime = struct {
         return true;
     }
 
+    fn rightReflectedHasPriority(self: *Runtime, left: Value, right: Value, reflected_name: []const u8) bool {
+        _ = self;
+        const left_header = left.asObject() orelse return false;
+        const right_header = right.asObject() orelse return false;
+        const left_instance = class_module.instanceFromHeader(left_header) orelse return false;
+        const right_instance = class_module.instanceFromHeader(right_header) orelse return false;
+        if (left_instance.class == right_instance.class or !mroContains(right_instance.class, left_instance.class)) return false;
+        const right_reflected = class_module.classAttribute(right_instance.class, reflected_name) orelse return false;
+        const left_reflected = class_module.classAttribute(left_instance.class, reflected_name) orelse return true;
+        return !left_reflected.identical(right_reflected);
+    }
+
     fn executeBinary(self: *Runtime, destination: u16, left: Value, right: Value, operation: u8, line: u32, column: u32) bool {
+        const left_method: ?[]const u8 = switch (operation) {
+            0 => "__add__",
+            1 => "__sub__",
+            2 => "__mul__",
+            3 => "__truediv__",
+            4 => "__floordiv__",
+            5 => "__mod__",
+            6 => "__pow__",
+            7 => "__and__",
+            8 => "__or__",
+            9 => "__xor__",
+            10 => "__lshift__",
+            11 => "__rshift__",
+            else => null,
+        };
+        const right_method: ?[]const u8 = switch (operation) {
+            0 => "__radd__",
+            1 => "__rsub__",
+            2 => "__rmul__",
+            3 => "__rtruediv__",
+            4 => "__rfloordiv__",
+            5 => "__rmod__",
+            6 => "__rpow__",
+            7 => "__rand__",
+            8 => "__ror__",
+            9 => "__rxor__",
+            10 => "__rlshift__",
+            11 => "__rrshift__",
+            else => null,
+        };
+        var right_reflected_tried = false;
+        if (right_method) |method| {
+            if (self.rightReflectedHasPriority(left, right, method)) {
+                right_reflected_tried = true;
+                if (self.invokeSpecialSync(right, method, &.{left}, line, column)) |result| {
+                    if (result.asExceptionClass() == null or result.asExceptionClass().? != std.math.maxInt(u8)) {
+                        self.setRegister(destination, result);
+                        return true;
+                    }
+                } else if (self.last_exception != null) return false;
+            }
+        }
+        if (left_method) |method| {
+            if (self.invokeSpecialSync(left, method, &.{right}, line, column)) |result| {
+                if (result.asExceptionClass() == null or result.asExceptionClass().? != std.math.maxInt(u8)) {
+                    self.setRegister(destination, result);
+                    return true;
+                }
+            } else if (self.last_exception != null) return false;
+        }
+        if (right_method) |method| {
+            if (!right_reflected_tried) {
+                if (self.invokeSpecialSync(right, method, &.{left}, line, column)) |result| {
+                    if (result.asExceptionClass() == null or result.asExceptionClass().? != std.math.maxInt(u8)) {
+                        self.setRegister(destination, result);
+                        return true;
+                    }
+                } else if (self.last_exception != null) return false;
+            }
+        }
         if (operation == 5) if (left.asObject()) |header| if (string.fromHeader(header)) |template| return self.executePercentFormat(destination, template, right, line, column);
         if (operation == 1 or operation == 7 or operation == 8) {
             const left_header = left.asObject() orelse null;
@@ -6286,11 +7423,17 @@ pub const Runtime = struct {
         if (value.tag() == .none) return self.appendOutput("None");
         if (value.asBool()) |boolean| return self.appendOutput(if (boolean) "True" else "False");
         if (value.asExceptionClass()) |class_index| {
+            if (class_index == std.math.maxInt(u8)) return self.appendOutput("NotImplemented");
             if (class_index >= exceptions.allKinds.len) return self.engineFault();
             return self.appendFormatted("<class '{s}'>", .{exceptions.exceptionName(exceptions.allKinds[class_index])});
         }
         if (value.asSmallInt()) |integer| return self.appendFormatted("{d}", .{integer});
-        if (value.asFloat()) |float_value| return self.appendFormatted("{d}", .{float_value});
+        if (value.asFloat()) |float_value| {
+            if (std.math.isFinite(float_value) and @trunc(float_value) == float_value) {
+                return self.appendFormatted("{d}.0", .{float_value});
+            }
+            return self.appendFormatted("{d}", .{float_value});
+        }
         if (number.formatInteger(&self.heap, value)) |formatted| {
             return switch (formatted) {
                 .value => |bytes| blk: {
@@ -6324,6 +7467,23 @@ pub const Runtime = struct {
             if (dict_module.viewFromHeader(header)) |view| return self.appendMappingView(header, view, line, column);
             if (iterator.rangeFromHeader(header)) |range| return self.appendRange(range, line, column);
             if (file_module.fromHeader(header)) |file| return self.appendFormatted("<_io.File name={s} mode={s}>", .{ file.path, file.mode_text });
+            if (class_module.instanceFromHeader(header)) |instance| {
+                const method_name = if (nested or class_module.classAttribute(instance.class, "__str__") == null) "__repr__" else "__str__";
+                if (self.invokeSpecialSync(value, method_name, &.{}, line, column)) |representation| {
+                    const representation_header = representation.asObject() orelse {
+                        self.setException(.{ .kind = .type_error, .message = "__repr__ returned non-string" }, line, column, null);
+                        return false;
+                    };
+                    const text = string.fromHeader(representation_header) orelse {
+                        self.setException(.{ .kind = .type_error, .message = "__repr__ returned non-string" }, line, column, null);
+                        return false;
+                    };
+                    return self.appendOutput(string.content(text));
+                }
+                if (self.last_exception != null) return false;
+                return self.appendFormatted("<{s} object at 0x{x}>", .{ instance.class.name, @intFromPtr(header) });
+            }
+            if (class_module.classFromHeader(header)) |class| return self.appendFormatted("<class '{s}'>", .{class.name});
             self.setException(.{ .kind = .type_error, .message = "object has no printable representation" }, line, column, null);
             return false;
         }
@@ -6473,6 +7633,36 @@ pub const Runtime = struct {
         if (value.asFloat()) |float_value| return float_value != 0;
         if (number.isIntegerValue(value)) return !number.isZeroValue(value);
         if (value.asObject()) |header| {
+            if (class_module.instanceFromHeader(header)) |instance| {
+                if (class_module.classAttribute(instance.class, "__bool__") != null) {
+                    const result = self.invokeSpecialSync(value, "__bool__", &.{}, line, column) orelse return null;
+                    if (result.asBool()) |boolean| return boolean;
+                    self.setException(.{ .kind = .type_error, .message = "__bool__ should return bool" }, line, column, null);
+                    return null;
+                }
+                if (class_module.classAttribute(instance.class, "__len__") != null) {
+                    const result = self.invokeSpecialSync(value, "__len__", &.{}, line, column) orelse return null;
+                    if (!number.isIntegerValue(result)) {
+                        self.setException(.{ .kind = .type_error, .message = "'__len__' should return an integer" }, line, column, null);
+                        return null;
+                    }
+                    return switch (number.compare(result, Value.fromSmallInt(0).?)) {
+                        .value => |order| if (order == .less) blk: {
+                            self.setException(.{ .kind = .value_error, .message = "__len__() should return >= 0" }, line, column, null);
+                            break :blk null;
+                        } else !number.isZeroValue(result),
+                        .python_exception => |exception| blk: {
+                            self.setException(exception, line, column, null);
+                            break :blk null;
+                        },
+                        .engine_error => blk: {
+                            _ = self.engineFault();
+                            break :blk null;
+                        },
+                    };
+                }
+                return true;
+            }
             if (sequence.length(value)) |count| return count != 0;
             if (string.fromHeader(header)) |text| return text.data.len != 0;
             if (byte_module.fromHeader(header)) |data| return data.data.len != 0;
@@ -6523,6 +7713,35 @@ pub const Runtime = struct {
         if (operation == 8 or operation == 9) {
             const contained = self.containsValue(left, right, line, column) orelse return null;
             return if (operation == 8) contained else !contained;
+        }
+
+        const left_is_user = if (left.asObject()) |header| class_module.instanceFromHeader(header) != null else false;
+        const right_is_user = if (right.asObject()) |header| class_module.instanceFromHeader(header) != null else false;
+        if (operation <= 5 and (left_is_user or right_is_user)) {
+            const left_name: []const u8 = switch (operation) {
+                0 => "__eq__",
+                1 => "__ne__",
+                2 => "__lt__",
+                3 => "__le__",
+                4 => "__gt__",
+                5 => "__ge__",
+                else => unreachable,
+            };
+            const right_name: []const u8 = switch (operation) {
+                2 => "__gt__",
+                3 => "__ge__",
+                4 => "__lt__",
+                5 => "__le__",
+                else => left_name,
+            };
+            const args = [_]Value{right};
+            if (self.invokeSpecialSync(left, left_name, &args, line, column)) |result| {
+                if (result.asExceptionClass() == null or result.asExceptionClass().? != std.math.maxInt(u8)) return self.valueTruthy(result, line, column);
+            } else if (self.last_exception != null) return null;
+            if (self.invokeSpecialSync(right, right_name, &.{left}, line, column)) |result| {
+                if (result.asExceptionClass() == null or result.asExceptionClass().? != std.math.maxInt(u8)) return self.valueTruthy(result, line, column);
+            } else if (self.last_exception != null) return null;
+            if (operation == 0 or operation == 1) return if (operation == 0) left.identical(right) else !left.identical(right);
         }
 
         if (operation == 0 or operation == 1) {
@@ -6593,6 +7812,11 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .type_error, .message = "argument of type is not iterable" }, line, column, null);
             return null;
         };
+        if (class_module.instanceFromHeader(header) != null) {
+            const args = [_]Value{item};
+            if (self.invokeSpecialSync(container, "__contains__", &args, line, column)) |result| return self.valueTruthy(result, line, column);
+            if (self.last_exception != null) return null;
+        }
         if (dict_module.dictFromHeader(header)) |mapping| return self.mappingContains(mapping, item, line, column);
         if (dict_module.viewFromHeader(header)) |view| {
             const mapping_iterator = switch (dict_module.createIterator(&self.heap, view.owner, view.kind)) {
@@ -6681,8 +7905,66 @@ pub const Runtime = struct {
             }
             return std.mem.indexOfScalar(u8, data.data, @intCast(needle)) != null;
         }
+        if (class_module.instanceFromHeader(header) != null) return self.containsUserIterable(item, container, line, column);
         self.setException(.{ .kind = .type_error, .message = "object is not a supported container" }, line, column, null);
         return null;
+    }
+
+    fn containsUserIterable(self: *Runtime, item: Value, container: Value, line: u32, column: u32) ?bool {
+        const selected = switch (self.createVmIterator(container, line, column)) {
+            .value => |iterator_value| iterator_value,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return null;
+            },
+            .engine_error => {
+                _ = self.engineFault();
+                return null;
+            },
+        };
+        var root = gc.Root{ .object = &selected.header };
+        var needle_root = gc.Root{ .object = item.asObject() };
+        var candidate_root = gc.Root{ .object = null };
+        var roots = gc.RootFrame{};
+        roots.push(&self.heap.roots);
+        roots.add(&root);
+        roots.add(&needle_root);
+        roots.add(&candidate_root);
+        defer roots.pop();
+        const caller = self.top_frame orelse {
+            _ = self.engineFault();
+            return null;
+        };
+        if (caller.code.register_count == 0) {
+            _ = self.engineFault();
+            return null;
+        }
+        const scratch: u16 = @intCast(caller.code.register_count - 1);
+        const owns_work_budget = self.beginSynchronousWork();
+        defer self.endSynchronousWork(owns_work_budget);
+        while (true) {
+            if (!self.chargeSynchronousWork(line, column)) return null;
+            switch (self.nextIteratorValue(selected, scratch, line, column)) {
+                .item => |candidate| {
+                    candidate_root.object = candidate.asObject();
+                    const equal = self.valuesEqual(candidate, item, line, column) orelse return null;
+                    if (equal) return true;
+                },
+                .done => return false,
+                .suspended => {
+                    self.setException(.{ .kind = .runtime_error, .message = "iterator suspended during membership test" }, line, column, null);
+                    return null;
+                },
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return null;
+                },
+                .engine_error => {
+                    _ = self.engineFault();
+                    return null;
+                },
+            }
+        }
     }
 
     fn appendFormatted(self: *Runtime, comptime format: []const u8, arguments: anytype) bool {
@@ -6728,7 +8010,41 @@ pub const Runtime = struct {
         if (std.mem.eql(u8, name, "print")) return if (self.print_builtin_root.object) |header| Value.object(header) else null;
         if (std.mem.eql(u8, name, "input")) return if (self.input_builtin_root.object) |header| Value.object(header) else null;
         if (std.mem.eql(u8, name, "range")) return if (self.range_builtin_root.object) |header| Value.object(header) else null;
+        if (std.mem.eql(u8, name, "object")) return if (self.object_class_root.object) |header| Value.object(header) else null;
+        if (std.mem.eql(u8, name, "type")) return if (self.type_class_root.object) |header| Value.object(header) else null;
+        if (std.mem.eql(u8, name, "NotImplemented")) return Value.exceptionClass(std.math.maxInt(u8));
         return null;
+    }
+
+    fn ensureBuiltinClasses(self: *Runtime, line: u32, column: u32) bool {
+        if (self.object_class_root.object == null) {
+            switch (class_module.createRootClass(&self.heap)) {
+                .value => |object_class| self.object_class_root.object = &object_class.header,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            }
+        }
+        if (self.type_class_root.object == null) {
+            const object_header = self.object_class_root.object orelse return self.engineFault();
+            const object_class = class_module.classFromHeader(object_header) orelse return self.engineFault();
+            switch (class_module.createClass(&self.heap, "type", &.{object_class}, object_class)) {
+                .value => |type_class| self.type_class_root.object = &type_class.header,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            }
+        }
+        return true;
+    }
+
+    fn typeClass(self: *const Runtime) ?*class_module.Class {
+        const header = self.type_class_root.object orelse return null;
+        return class_module.classFromHeader(header);
     }
 
     fn activeCode(self: *const Runtime) ?*Code {
@@ -7024,6 +8340,18 @@ fn roundDecimalTieEven(value: f64, precision: usize) f64 {
     return @bitCast(if (value < 0) bits + 1 else bits - 1);
 }
 
+fn mroContains(class: *class_module.Class, target: *class_module.Class) bool {
+    for (class.mro) |base| if (base == target) return true;
+    return false;
+}
+
+fn frameNameValue(frame: *Frame, name: []const u8) ?Value {
+    if (indexOfName(frame.code.local_names, name)) |index| return frame.locals[index];
+    if (indexOfName(frame.code.cell_names, name)) |index| return if (frame.local_cells[index]) |cell| cell.value else null;
+    if (indexOfName(frame.code.free_names, name)) |index| return if (frame.free_cells[index]) |cell| cell.value else null;
+    return null;
+}
+
 fn compareOrder(order: std.math.Order, operation: u8) bool {
     return switch (operation) {
         2 => order == .lt,
@@ -7049,6 +8377,7 @@ fn isAlign(character: u8) bool {
 }
 
 fn builtinNative(name: []const u8) ?functions.Native {
+    if (std.mem.eql(u8, name, "bool")) return .bool_constructor;
     if (std.mem.eql(u8, name, "open")) return .open;
     if (std.mem.eql(u8, name, "str")) return .str_constructor;
     if (std.mem.eql(u8, name, "format")) return .format_builtin;
@@ -7067,11 +8396,28 @@ fn builtinNative(name: []const u8) ?functions.Native {
     if (std.mem.eql(u8, name, "enumerate")) return .enumerate;
     if (std.mem.eql(u8, name, "zip")) return .zip;
     if (std.mem.eql(u8, name, "reversed")) return .reversed;
+    if (std.mem.eql(u8, name, "isinstance")) return .isinstance_builtin;
+    if (std.mem.eql(u8, name, "issubclass")) return .issubclass_builtin;
+    if (std.mem.eql(u8, name, "callable")) return .callable_builtin;
+    if (std.mem.eql(u8, name, "repr")) return .repr_builtin;
+    if (std.mem.eql(u8, name, "getattr")) return .getattr_builtin;
+    if (std.mem.eql(u8, name, "setattr")) return .setattr_builtin;
+    if (std.mem.eql(u8, name, "delattr")) return .delattr_builtin;
+    if (std.mem.eql(u8, name, "hasattr")) return .hasattr_builtin;
+    if (std.mem.eql(u8, name, "property")) return .property_builtin;
+    if (std.mem.eql(u8, name, "staticmethod")) return .staticmethod_builtin;
+    if (std.mem.eql(u8, name, "classmethod")) return .classmethod_builtin;
+    if (std.mem.eql(u8, name, "super")) return .super_builtin;
     return null;
 }
 
 fn attributeNative(receiver: Value, name: []const u8) ?functions.Native {
     const header = receiver.asObject() orelse return null;
+    if (class_module.descriptorFromHeader(header)) |descriptor| if (descriptor.kind == .property) {
+        if (std.mem.eql(u8, name, "setter")) return .descriptor_setter;
+        if (std.mem.eql(u8, name, "deleter")) return .descriptor_deleter;
+        if (std.mem.eql(u8, name, "getter")) return null;
+    };
     if (file_module.fromHeader(header) != null) {
         if (std.mem.eql(u8, name, "read")) return .file_read;
         if (std.mem.eql(u8, name, "readline")) return .file_readline;

@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) void {
     bytecode_module.addImport("runtime_gc", native_runtime.gc);
     bytecode_module.addImport("runtime_value", native_runtime.value);
     const native_function_module = createRuntimeFunctionModule(b, target, optimize, native_runtime, bytecode_module);
+    native_runtime.class.addImport("runtime_function", native_function_module);
     const native_binder_module = createRuntimeBinderModule(b, target, optimize, native_runtime);
     const compiler_module = b.createModule(.{
         .root_source_file = b.path("src/frontend/compiler.zig"),
@@ -116,6 +117,7 @@ pub fn build(b: *std.Build) void {
     runtime_vm_module.addImport("runtime_exception", native_runtime.exception);
     runtime_vm_module.addImport("runtime_iterator", native_iterator_module);
     runtime_vm_module.addImport("runtime_function", native_function_module);
+    runtime_vm_module.addImport("runtime_class", native_runtime.class);
     runtime_vm_module.addImport("runtime_binder", native_binder_module);
     runtime_vm_module.addImport("runtime_host", native_runtime.host);
     runtime_vm_module.addImport("runtime_vfs", native_runtime.vfs);
@@ -216,6 +218,16 @@ pub fn build(b: *std.Build) void {
     });
     files_test_module.addImport("runtime_vm", runtime_vm_module);
     files_test_module.addImport("runtime_exception", native_runtime.exception);
+    const classes_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/classes.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    classes_test_module.addImport("runtime_vm", runtime_vm_module);
+    classes_test_module.addImport("runtime_host", native_runtime.host);
+    classes_test_module.addImport("frontend_parser", frontend_modules.parser);
+    classes_test_module.addImport("frontend_ast", frontend_modules.ast);
+    classes_test_module.addImport("frontend_scope", frontend_modules.scope);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -237,6 +249,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/unit/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = true,
     });
     unit_test_root.addImport("abi", abi_module);
     unit_test_root.addImport("runtime_gc_tests", gc_test_module);
@@ -257,6 +270,7 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("host_codec_tests", host_codec_test_module);
     unit_test_root.addImport("vfs_tests", vfs_test_module);
     unit_test_root.addImport("file_tests", files_test_module);
+    unit_test_root.addImport("class_tests", classes_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -288,8 +302,8 @@ pub fn build(b: *std.Build) void {
     wasm.entry = .disabled;
     wasm.export_memory = true;
 
-    const install_wasm = b.addInstallArtifact(wasm, .{});
-    b.installArtifact(wasm);
+    const install_wasm = b.addInstallFile(wasm.getEmittedBin(), "peony.wasm");
+    b.getInstallStep().dependOn(&install_wasm.step);
     const wasm_step = b.step("wasm", "Build the stripped ReleaseSmall browser WASM artifact");
     wasm_step.dependOn(&install_wasm.step);
 
@@ -350,7 +364,7 @@ fn addProbe(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, p
     exports[abi_exports.len] = probe_symbol;
 
     const module = b.createModule(.{
-        .root_source_file = b.path(b.fmt("zig-cache/size-probes/{s}-root.zig", .{name})),
+        .root_source_file = b.path(b.fmt(".zig-cache/size-probes/{s}-root.zig", .{name})),
         .target = target,
         .optimize = .ReleaseSmall,
         .single_threaded = true,
@@ -370,7 +384,7 @@ fn addProbe(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, p
     exe.entry = .disabled;
     exe.export_memory = true;
 
-    const install = b.addInstallArtifact(exe, .{});
+    const install = b.addInstallFile(exe.getEmittedBin(), b.fmt("peony-probe-{s}.wasm", .{name}));
     const step = b.step(b.fmt("probe-{s}", .{name}), b.fmt("Build the {s} feature-size probe", .{name}));
     step.dependOn(&install.step);
 }
@@ -391,6 +405,7 @@ fn createExecutionVmModule(
     bytecode_module.addImport("runtime_gc", runtime.gc);
     bytecode_module.addImport("runtime_value", runtime.value);
     const function_module = createRuntimeFunctionModule(b, target, optimize, runtime, bytecode_module);
+    runtime.class.addImport("runtime_function", function_module);
     const binder_module = createRuntimeBinderModule(b, target, optimize, runtime);
     const compiler_module = b.createModule(.{
         .root_source_file = b.path("src/frontend/compiler.zig"),
@@ -428,6 +443,7 @@ fn createExecutionVmModule(
     vm_module.addImport("runtime_exception", runtime.exception);
     vm_module.addImport("runtime_iterator", iterator_module);
     vm_module.addImport("runtime_function", function_module);
+    vm_module.addImport("runtime_class", runtime.class);
     vm_module.addImport("runtime_binder", binder_module);
     vm_module.addImport("runtime_host", runtime.host);
     vm_module.addImport("runtime_vfs", runtime.vfs);
@@ -512,6 +528,7 @@ const RuntimeModules = struct {
     host: *std.Build.Module,
     vfs: *std.Build.Module,
     file: *std.Build.Module,
+    class: *std.Build.Module,
 };
 
 fn createRuntimeModules(
@@ -564,6 +581,15 @@ fn createRuntimeModules(
     file_module.addImport("runtime_value", value_module);
     file_module.addImport("runtime_exception", exception_module);
     file_module.addImport("runtime_vfs", vfs_module);
+
+    const class_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/class.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    class_module.addImport("runtime_gc", gc_module);
+    class_module.addImport("runtime_value", value_module);
+    class_module.addImport("runtime_exception", exception_module);
 
     const slice_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/slice.zig"),
@@ -650,6 +676,7 @@ fn createRuntimeModules(
         .hash = hash_module,
         .vfs = vfs_module,
         .file = file_module,
+        .class = class_module,
     };
 }
 
@@ -666,4 +693,5 @@ fn addRuntimeImports(module: *std.Build.Module, runtime: RuntimeModules) void {
     module.addImport("runtime_slice", runtime.slice);
     module.addImport("runtime_vfs", runtime.vfs);
     module.addImport("runtime_file", runtime.file);
+    module.addImport("runtime_class", runtime.class);
 }

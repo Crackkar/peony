@@ -16,6 +16,7 @@ const host_tests = @import("host_tests");
 const host_codec_tests = @import("host_codec_tests");
 const vfs_tests = @import("vfs_tests");
 const file_tests = @import("file_tests");
+const class_tests = @import("class_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -798,6 +799,110 @@ test "closed file tell raises ValueError" {
     try file_tests.testClosedTellRaisesValueError();
 }
 
+test "getattr and hasattr expose file object fields" {
+    try file_tests.testGetattrAndHasattrExposeFileFields();
+}
+
 test "invalid UTF-8 text read releases partial buffer and allows reuse" {
     try file_tests.testInvalidTextReadReleasesPartialBufferAndAllowsReuse();
+}
+
+test "class parser and scope classify class locals and method closures" {
+    try class_tests.testParserAndClassScope();
+}
+
+test "class decorators, class body, bases and methods preserve evaluation order" {
+    try class_tests.testClassDefinitionOrderAndMethodBinding();
+}
+
+test "class body LOAD_NAME falls back to globals before assignment" {
+    try class_tests.testClassBodyLoadNameFallsBackToGlobals();
+}
+
+test "ordinary classes use C3 MRO, super and the implicit class cell" {
+    try class_tests.testC3MroSuperAndClassCell();
+}
+
+test "super binds inherited property getters to the instance" {
+    try class_tests.testSuperBindsInheritedPropertyGetter();
+}
+
+test "properties, static methods, class methods and init validation work" {
+    try class_tests.testDescriptorsAndConstructorValidation();
+}
+
+test "data descriptors shadow same-named instance attributes" {
+    try class_tests.testDataDescriptorShadowsInstanceAttribute();
+}
+
+test "isinstance distinguishes class objects from primitive instances" {
+    try class_tests.testIsinstanceTypeObjectDistinguishesInstances();
+}
+
+test "getattr default handles property AttributeError and preserves direct access" {
+    try class_tests.testGetattrDefaultHandlesPropertyAttributeError();
+}
+
+test "AttributeError suppression preserves a handled exception for bare raise" {
+    try class_tests.testAttributeErrorSuppressionPreservesHandledException();
+}
+
+test "special methods use type lookup and reflected NotImplemented" {
+    try class_tests.testSpecialMethodsAndReflectedFallback();
+}
+
+test "user class context managers enter, suppress and exit in order" {
+    try class_tests.testUserClassWithProtocol();
+}
+
+test "with exit truthiness runs while the pending exception is rooted" {
+    try class_tests.testWithExitTruthinessWhileExceptionIsPending();
+}
+
+test "eq without hash makes instances unhashable" {
+    try class_tests.testEqualityDisablesHashWithoutOverride();
+}
+
+test "subclass equality without hash overrides inherited hash" {
+    try class_tests.testSubclassEqWithoutHashOverridesInheritedHash();
+}
+
+test "dict equality tries a user lookup key's right equality" {
+    try class_tests.testDictKeyEqualityTriesLookupKeyRightEq();
+}
+
+test "dict string keys try a user lookup key's right equality" {
+    try class_tests.testDictStringKeyEqualityTriesLookupKeyRightEq();
+}
+
+test "a right subclass reflected method has arithmetic priority" {
+    try class_tests.testRightSubclassReflectedArithmeticHasPriority();
+}
+
+test "contains falls back to a user iterator when needed" {
+    try class_tests.testContainsFallsBackToUserIterator();
+}
+
+test "contains converts suspended user iteration into catchable RuntimeError and recovers" {
+    try class_tests.testContainsSuspendedIteratorRaisesCatchableRuntimeErrorAndRecovers();
+}
+
+test "contains roots a fresh user iterator item through allocating equality" {
+    try class_tests.testContainsRootsFreshUserIteratorItemDuringAllocatingEquality();
+}
+
+test "classes and bound methods survive collection and cancellation recovery" {
+    try class_tests.testClassGcQuantumCancelAndReset();
+}
+
+test "long class initializer timeslices and can suspend for host input" {
+    try class_tests.testLongInitializerTimeslicesAndSuspendsForInput();
+}
+
+test "dynamic type and metaclass construction remain explicitly unsupported" {
+    try class_tests.testUnsupportedDynamicTypeAndMetaclass();
+}
+
+test "shadowed builtin type remains callable in module and local scopes" {
+    try class_tests.testShadowedTypeNameRemainsCallable();
 }

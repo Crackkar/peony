@@ -119,7 +119,7 @@ const Parser = struct {
             return;
         }
         if (self.atText("def")) {
-            try statements.append(self.allocator, try self.parseFunction());
+            try statements.append(self.allocator, try self.parseFunction(&.{}));
             return;
         }
         if (self.atText("try")) {
@@ -127,7 +127,10 @@ const Parser = struct {
             statements.append(self.allocator, try self.parseTry()) catch return error.OutOfMemory;
             return;
         }
-        if (self.atText("class")) return self.failUnsupported(.later_commit, "class definitions are not parsed in this commit");
+        if (self.atText("class")) {
+            try statements.append(self.allocator, try self.parseClass(&.{}));
+            return;
+        }
         if (self.atText("with")) {
             statements.append(self.allocator, try self.parseWith()) catch return error.OutOfMemory;
             return;
@@ -135,8 +138,32 @@ const Parser = struct {
         if (self.atText("import") or self.atText("from")) return self.failUnsupported(.later_commit, "import statements are not parsed in this commit");
         if (self.atText("match") and self.looksLikeMatchStatement()) return self.failUnsupported(.later_commit, "match statements are not parsed in this commit");
         if (self.atText("type") and self.peekKind(1, .identifier) and self.peekText(2, "=")) return self.failUnsupported(.excluded, "type statements and PEP 695 syntax are permanently excluded");
-        if (self.atOperator("@")) return self.failUnsupported(.later_commit, "decorators are not parsed in this commit");
+        if (self.atOperator("@")) {
+            const decorators = try self.parseDecorators();
+            if (self.atText("def")) {
+                try statements.append(self.allocator, try self.parseFunction(decorators));
+                return;
+            }
+            if (self.atText("class")) {
+                try statements.append(self.allocator, try self.parseClass(decorators));
+                return;
+            }
+            return self.failAtCurrent("decorators must precede a function or class definition");
+        }
         try self.parseSimpleLine(statements);
+    }
+
+    fn parseDecorators(self: *Parser) ParseError![]const NodeId {
+        var decorators: std.ArrayList(NodeId) = .empty;
+        while (self.atOperator("@")) {
+            _ = self.advance();
+            try decorators.append(self.allocator, try self.parseExpression(0));
+            if (!self.at(.newline)) return self.failAtCurrent("expected end of decorator line");
+            _ = self.advance();
+            while (self.at(.newline)) _ = self.advance();
+        }
+        if (decorators.items.len > 255) return self.failAtCurrent("too many decorators");
+        return decorators.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
     }
 
     fn parseSimpleLine(self: *Parser, statements: *std.ArrayList(NodeId)) ParseError!void {
@@ -463,7 +490,7 @@ const Parser = struct {
         return self.addNode(.with_statement, .{ .start = start.start, .end = self.node(body).span.end }, "", item_count, children.items);
     }
 
-    fn parseFunction(self: *Parser) ParseError!NodeId {
+    fn parseFunction(self: *Parser, decorators: []const NodeId) ParseError!NodeId {
         const start = self.advance();
         if (!self.at(.identifier)) return self.failAtCurrent("expected function name");
         const name = self.advance();
@@ -478,6 +505,7 @@ const Parser = struct {
         }
         _ = try self.expectText(":", "expected ':' after function signature");
         var children: std.ArrayList(NodeId) = .empty;
+        try children.appendSlice(self.allocator, decorators);
         try children.appendSlice(self.allocator, parameters);
         if (return_annotation) |annotation| try children.append(self.allocator, annotation);
         const enclosing_loop_depth = self.loop_depth;
@@ -491,8 +519,39 @@ const Parser = struct {
         self.function_depth -= 1;
         self.loop_depth = enclosing_loop_depth;
         try children.append(self.allocator, body);
-        const flags = if (return_annotation != null) ast_module.function_flags.has_return_annotation else 0;
+        const flags = (if (return_annotation != null) ast_module.function_flags.has_return_annotation else 0) |
+            (@as(u32, @intCast(decorators.len)) << ast_module.function_flags.decorator_count_shift);
         return self.addNode(.function_definition, .{ .start = start.start, .end = self.node(body).span.end }, self.tokenText(name), flags, children.items);
+    }
+
+    fn parseClass(self: *Parser, decorators: []const NodeId) ParseError!NodeId {
+        const start = self.advance();
+        if (!self.at(.identifier)) return self.failAtCurrent("expected class name");
+        const name = self.advance();
+        if (self.atText("[")) return self.failUnsupported(.excluded, "PEP 695 type parameter syntax is permanently excluded");
+        var bases: std.ArrayList(NodeId) = .empty;
+        if (self.atText("(")) {
+            _ = self.advance();
+            while (!self.atText(")")) {
+                if (self.at(.endmarker) or self.at(.newline)) return self.failAtCurrent("expected ')' after class bases");
+                if (self.at(.identifier) and self.peekText(1, "=")) {
+                    return self.failUnsupported(.excluded, "class keyword arguments and custom metaclasses are permanently excluded");
+                }
+                if (self.atOperator("**")) return self.failUnsupported(.excluded, "class keyword arguments and custom metaclasses are permanently excluded");
+                try bases.append(self.allocator, try self.parseExpression(0));
+                if (!self.atText(",")) break;
+                _ = self.advance();
+            }
+            _ = try self.expectText(")", "expected ')' after class bases");
+        }
+        _ = try self.expectText(":", "expected ':' after class header");
+        const body = try self.parseSuite();
+        var children: std.ArrayList(NodeId) = .empty;
+        try children.appendSlice(self.allocator, decorators);
+        try children.appendSlice(self.allocator, bases.items);
+        try children.append(self.allocator, body);
+        const flags = @as(u32, @intCast(decorators.len)) << ast_module.class_flags.decorator_count_shift;
+        return self.addNode(.class_definition, .{ .start = start.start, .end = self.node(body).span.end }, self.tokenText(name), flags, children.items);
     }
 
     fn parseSuite(self: *Parser) ParseError!NodeId {

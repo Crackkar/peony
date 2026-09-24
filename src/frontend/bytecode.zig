@@ -57,6 +57,9 @@ pub const Opcode = enum(u8) {
     accept_exception,
     with_enter,
     with_exit,
+    make_class,
+    set_attribute,
+    delete_attribute,
 };
 
 /// Fixed 64-bit register instruction. The least-significant byte is the opcode;
@@ -143,6 +146,9 @@ pub const Instruction = struct {
             52 => .accept_exception,
             53 => .with_enter,
             54 => .with_exit,
+            55 => .make_class,
+            56 => .set_attribute,
+            57 => .delete_attribute,
             else => null,
         };
     }
@@ -218,6 +224,15 @@ pub const FunctionSite = struct {
     has_return_annotation: bool,
 };
 
+pub const ClassSite = struct {
+    code_index: u32,
+    name_index: u32,
+    decorator_start: u32,
+    decorator_count: u16,
+    base_start: u32,
+    base_count: u16,
+};
+
 pub const UnpackSite = struct {
     destination_start: u32,
     destination_count: u16,
@@ -250,6 +265,7 @@ pub const TrySite = struct {
 
 pub const code_flags = struct {
     pub const function: u32 = 1 << 0;
+    pub const class_body: u32 = 1 << 1;
 };
 
 pub const Code = struct {
@@ -268,6 +284,7 @@ pub const Code = struct {
     dstar_previous_arguments: []CallArgument = &.{},
     dstar_sites: []DstarSite = &.{},
     function_sites: []FunctionSite = &.{},
+    class_sites: []ClassSite = &.{},
     unpack_sites: []UnpackSite = &.{},
     sequence_sites: []SequenceSite = &.{},
     slice_sites: []SliceSite = &.{},
@@ -306,6 +323,7 @@ pub const Code = struct {
         self.allocator.free(self.dstar_previous_arguments);
         self.allocator.free(self.dstar_sites);
         self.allocator.free(self.function_sites);
+        self.allocator.free(self.class_sites);
         self.allocator.free(self.unpack_sites);
         self.allocator.free(self.sequence_sites);
         self.allocator.free(self.slice_sites);

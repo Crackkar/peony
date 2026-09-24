@@ -213,6 +213,17 @@ pub fn testClosedTellRaisesValueError() !void {
     , .value_error);
 }
 
+pub fn testGetattrAndHasattrExposeFileFields() !void {
+    try expectOutput(
+        \\file = open("/home/attribute-fields.txt", "w")
+        \\print(getattr(file, "closed"), hasattr(file, "closed"))
+        \\print(getattr(file, "name"), getattr(file, "mode"), getattr(file, "encoding"))
+        \\print(hasattr(file, "name"), hasattr(file, "mode"), hasattr(file, "encoding"))
+        \\file.close()
+        \\print(getattr(file, "closed"))
+    , "False True\n/home/attribute-fields.txt w UTF-8\nTrue True True\nTrue\n");
+}
+
 pub fn testInvalidTextReadReleasesPartialBufferAndAllowsReuse() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 8 * 1024 * 1024);

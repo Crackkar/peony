@@ -147,6 +147,7 @@ const Compiler = struct {
     dstar_previous_arguments: std.ArrayList(bytecode.CallArgument) = .empty,
     dstar_sites: std.ArrayList(bytecode.DstarSite) = .empty,
     function_sites: std.ArrayList(bytecode.FunctionSite) = .empty,
+    class_sites: std.ArrayList(bytecode.ClassSite) = .empty,
     unpack_sites: std.ArrayList(bytecode.UnpackSite) = .empty,
     sequence_sites: std.ArrayList(bytecode.SequenceSite) = .empty,
     slice_sites: std.ArrayList(bytecode.SliceSite) = .empty,
@@ -206,7 +207,10 @@ const Compiler = struct {
     fn initNested(parent: *Compiler, scope_id: scope_module.ScopeId, display_name: []const u8) std.mem.Allocator.Error!Compiler {
         const allocator = parent.heap.allocator;
         const code = allocator.create(Code) catch return error.OutOfMemory;
-        code.* = .{ .allocator = allocator, .flags = bytecode.code_flags.function };
+        code.* = .{
+            .allocator = allocator,
+            .flags = bytecode.code_flags.function | if (parent.analysis.scope(scope_id).kind == .class) bytecode.code_flags.class_body else 0,
+        };
         code.filename = allocator.dupe(u8, parent.code.filename) catch {
             allocator.destroy(code);
             return error.OutOfMemory;
@@ -239,7 +243,8 @@ const Compiler = struct {
                 .local => &nested.local_names,
                 .cell => &nested.cell_names,
                 .free => &nested.free_names,
-                .global_explicit, .global_implicit, .class_local => null,
+                .class_local => if (parent.analysis.scope(scope_id).kind == .class) &nested.local_names else null,
+                .global_explicit, .global_implicit => null,
             };
             if (target) |names| {
                 const owned = allocator.dupe(u8, symbol.name) catch {
@@ -325,6 +330,7 @@ const Compiler = struct {
         self.code.dstar_previous_arguments = try self.dstar_previous_arguments.toOwnedSlice(self.allocator);
         self.code.dstar_sites = try self.dstar_sites.toOwnedSlice(self.allocator);
         self.code.function_sites = try self.function_sites.toOwnedSlice(self.allocator);
+        self.code.class_sites = try self.class_sites.toOwnedSlice(self.allocator);
         self.code.unpack_sites = try self.unpack_sites.toOwnedSlice(self.allocator);
         self.code.sequence_sites = try self.sequence_sites.toOwnedSlice(self.allocator);
         self.code.slice_sites = try self.slice_sites.toOwnedSlice(self.allocator);
@@ -356,6 +362,7 @@ const Compiler = struct {
         self.dstar_previous_arguments.deinit(self.allocator);
         self.dstar_sites.deinit(self.allocator);
         self.function_sites.deinit(self.allocator);
+        self.class_sites.deinit(self.allocator);
         self.unpack_sites.deinit(self.allocator);
         self.sequence_sites.deinit(self.allocator);
         self.slice_sites.deinit(self.allocator);
@@ -382,6 +389,7 @@ const Compiler = struct {
             .pass_statement => {},
             .block => try self.compileBlock(node_id),
             .function_definition => try self.compileFunctionDefinition(node_id),
+            .class_definition => try self.compileClassDefinition(node_id),
             .delete_statement => try self.compileDelete(node_id),
             .return_statement => try self.compileReturn(node_id),
             .raise_statement => try self.compileRaise(node_id),
@@ -582,10 +590,12 @@ const Compiler = struct {
         const children = self.ast.children(node_id);
         if (children.len == 0) return self.failUnsupported(node.span, "function definition shape is unsupported");
         const body_id = children[children.len - 1];
+        const decorator_count: usize = (node.flags & ast_module.function_flags.decorator_count_mask) >> ast_module.function_flags.decorator_count_shift;
         const has_return_annotation = node.flags & ast_module.function_flags.has_return_annotation != 0;
         const return_annotation_id: ?NodeId = if (has_return_annotation) children[children.len - 2] else null;
         const parameter_end = children.len - 1 - @as(usize, @intFromBool(has_return_annotation));
-        const parameter_ids = children[0..parameter_end];
+        if (decorator_count > parameter_end) return self.failUnsupported(node.span, "function decorator metadata is invalid");
+        const parameter_ids = children[decorator_count..parameter_end];
         const function_scope = self.analysis.scopeForNode(body_id) orelse return self.failUnsupported(node.span, "function scope metadata is missing");
         const nested_code = try self.compileNestedFunction(function_scope, node.text, body_id, parameter_ids, node.span);
         const nested_index = std.math.cast(u32, self.nested_codes.items.len) orelse return self.failUnsupported(node.span, "too many nested code objects");
@@ -596,10 +606,19 @@ const Compiler = struct {
 
         var held: std.ArrayList(u16) = .empty;
         defer held.deinit(self.scratch_allocator);
+        var decorator_registers: std.ArrayList(u16) = .empty;
+        defer decorator_registers.deinit(self.scratch_allocator);
         var values: std.ArrayList(u16) = .empty;
         defer values.deinit(self.scratch_allocator);
         var default_count: u32 = 0;
         var annotation_count: u32 = 0;
+
+        // Decorator expressions run in source order before defaults/annotations.
+        for (children[0..decorator_count]) |decorator_id| {
+            const register = try self.compileExpression(decorator_id);
+            try decorator_registers.append(self.scratch_allocator, register);
+            try held.append(self.scratch_allocator, register);
+        }
 
         // CPython evaluates every default before any parameter annotation.
         for (parameter_ids) |parameter_id| {
@@ -638,10 +657,88 @@ const Compiler = struct {
         });
         const destination = try self.acquire(node.span);
         try self.emitIndex(.make_function, destination, site_index, 0, node.span);
+        var decorator_index = decorator_registers.items.len;
+        while (decorator_index > 0) {
+            decorator_index -= 1;
+            const arguments = [_]u16{destination};
+            try self.emitCallRegisters(decorator_registers.items[decorator_index], &arguments, node.span);
+            try self.emit(.move, destination, decorator_registers.items[decorator_index], 0, 0, node.span);
+        }
         const binding = self.analysis.symbol(self.scope_id orelse 0, node.text) orelse return self.failUnsupported(node.span, "function name binding metadata is missing");
         try self.compileStoreName(destination, node.text, binding.binding, node.span);
         self.temps.release(destination);
         while (held.items.len != 0) self.temps.release(held.pop().?);
+    }
+
+    fn compileClassDefinition(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len == 0) return self.failUnsupported(node.span, "class definition shape is unsupported");
+        const decorator_count: usize = node.flags & ast_module.class_flags.decorator_count_mask;
+        if (decorator_count > children.len - 1) return self.failUnsupported(node.span, "class decorator metadata is invalid");
+        const body_id = children[children.len - 1];
+        const bases = children[decorator_count .. children.len - 1];
+        const class_scope = self.analysis.scopeForNode(body_id) orelse return self.failUnsupported(node.span, "class scope metadata is missing");
+
+        var held: std.ArrayList(u16) = .empty;
+        defer held.deinit(self.scratch_allocator);
+        var decorators: std.ArrayList(u16) = .empty;
+        defer decorators.deinit(self.scratch_allocator);
+        var base_registers: std.ArrayList(u16) = .empty;
+        defer base_registers.deinit(self.scratch_allocator);
+        for (children[0..decorator_count]) |decorator_id| {
+            const value = try self.compileExpression(decorator_id);
+            try decorators.append(self.scratch_allocator, value);
+            try held.append(self.scratch_allocator, value);
+        }
+        for (bases) |base_id| {
+            const value = try self.compileExpression(base_id);
+            try base_registers.append(self.scratch_allocator, value);
+            try held.append(self.scratch_allocator, value);
+        }
+
+        const body_code = try self.compileNestedClassBody(class_scope, node.text, body_id, node.span);
+        const nested_index = std.math.cast(u32, self.nested_codes.items.len) orelse return self.failUnsupported(node.span, "too many nested code objects");
+        self.nested_codes.append(self.allocator, body_code) catch {
+            body_code.deinit(self.heap);
+            return error.OutOfMemory;
+        };
+        const name_index = try self.internName(node.text);
+        const decorator_start = std.math.cast(u32, self.argument_registers.items.len) orelse return self.failUnsupported(node.span, "too many class operands");
+        try self.argument_registers.appendSlice(self.allocator, decorators.items);
+        const base_start = std.math.cast(u32, self.argument_registers.items.len) orelse return self.failUnsupported(node.span, "too many class operands");
+        try self.argument_registers.appendSlice(self.allocator, base_registers.items);
+        const site_index = std.math.cast(u32, self.class_sites.items.len) orelse return self.failUnsupported(node.span, "too many class definition sites");
+        try self.class_sites.append(self.allocator, .{
+            .code_index = nested_index,
+            .name_index = name_index,
+            .decorator_start = decorator_start,
+            .decorator_count = std.math.cast(u16, decorators.items.len) orelse return self.failUnsupported(node.span, "too many class decorators"),
+            .base_start = base_start,
+            .base_count = std.math.cast(u16, base_registers.items.len) orelse return self.failUnsupported(node.span, "too many class bases"),
+        });
+        const destination = try self.acquire(node.span);
+        try self.emitIndex(.make_class, destination, site_index, 0, node.span);
+        var index = decorators.items.len;
+        while (index > 0) {
+            index -= 1;
+            const arguments = [_]u16{destination};
+            try self.emitCallRegisters(decorators.items[index], &arguments, node.span);
+            try self.emit(.move, destination, decorators.items[index], 0, 0, node.span);
+        }
+        const binding = self.analysis.symbol(self.scope_id orelse 0, node.text) orelse return self.failUnsupported(node.span, "class name binding metadata is missing");
+        try self.compileStoreName(destination, node.text, binding.binding, node.span);
+        self.temps.release(destination);
+        while (held.items.len != 0) self.temps.release(held.pop().?);
+    }
+
+    fn emitCallRegisters(self: *Compiler, callee: u16, arguments: []const u16, span: Span) CompileError!void {
+        const start = std.math.cast(u32, self.call_arguments.items.len) orelse return self.failUnsupported(span, "too many call operands");
+        for (arguments) |register| try self.call_arguments.append(self.allocator, .{ .register = register });
+        const site_index = std.math.cast(u32, self.call_sites.items.len) orelse return self.failUnsupported(span, "too many call sites");
+        const count = std.math.cast(u16, arguments.len) orelse return self.failUnsupported(span, "too many call arguments");
+        try self.call_sites.append(self.allocator, .{ .argument_start = start, .argument_count = count });
+        try self.emitIndex(.call, callee, site_index, 0, span);
     }
 
     fn compileNestedFunction(
@@ -660,6 +757,37 @@ const Compiler = struct {
             self.pending_exception = nested.pending_exception;
             return err;
         };
+        nested.compileStatement(body_id) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        const none = nested.loadConstant(Value.noneValue(), span) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        nested.emit(.return_value, none, 0, 0, 0, span) catch |err| {
+            self.diagnostic = nested.diagnostic;
+            self.pending_exception = nested.pending_exception;
+            return err;
+        };
+        nested.temps.release(none);
+        const code = nested.finishCode() catch return error.OutOfMemory;
+        keep_code = true;
+        return code;
+    }
+
+    fn compileNestedClassBody(
+        self: *Compiler,
+        scope_id: scope_module.ScopeId,
+        display_name: []const u8,
+        body_id: NodeId,
+        span: Span,
+    ) CompileError!*Code {
+        var nested = Compiler.initNested(self, scope_id, display_name) catch return error.OutOfMemory;
+        var keep_code = false;
+        defer if (!keep_code) nested.discardCode();
         nested.compileStatement(body_id) catch |err| {
             self.diagnostic = nested.diagnostic;
             self.pending_exception = nested.pending_exception;
@@ -769,9 +897,63 @@ const Compiler = struct {
         const children = self.ast.children(node_id);
         if (children.len != 2) return self.failUnsupported(node.span, "augmented assignment shape is unsupported");
         const target = self.ast.node(children[0]);
-        if (target.kind != .name) return self.failUnsupported(target.span, "attribute and subscript augmented assignment are not implemented yet");
         if (node.text.len < 2 or node.text[node.text.len - 1] != '=') return self.failUnsupported(node.span, "augmented operator is unsupported");
         const operation = binaryOperation(node.text[0 .. node.text.len - 1]) orelse return self.failUnsupported(node.span, "this augmented operator is not implemented yet");
+        if (target.kind == .attribute) {
+            const target_children = self.ast.children(children[0]);
+            if (target_children.len != 1) return self.failUnsupported(target.span, "attribute augmented assignment shape is unsupported");
+            const receiver = try self.compileExpression(target_children[0]);
+            const name_index = try self.internName(target.text);
+            if (name_index > std.math.maxInt(u16)) {
+                self.temps.release(receiver);
+                return self.failUnsupported(target.span, "too many attribute names in code object");
+            }
+            const result = self.acquire(target.span) catch |err| {
+                self.temps.release(receiver);
+                return err;
+            };
+            try self.emit(.get_attribute, result, receiver, name_index, 0, target.span);
+            const right = self.compileExpression(children[1]) catch |err| {
+                self.temps.release(result);
+                self.temps.release(receiver);
+                return err;
+            };
+            try self.emit(.binary, result, right, 0, @intFromEnum(operation), node.span);
+            try self.emit(.set_attribute, receiver, result, name_index, 0, target.span);
+            self.temps.release(right);
+            self.temps.release(result);
+            self.temps.release(receiver);
+            return;
+        }
+        if (target.kind == .subscript) {
+            const target_children = self.ast.children(children[0]);
+            if (target_children.len != 2) return self.failUnsupported(target.span, "subscript augmented assignment shape is unsupported");
+            const container = try self.compileExpression(target_children[0]);
+            const index_register = self.compileExpression(target_children[1]) catch |err| {
+                self.temps.release(container);
+                return err;
+            };
+            const result = self.acquire(target.span) catch |err| {
+                self.temps.release(index_register);
+                self.temps.release(container);
+                return err;
+            };
+            try self.emit(.get_item, result, container, index_register, 0, target.span);
+            const right = self.compileExpression(children[1]) catch |err| {
+                self.temps.release(result);
+                self.temps.release(index_register);
+                self.temps.release(container);
+                return err;
+            };
+            try self.emit(.binary, result, right, 0, @intFromEnum(operation), node.span);
+            try self.emit(.set_item, result, container, index_register, 0, target.span);
+            self.temps.release(right);
+            self.temps.release(result);
+            self.temps.release(index_register);
+            self.temps.release(container);
+            return;
+        }
+        if (target.kind != .name) return self.failUnsupported(target.span, "augmented assignment target is unsupported");
         const binding = self.analysis.bindingOf(children[0]) orelse .global_implicit;
         const left = try self.acquire(target.span);
         try self.compileLoadName(left, target.text, binding, target.span);
@@ -810,6 +992,19 @@ const Compiler = struct {
             try self.emit(.set_item, value_register, container, index_register, 0, target.span);
             self.temps.release(index_register);
             self.temps.release(container);
+            return;
+        }
+        if (target.kind == .attribute) {
+            const children = self.ast.children(target_id);
+            if (children.len != 1) return self.failUnsupported(target.span, "attribute assignment shape is unsupported");
+            const receiver = try self.compileExpression(children[0]);
+            const name_index = try self.internName(target.text);
+            if (name_index > std.math.maxInt(u16)) {
+                self.temps.release(receiver);
+                return self.failUnsupported(target.span, "too many attribute names in code object");
+            }
+            try self.emit(.set_attribute, receiver, value_register, name_index, 0, target.span);
+            self.temps.release(receiver);
             return;
         }
         if (target.kind == .tuple_display or target.kind == .list_display) {
@@ -859,7 +1054,7 @@ const Compiler = struct {
             switch (binding) {
                 .local, .cell, .free => try self.emitIndex(.delete_local, 0, name_index, localBindingFlag(binding), target.span),
                 .global_explicit, .global_implicit => try self.emitIndex(.delete_global, 0, name_index, 0, target.span),
-                .class_local => return self.failUnsupported(target.span, "class namespace execution is not implemented yet"),
+                .class_local => try self.emitIndex(.delete_local, 0, name_index, localBindingFlag(.local), target.span),
             }
             return;
         }
@@ -876,6 +1071,19 @@ const Compiler = struct {
             self.temps.release(container);
             return;
         }
+        if (target.kind == .attribute) {
+            const children = self.ast.children(target_id);
+            if (children.len != 1) return self.failUnsupported(target.span, "attribute delete shape is unsupported");
+            const receiver = try self.compileExpression(children[0]);
+            const name_index = try self.internName(target.text);
+            if (name_index > std.math.maxInt(u16)) {
+                self.temps.release(receiver);
+                return self.failUnsupported(target.span, "too many attribute names in code object");
+            }
+            try self.emit(.delete_attribute, receiver, 0, name_index, 0, target.span);
+            self.temps.release(receiver);
+            return;
+        }
         if (target.kind == .tuple_display or target.kind == .list_display) {
             for (self.ast.children(target_id)) |child| try self.compileDeleteTarget(child);
             return;
@@ -888,7 +1096,7 @@ const Compiler = struct {
         switch (binding) {
             .local, .cell, .free => try self.emitIndex(.load_local, destination, name_index, localBindingFlag(binding), span),
             .global_explicit, .global_implicit => try self.emitIndex(.load_global, destination, name_index, 0, span),
-            .class_local => return self.failUnsupported(span, "class namespace execution is not implemented yet"),
+            .class_local => try self.emitIndex(.load_local, destination, name_index, localBindingFlag(.local), span),
         }
     }
 
@@ -897,7 +1105,7 @@ const Compiler = struct {
         switch (binding) {
             .local, .cell, .free => try self.emitIndex(.store_local, source, name_index, localBindingFlag(binding), span),
             .global_explicit, .global_implicit => try self.emitIndex(.store_global, source, name_index, 0, span),
-            .class_local => return self.failUnsupported(span, "class namespace execution is not implemented yet"),
+            .class_local => try self.emitIndex(.store_local, source, name_index, localBindingFlag(.local), span),
         }
     }
 
@@ -1476,6 +1684,9 @@ const Compiler = struct {
         const node = self.ast.node(node_id);
         const children = self.ast.children(node_id);
         if (children.len == 0) return self.failUnsupported(node.span, "call shape is unsupported");
+        if (children.len == 4 and self.isUnshadowedBuiltinType(children[0])) {
+            return self.failUnsupported(node.span, "three-argument dynamic type construction is permanently excluded");
+        }
         const count = children.len - 1;
         if (count > std.math.maxInt(u16)) return self.failUnsupported(node.span, "call has more than 65,535 arguments");
         const initial_temps = self.temps.next;
@@ -1530,6 +1741,30 @@ const Compiler = struct {
             self.temps.release(held[held_count].register);
         }
         return callee;
+    }
+
+    fn isUnshadowedBuiltinType(self: *Compiler, node_id: NodeId) bool {
+        const node = self.ast.node(node_id);
+        if (node.kind != .name or !std.mem.eql(u8, node.text, "type")) return false;
+        const binding = self.analysis.bindingOf(node_id) orelse .global_implicit;
+        switch (binding) {
+            .local, .cell, .free, .class_local => return false,
+            .global_explicit, .global_implicit => {},
+        }
+
+        const shadow_flags = scope_module.symbol_flags.assign | scope_module.symbol_flags.param |
+            scope_module.symbol_flags.import | scope_module.symbol_flags.delete;
+        if (self.analysis.scopeForNode(node_id)) |scope_id| {
+            if (self.analysis.symbol(scope_id, "type")) |symbol| {
+                if (symbol.flags & shadow_flags != 0) return false;
+            }
+        }
+        if (self.analysis.scope(0).kind == .module) {
+            if (self.analysis.symbol(0, "type")) |symbol| {
+                if (symbol.flags & shadow_flags != 0) return false;
+            }
+        }
+        return true;
     }
 
     fn parseFloat(self: *Compiler, spelling: []const u8, span: Span) CompileError!f64 {

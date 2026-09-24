@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-const wasmPath = fileURLToPath(new URL('../zig-out/bin/peony.wasm', import.meta.url));
+const wasmPath = fileURLToPath(new URL('../zig-out/peony.wasm', import.meta.url));
 const status = Object.freeze({ ok: 0, unsupported: 1, completed: 5, pythonException: 6, timeslice: 7, cancelled: 8, limit: 12 });
 
 async function newApi() {

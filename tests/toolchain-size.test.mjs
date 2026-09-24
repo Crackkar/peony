@@ -15,10 +15,12 @@ test('size report is repeatable and includes the baseline plus all feature delta
   const second = run();
 
   assert.deepEqual(second, first);
+  assert.equal(first.baseline.artifact, 'zig-out/peony.wasm');
   assert.ok(first.baseline.rawBytes > 0);
   assert.ok(first.baseline.brotliQ11Bytes > 0);
   assert.deepEqual(Object.keys(first.probes).sort(), ['bigint', 'json', 'unicode15']);
-  for (const result of Object.values(first.probes)) {
+  for (const [name, result] of Object.entries(first.probes)) {
+    assert.equal(result.artifact, `zig-out/peony-probe-${name}.wasm`);
     assert.ok(result.rawDeltaBytes > 0);
     assert.ok(Number.isFinite(result.brotliQ11DeltaBytes));
     assert.ok(Number.isInteger(result.brotliQ11DeltaBytes));

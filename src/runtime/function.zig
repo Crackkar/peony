@@ -81,6 +81,22 @@ pub const Native = enum {
     set_update,
     set_clear,
     set_copy,
+    type_builtin,
+    bool_constructor,
+    isinstance_builtin,
+    issubclass_builtin,
+    getattr_builtin,
+    setattr_builtin,
+    delattr_builtin,
+    hasattr_builtin,
+    callable_builtin,
+    repr_builtin,
+    property_builtin,
+    staticmethod_builtin,
+    classmethod_builtin,
+    super_builtin,
+    descriptor_setter,
+    descriptor_deleter,
 };
 
 pub const Cell = struct {

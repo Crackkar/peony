@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-const wasmPath = fileURLToPath(new URL('../zig-out/bin/peony.wasm', import.meta.url));
+const wasmPath = fileURLToPath(new URL('../zig-out/peony.wasm', import.meta.url));
 
 async function instantiateBytes() {
   const bytes = await readFile(wasmPath);

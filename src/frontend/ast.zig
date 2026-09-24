@@ -78,6 +78,13 @@ pub const parameter_flags = struct {
 
 pub const function_flags = struct {
     pub const has_return_annotation: u32 = 1 << 0;
+    pub const decorator_count_shift: u5 = 8;
+    pub const decorator_count_mask: u32 = 0xff << decorator_count_shift;
+};
+
+pub const class_flags = struct {
+    pub const decorator_count_shift: u5 = 0;
+    pub const decorator_count_mask: u32 = 0xff;
 };
 
 pub const comprehension_flags = struct {
@@ -104,9 +111,9 @@ pub const with_item_flags = struct {
 
 /// Children occupy one contiguous range in Ast.children. Names, literal spellings,
 /// and operator spellings borrow bytes from the compilation source. Function
-/// nodes store parameters first, an optional return annotation next when marked
-/// by `function_flags.has_return_annotation`, and the body as the final child.
-/// Class nodes store base expressions followed by a block. Future comprehension
+/// nodes store decorator expressions, parameters, an optional return annotation
+/// when marked by `function_flags.has_return_annotation`, and the body last.
+/// Class nodes store decorator expressions, base expressions, then a block. Future comprehension
 /// nodes store clause nodes followed by their result expression; each clause
 /// stores target, iterable, then zero or more filters. Import alias text is the
 /// bound local name.

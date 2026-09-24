@@ -296,8 +296,11 @@ const Builder = struct {
         try self.note(parent_scope, class_node.text, symbol_flags.assign, class_id);
         const children = self.ast.children(class_id);
         if (children.len == 0) return;
+        const decorator_count: usize = class_node.flags & ast_module.class_flags.decorator_count_mask;
+        if (decorator_count > children.len - 1) return self.abortAt("invalid class decorator metadata", class_node.text, class_id);
         const body_id = children[children.len - 1];
-        for (children[0 .. children.len - 1]) |base| try self.visit(parent_scope, base);
+        for (children[0..decorator_count]) |decorator| try self.visit(parent_scope, decorator);
+        for (children[decorator_count .. children.len - 1]) |base| try self.visit(parent_scope, base);
         const class_scope = try self.addScope(.class, class_id, body_id, parent_scope);
         try self.visit(class_scope, body_id);
     }
