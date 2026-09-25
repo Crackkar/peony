@@ -115,6 +115,17 @@ pub const with_item_flags = struct {
     pub const has_target: u32 = 1 << 0;
 };
 
+pub const import_flags = struct {
+    pub const from_import: u32 = 1 << 0;
+    pub const wildcard: u32 = 1 << 1;
+    pub const relative_shift: u5 = 8;
+    pub const relative_mask: u32 = 0xff << relative_shift;
+};
+
+pub const import_alias_flags = struct {
+    pub const has_alias: u32 = 1 << 0;
+};
+
 pub const match_case_flags = struct {
     pub const has_guard: u32 = 1 << 0;
 };

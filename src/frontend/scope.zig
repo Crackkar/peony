@@ -365,7 +365,9 @@ const Builder = struct {
         for (self.ast.children(node_id)) |alias_id| {
             const alias = self.ast.node(alias_id);
             self.node_scopes[@intCast(alias_id)] = scope_id;
-            if (alias.kind == .import_alias) try self.note(scope_id, alias.text, symbol_flags.import | symbol_flags.assign, alias_id) else try self.visit(scope_id, alias_id);
+            if (alias.kind == .import_alias and !std.mem.eql(u8, alias.text, "*")) {
+                try self.note(scope_id, alias.text, symbol_flags.import | symbol_flags.assign, alias_id);
+            } else if (alias.kind != .import_alias) try self.visit(scope_id, alias_id);
         }
     }
 
@@ -676,7 +678,7 @@ const Builder = struct {
 
     fn assignOccurrenceBindings(self: *Builder) std.mem.Allocator.Error!void {
         for (self.ast.nodes, 0..) |node, index| {
-            if ((node.kind != .name and node.kind != .except_handler and node.kind != .capture_pattern) or self.node_scopes[index] == no_scope) continue;
+            if ((node.kind != .name and node.kind != .except_handler and node.kind != .capture_pattern and node.kind != .import_alias) or self.node_scopes[index] == no_scope) continue;
             const scope_id = self.node_scopes[index];
             if (self.symbolIndex(scope_id, node.text)) |symbol_index| {
                 self.node_bindings[index] = self.scopes.items[@intCast(scope_id)].symbols.items[symbol_index].value.binding;

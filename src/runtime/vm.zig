@@ -21,6 +21,7 @@ const host = @import("runtime_host");
 const vfs_module = @import("runtime_vfs");
 const file_module = @import("runtime_file");
 const class_module = @import("runtime_class");
+const module_module = @import("runtime_module");
 
 const Value = value_module.Value;
 const Code = bytecode.Code;
@@ -65,8 +66,9 @@ const TryBlock = struct {
 };
 
 const Environment = struct {
-    header: gc.Header,
+    header: gc.Header align(8),
     entries: std.ArrayList(GlobalEntry) = .empty,
+    module_owner: ?*gc.Header = null,
 };
 
 const TestContextManager = struct {
@@ -94,6 +96,8 @@ fn destroyTestContextManager(header: *gc.Header, allocator: std.mem.Allocator) v
 
 const Frame = struct {
     code: *Code,
+    environment: *gc.Header = undefined,
+    module_initializing: ?*module_module.Module = null,
     previous: ?*Frame = null,
     return_destination: ?u16 = null,
     generator_owner: ?*iterator.Iterator = null,
@@ -131,6 +135,10 @@ const Frame = struct {
     }
 
     fn unwindRootStart(self: *const Frame) usize {
+        return self.environmentRootIndex() + 1;
+    }
+
+    fn environmentRootIndex(self: *const Frame) usize {
         return self.returnOverrideRootIndex() + 1;
     }
 };
@@ -198,6 +206,7 @@ const environment_kind = gc.Kind{
 fn traceEnvironment(header: *gc.Header, tracer: *gc.Tracer) void {
     const environment: *Environment = @ptrCast(@alignCast(header));
     for (environment.entries.items) |entry| tracer.visit(entry.value.asObject());
+    tracer.visit(environment.module_owner);
 }
 
 fn destroyEnvironment(header: *gc.Header, allocator: std.mem.Allocator) void {
@@ -218,6 +227,7 @@ pub const Runtime = struct {
     environment_frame: gc.RootFrame = .{},
     environment_root: gc.Root = .{ .object = null },
     builtin_frame: gc.RootFrame = .{},
+    module_cache_root: gc.Root = .{ .object = null },
     print_builtin_root: gc.Root = .{ .object = null },
     input_builtin_root: gc.Root = .{ .object = null },
     range_builtin_root: gc.Root = .{ .object = null },
@@ -228,6 +238,7 @@ pub const Runtime = struct {
     emergency_exception_root: gc.Root = .{ .object = null },
     active_exception: ?*exceptions.ExceptionInstance = null,
     code: ?*Code = null,
+    imported_codes: std.ArrayList(*Code) = .empty,
     top_frame: ?*Frame = null,
     registers: []Value = &.{},
     register_roots: []gc.Root = &.{},
@@ -304,6 +315,7 @@ pub const Runtime = struct {
             return error.OutOfMemory;
         };
         environment.entries = .empty;
+        environment.module_owner = null;
         self.environment = environment;
         self.environment_root.object = &environment.header;
         self.environment_frame.push(&self.heap.roots);
@@ -314,6 +326,7 @@ pub const Runtime = struct {
         self.builtin_frame.add(&self.range_builtin_root);
         self.builtin_frame.add(&self.object_class_root);
         self.builtin_frame.add(&self.type_class_root);
+        self.builtin_frame.add(&self.module_cache_root);
         self.exception_frame.push(&self.heap.roots);
         self.exception_frame.add(&self.exception_root);
         self.exception_frame.add(&self.emergency_exception_root);
@@ -372,6 +385,7 @@ pub const Runtime = struct {
         self.clearVfsOutput();
         self.vfs.deinit();
         self.stdout_bytes.deinit(self.heap.allocator);
+        self.imported_codes.deinit(self.heap.allocator);
         self.repr_path.deinit(self.heap.allocator);
         if (self.traceback_json_owned) |json| self.heap.allocator.free(json);
         self.traceback_json_owned = null;
@@ -394,7 +408,13 @@ pub const Runtime = struct {
         switch (outcome) {
             .ready => |code| {
                 self.code = code;
-                if (self.prepareRegisters(code)) return .{ .ready = code };
+                if (self.prepareRegisters(code)) {
+                    if (!self.initializeModuleWorld(1, 1)) {
+                        const exception = self.last_exception orelse PythonException{ .kind = .memory_error, .message = "session memory limit exceeded" };
+                        return .{ .python_exception = exception };
+                    }
+                    return .{ .ready = code };
+                }
                 code.deinit(&self.heap);
                 self.code = null;
                 const exception = PythonException{ .kind = .memory_error, .message = "session memory limit exceeded" };
@@ -694,6 +714,11 @@ pub const Runtime = struct {
         self.invalidateEvent();
 
         self.clearGlobals();
+        self.module_cache_root.object = null;
+        while (self.imported_codes.items.len != 0) {
+            const imported = self.imported_codes.pop().?;
+            imported.deinit(&self.heap);
+        }
         if (self.code) |code| {
             code.deinit(&self.heap);
             self.code = null;
@@ -760,7 +785,8 @@ pub const Runtime = struct {
     fn allocateFrame(self: *Runtime, code: *Code, return_destination: ?u16) error{OutOfMemory}!*Frame {
         const allocator = self.heap.allocator;
         const frame = allocator.create(Frame) catch return error.OutOfMemory;
-        frame.* = .{ .code = code, .return_destination = return_destination };
+        const environment = self.currentEnvironment();
+        frame.* = .{ .code = code, .return_destination = return_destination, .environment = environment };
         errdefer self.freeFrameStorage(frame);
         frame.registers = try allocator.alloc(Value, @intCast(code.register_count));
         @memset(frame.registers, Value.unboundValue());
@@ -777,10 +803,11 @@ pub const Runtime = struct {
         const cell_roots = std.math.add(usize, frame.local_cells.len, frame.free_cells.len) catch return error.OutOfMemory;
         const unwind_root_count = std.math.mul(usize, code.try_sites.len, 2) catch return error.OutOfMemory;
         const root_prefix = std.math.add(usize, first_roots, cell_roots) catch return error.OutOfMemory;
-        const with_special_roots = std.math.add(usize, root_prefix, 2) catch return error.OutOfMemory;
+        const with_special_roots = std.math.add(usize, root_prefix, 3) catch return error.OutOfMemory;
         const root_count = std.math.add(usize, with_special_roots, unwind_root_count) catch return error.OutOfMemory;
         frame.roots = try allocator.alloc(gc.Root, root_count);
         @memset(frame.roots, .{ .object = null });
+        frame.roots[frame.environmentRootIndex()].object = environment;
         frame.root_frame.push(&self.heap.roots);
         for (frame.roots) |*root| frame.root_frame.add(root);
         frame.previous = self.top_frame;
@@ -931,6 +958,7 @@ pub const Runtime = struct {
             const caller = frame.previous;
             if (caller == null) return false;
             self.appendTracebackCaller(caller.?);
+            if (frame.module_initializing) |failed_module| self.removeCachedModule(failed_module);
             const popped = self.popFrame() orelse return self.engineFault();
             self.forgetGeneratorFrame(popped);
             self.freeFrameStorage(popped);
@@ -1063,6 +1091,7 @@ pub const Runtime = struct {
 
     fn performReturn(self: *Runtime, result: Value, line: u32, column: u32) bool {
         const returning_frame = self.top_frame orelse return self.engineFault();
+        const completing_module = returning_frame.module_initializing;
         var result_value = result;
         if (returning_frame.return_override) |override| {
             if (returning_frame.override_requires_none and result.tag() != .none) {
@@ -1082,6 +1111,14 @@ pub const Runtime = struct {
             }
         }
         const frame = self.popFrame() orelse return self.engineFault();
+        if (completing_module) |selected| {
+            selected.initialized = true;
+            if (!self.attachImportedChild(selected, line, column)) {
+                self.removeCachedModule(selected);
+                self.freeFrameStorage(frame);
+                return false;
+            }
+        }
         if (frame.generator_owner != null) {
             if (frame.generator_owner) |owner| {
                 owner.generator_return_value = result_value;
@@ -1099,6 +1136,18 @@ pub const Runtime = struct {
             self.setRegister(destination, result_value);
             _ = caller;
         } else if (return_destination != null) return self.engineFault();
+        return true;
+    }
+
+    fn attachImportedChild(self: *Runtime, selected: *module_module.Module, line: u32, column: u32) bool {
+        const separator = std.mem.lastIndexOfScalar(u8, selected.name, '.') orelse return true;
+        const parent_name = selected.name[0..separator];
+        const child_name = selected.name[separator + 1 ..];
+        const parent = self.findCachedModule(parent_name) orelse return true;
+        if (!self.environmentStore(parent.environment, child_name, Value.object(&selected.header))) {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        }
         return true;
     }
 
@@ -1834,6 +1883,7 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return false;
         };
+        setFrameEnvironment(frame, function.globals orelse frame.environment);
         // Re-link the caller, frame and stable bound-value roots in strict LIFO
         // order. The bound roots stay above the frame until every cell is
         // created and initialized, so later cell allocations cannot sweep a
@@ -4259,6 +4309,7 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return null;
         };
+        setFrameEnvironment(frame, function.globals orelse frame.environment);
         var complete = false;
         defer if (!complete) {
             if (bound_roots_active) {
@@ -5282,6 +5333,7 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return null;
         };
+        setFrameEnvironment(frame, function.globals orelse frame.environment);
         var complete = false;
         var suspended = false;
         defer if (!complete) {
@@ -5605,7 +5657,7 @@ pub const Runtime = struct {
         for (nested_code.free_names, 0..) |name, index| {
             captured[index] = self.findCell(name) orelse return self.engineFault();
         }
-        switch (functions.createPython(&self.heap, nested_code, &self.environment.header, captured, defaults, annotations, Value.object(&annotation_dict.header))) {
+        switch (functions.createPython(&self.heap, nested_code, self.currentEnvironment(), captured, defaults, annotations, Value.object(&annotation_dict.header))) {
             .value => |function| self.setRegister(instruction.a(), Value.object(&function.header)),
             .python_exception => |exception| {
                 self.setException(exception, line, column, null);
@@ -5820,7 +5872,9 @@ pub const Runtime = struct {
 
     fn clearGlobals(self: *Runtime) void {
         for (self.environment.entries.items) |entry| self.heap.allocator.free(entry.name);
-        self.environment.entries.clearRetainingCapacity();
+        self.environment.entries.deinit(self.heap.allocator);
+        self.environment.entries = .empty;
+        self.environment.module_owner = null;
     }
 
     fn execute(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
@@ -5955,6 +6009,9 @@ pub const Runtime = struct {
                 const name = self.codeName(instruction.index32()) orelse return self.engineFault();
                 return self.storeAnnotation(name, self.registers[instruction.a()], instruction.flags() != 0, line, column);
             },
+            .import_module => return self.executeImportModule(instruction.a(), instruction.index32(), line, column),
+            .import_member => return self.executeImportMember(instruction, line, column),
+            .import_star => return self.executeImportStar(instruction.a(), instruction.b(), line, column),
             .load_local => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
                 const name = self.codeName(instruction.index32()) orelse return self.engineFault();
@@ -6514,6 +6571,12 @@ pub const Runtime = struct {
 
     fn lookupAttributeValue(self: *Runtime, receiver: Value, name: []const u8, line: u32, column: u32) ?Value {
         const header = receiver.asObject() orelse return null;
+        if (module_module.fromHeader(header)) |selected| {
+            if (std.mem.eql(u8, name, "__name__")) return self.createStringValue(selected.name, line, column);
+            if (std.mem.eql(u8, name, "__package__")) return self.createStringValue(selected.package, line, column);
+            if (std.mem.eql(u8, name, "__file__")) return self.createStringValue(selected.filename, line, column);
+            return environmentLookup(selected.environment, name);
+        }
         if (functions.functionFromHeader(header)) |function| {
             if (std.mem.eql(u8, name, "__annotations__")) return function.annotations_dict;
         }
@@ -6720,6 +6783,17 @@ pub const Runtime = struct {
         if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
         const name = self.codeName(instruction.c()) orelse return self.engineFault();
         const receiver = self.registers[instruction.b()];
+        if (receiver.asObject()) |header| if (module_module.fromHeader(header)) |selected| {
+            if (std.mem.eql(u8, name, "__name__")) return self.storeStringResult(instruction.a(), string.create(&self.heap, selected.name), line, column);
+            if (std.mem.eql(u8, name, "__package__")) return self.storeStringResult(instruction.a(), string.create(&self.heap, selected.package), line, column);
+            if (std.mem.eql(u8, name, "__file__")) return self.storeStringResult(instruction.a(), string.create(&self.heap, selected.filename), line, column);
+            if (environmentLookup(selected.environment, name)) |value| {
+                self.setRegister(instruction.a(), value);
+                return true;
+            }
+            self.setException(.{ .kind = .attribute_error, .message = "module has no such attribute" }, line, column, name);
+            return false;
+        };
         if (receiver.asObject()) |header| if (functions.functionFromHeader(header)) |function| {
             if (std.mem.eql(u8, name, "__annotations__")) {
                 self.setRegister(instruction.a(), function.annotations_dict);
@@ -6865,6 +6939,13 @@ pub const Runtime = struct {
         const receiver = self.registers[instruction.a()];
         const value = self.registers[instruction.b()];
         const header = receiver.asObject() orelse return self.nativeAttributeError(line, column, "attribute assignment requires an object");
+        if (module_module.fromHeader(header)) |selected| {
+            if (!self.environmentStore(selected.environment, name, value)) {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            }
+            return true;
+        }
         if (class_module.instanceFromHeader(header)) |instance| {
             if (class_module.classAttribute(instance.class, name)) |class_value| if (class_value.asObject()) |class_header| if (class_module.descriptorFromHeader(class_header)) |descriptor| {
                 if (descriptor.kind == .property) {
@@ -6895,6 +6976,16 @@ pub const Runtime = struct {
         const name = self.codeName(instruction.c()) orelse return self.engineFault();
         const receiver = self.registers[instruction.a()];
         const header = receiver.asObject() orelse return self.nativeAttributeError(line, column, "attribute deletion requires an object");
+        if (module_module.fromHeader(header)) |selected| {
+            const environment: *Environment = @ptrCast(@alignCast(selected.environment));
+            for (environment.entries.items, 0..) |entry, index| {
+                if (!std.mem.eql(u8, entry.name, name)) continue;
+                self.heap.allocator.free(entry.name);
+                _ = environment.entries.orderedRemove(index);
+                return true;
+            }
+            return self.nativeAttributeError(line, column, "module has no such attribute");
+        }
         if (class_module.instanceFromHeader(header)) |instance| {
             if (class_module.classAttribute(instance.class, name)) |class_value| if (class_value.asObject()) |class_header| if (class_module.descriptorFromHeader(class_header)) |descriptor| {
                 if (descriptor.kind == .property) {
@@ -8305,8 +8396,590 @@ pub const Runtime = struct {
     }
 
     fn globalValue(self: *const Runtime, name: []const u8) ?Value {
-        for (self.environment.entries.items) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
+        const environment = self.currentEnvironmentObject();
+        for (environment.entries.items) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
         return null;
+    }
+
+    fn currentEnvironment(self: *const Runtime) *gc.Header {
+        if (self.top_frame) |frame| return frame.environment;
+        return &self.environment.header;
+    }
+
+    fn currentEnvironmentObject(self: *const Runtime) *Environment {
+        return @ptrCast(@alignCast(self.currentEnvironment()));
+    }
+
+    fn setFrameEnvironment(frame: *Frame, environment: *gc.Header) void {
+        frame.environment = environment;
+        frame.roots[frame.environmentRootIndex()].object = environment;
+    }
+
+    fn environmentLookup(environment_header: *gc.Header, name: []const u8) ?Value {
+        const environment: *Environment = @ptrCast(@alignCast(environment_header));
+        for (environment.entries.items) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
+        return null;
+    }
+
+    fn environmentStore(self: *Runtime, environment_header: *gc.Header, name: []const u8, value: Value) bool {
+        var roots = [_]gc.Root{ .{ .object = environment_header }, .{ .object = value.asObject() } };
+        var root_frame = gc.RootFrame{};
+        root_frame.push(&self.heap.roots);
+        for (&roots) |*root| root_frame.add(root);
+        defer root_frame.pop();
+        const environment: *Environment = @ptrCast(@alignCast(environment_header));
+        for (environment.entries.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                entry.value = value;
+                return true;
+            }
+        }
+        const owned_name = self.heap.allocator.dupe(u8, name) catch return false;
+        environment.entries.append(self.heap.allocator, .{ .name = owned_name, .value = value }) catch {
+            self.heap.allocator.free(owned_name);
+            return false;
+        };
+        return true;
+    }
+
+    fn createEnvironment(self: *Runtime, line: u32, column: u32) ?*Environment {
+        const environment = self.heap.createObject(Environment, &environment_kind) catch {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return null;
+        };
+        environment.entries = .empty;
+        environment.module_owner = null;
+        return environment;
+    }
+
+    fn createStringValue(self: *Runtime, text: []const u8, line: u32, column: u32) ?Value {
+        return switch (string.create(&self.heap, text)) {
+            .value => |created| Value.object(&created.header),
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk null;
+            },
+            .engine_error => blk: {
+                _ = self.engineFault();
+                break :blk null;
+            },
+        };
+    }
+
+    fn moduleCache(self: *const Runtime) ?*dict_module.Dict {
+        const header = self.module_cache_root.object orelse return null;
+        return dict_module.dictFromHeader(header);
+    }
+
+    fn countCodeRoots(code: *bytecode.Code) ?usize {
+        var total = code.root_slots.len;
+        for (code.nested_codes) |nested| {
+            total = std.math.add(usize, total, countCodeRoots(nested) orelse return null) catch return null;
+        }
+        return total;
+    }
+
+    fn copyCodeRoots(code: *bytecode.Code, destination: []?*gc.Header, cursor: *usize) void {
+        for (code.root_slots) |root| {
+            destination[cursor.*] = root.object;
+            cursor.* += 1;
+        }
+        for (code.nested_codes) |nested| copyCodeRoots(nested, destination, cursor);
+    }
+
+    fn detachRootsTo(self: *Runtime, boundary: ?*gc.RootFrame) bool {
+        while (self.heap.roots.top_frame != boundary) {
+            const frame = self.heap.roots.top_frame orelse return false;
+            frame.pop();
+        }
+        return true;
+    }
+
+    fn findCachedModule(self: *const Runtime, name: []const u8) ?*module_module.Module {
+        const mapping = self.moduleCache() orelse return null;
+        for (mapping.entries.items) |entry| {
+            if (!entry.alive) continue;
+            const key_header = entry.key.asObject() orelse continue;
+            const key = string.fromHeader(key_header) orelse continue;
+            if (!std.mem.eql(u8, string.content(key), name)) continue;
+            const module_header = entry.value.asObject() orelse return null;
+            return module_module.fromHeader(module_header);
+        }
+        return null;
+    }
+
+    fn cacheModule(self: *Runtime, selected: *module_module.Module, line: u32, column: u32) bool {
+        const mapping = self.moduleCache() orelse return self.engineFault();
+        var roots = [_]gc.Root{ .{ .object = &mapping.header }, .{ .object = &selected.header }, .{ .object = null } };
+        var root_frame = gc.RootFrame{};
+        root_frame.push(&self.heap.roots);
+        for (&roots) |*root| root_frame.add(root);
+        defer root_frame.pop();
+        const key = self.createStringValue(selected.name, line, column) orelse return false;
+        roots[2].object = key.asObject();
+        return self.setMappingValue(mapping, key, Value.object(&selected.header), line, column);
+    }
+
+    fn removeCachedModule(self: *Runtime, selected: *module_module.Module) void {
+        const mapping = self.moduleCache() orelse return;
+        for (mapping.entries.items) |entry| {
+            if (!entry.alive or entry.value.asObject() != &selected.header) continue;
+            var context = DictEqualityContext{ .runtime = self, .line = 1, .column = 1 };
+            _ = dict_module.delete(mapping, entry.key, entry.hash, &context, dictKeysEqual);
+            return;
+        }
+    }
+
+    fn initializeModuleWorld(self: *Runtime, line: u32, column: u32) bool {
+        if (self.moduleCache() != null) return true;
+        const created_cache = dict_module.create(&self.heap, false);
+        const cache = switch (created_cache) {
+            .value => |mapping| mapping,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        self.module_cache_root.object = &cache.header;
+
+        const sys_environment = self.createEnvironment(line, column) orelse return false;
+        var sys_env_root = gc.Root{ .object = &sys_environment.header };
+        var roots = gc.RootFrame{};
+        roots.push(&self.heap.roots);
+        roots.add(&sys_env_root);
+        defer roots.pop();
+        const sys_created = module_module.create(&self.heap, "sys", "", "<built-in>", "", &sys_environment.header, false);
+        const sys = switch (sys_created) {
+            .value => |module| module,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+        };
+        sys_environment.module_owner = &sys.header;
+        var sys_root = gc.Root{ .object = &sys.header };
+        roots.add(&sys_root);
+        if (!self.cacheModule(sys, line, column)) return false;
+        if (!self.environmentStore(&sys_environment.header, "modules", Value.object(&cache.header))) {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        }
+
+        {
+            const path_values = self.heap.allocator.alloc(Value, 3) catch {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            };
+            defer self.heap.allocator.free(path_values);
+            const path_texts = [_][]const u8{"/home", "/course", "/tmp"};
+            var path_roots = [_]gc.Root{.{ .object = null }, .{ .object = null }, .{ .object = null }};
+            var path_frame = gc.RootFrame{};
+            path_frame.push(&self.heap.roots);
+            for (&path_roots) |*root| path_frame.add(root);
+            defer path_frame.pop();
+            for (path_texts, 0..) |text, index| {
+                const value = self.createStringValue(text, line, column) orelse return false;
+                path_values[index] = value;
+                path_roots[index].object = value.asObject();
+            }
+            const path_list = switch (sequence.createList(&self.heap, path_values)) {
+                .value => |list| list,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            var path_root = gc.Root{ .object = &path_list.header };
+            path_frame.add(&path_root);
+            if (!self.environmentStore(&sys_environment.header, "path", Value.object(&path_list.header))) {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            }
+        }
+
+        const filename = if (self.code) |code| code.filename else "<string>";
+        const main_created = module_module.create(&self.heap, "__main__", "", filename, "", &self.environment.header, false);
+        const main_module = switch (main_created) {
+            .value => |module| module,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+        };
+        self.environment.module_owner = &main_module.header;
+        var main_root = gc.Root{ .object = &main_module.header };
+        roots.add(&main_root);
+        if (!self.cacheModule(main_module, line, column)) return false;
+        var main_name_root = gc.Root{ .object = null };
+        var main_file_root = gc.Root{ .object = null };
+        var main_package_root = gc.Root{ .object = null };
+        roots.add(&main_name_root);
+        roots.add(&main_file_root);
+        roots.add(&main_package_root);
+        const main_name = self.createStringValue("__main__", line, column) orelse return false;
+        main_name_root.object = main_name.asObject();
+        const main_file = self.createStringValue(filename, line, column) orelse return false;
+        main_file_root.object = main_file.asObject();
+        const empty_package = self.createStringValue("", line, column) orelse return false;
+        main_package_root.object = empty_package.asObject();
+        if (!self.environmentStore(&self.environment.header, "__name__", main_name) or
+            !self.environmentStore(&self.environment.header, "__package__", empty_package) or
+            !self.environmentStore(&self.environment.header, "__file__", main_file))
+        {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        }
+        return true;
+    }
+
+    fn moduleForEnvironment(self: *const Runtime, environment: *gc.Header) ?*module_module.Module {
+        const mapping = self.moduleCache() orelse return null;
+        for (mapping.entries.items) |entry| {
+            if (!entry.alive) continue;
+            const header = entry.value.asObject() orelse continue;
+            const selected = module_module.fromHeader(header) orelse continue;
+            if (selected.environment == environment) return selected;
+        }
+        return null;
+    }
+
+    fn resolveImportName(self: *Runtime, raw_name: []const u8, relative_level: u8, line: u32, column: u32) ?[]u8 {
+        if (relative_level == 0) return self.heap.allocator.dupe(u8, raw_name) catch {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return null;
+        };
+        const importing_module = self.moduleForEnvironment(self.currentEnvironment()) orelse {
+            self.setException(.{ .kind = .import_error, .message = "attempted relative import with no known parent package" }, line, column, null);
+            return null;
+        };
+        if (importing_module.package.len == 0) {
+            self.setException(.{ .kind = .import_error, .message = "attempted relative import with no known parent package" }, line, column, null);
+            return null;
+        }
+        var package_end = importing_module.package.len;
+        var level: u8 = 1;
+        while (level < relative_level) : (level += 1) {
+            if (std.mem.lastIndexOfScalar(u8, importing_module.package[0..package_end], '.')) |separator| {
+                package_end = separator;
+            } else {
+                self.setException(.{ .kind = .import_error, .message = "attempted relative import beyond top-level package" }, line, column, null);
+                return null;
+            }
+        }
+        const base = importing_module.package[0..package_end];
+        const separator: usize = @intFromBool(base.len != 0 and raw_name.len != 0);
+        const total = std.math.add(usize, base.len + separator, raw_name.len) catch {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return null;
+        };
+        const result = self.heap.allocator.alloc(u8, total) catch {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return null;
+        };
+        @memcpy(result[0..base.len], base);
+        if (separator != 0) result[base.len] = '.';
+        @memcpy(result[base.len + separator ..], raw_name);
+        return result;
+    }
+
+    const ResolvedModule = struct { filename: []u8, is_package: bool };
+
+    fn resolveModuleFile(self: *Runtime, name: []const u8) std.mem.Allocator.Error!?ResolvedModule {
+        if (std.mem.lastIndexOfScalar(u8, name, '.')) |separator| {
+            if (self.findCachedModule(name[0..separator])) |parent| {
+                if (!parent.is_package) return null;
+                return self.resolveModuleFileUnder(parent.search_path, name[separator + 1 ..]);
+            }
+        }
+        const roots = [_][]const u8{"/home", "/course", "/tmp"};
+        for (roots) |root| {
+            if (try self.resolveModuleFileUnder(root, name)) |resolved| return resolved;
+        }
+        return null;
+    }
+
+    fn resolveModuleFileUnder(self: *Runtime, root: []const u8, name: []const u8) std.mem.Allocator.Error!?ResolvedModule {
+        var base = std.ArrayList(u8).empty;
+        defer base.deinit(self.heap.allocator);
+        try base.appendSlice(self.heap.allocator, root);
+        if (root.len == 0 or root[root.len - 1] != '/') try base.append(self.heap.allocator, '/');
+        for (name) |character| try base.append(self.heap.allocator, if (character == '.') '/' else character);
+
+        var package_path = std.ArrayList(u8).empty;
+        defer package_path.deinit(self.heap.allocator);
+        try package_path.appendSlice(self.heap.allocator, base.items);
+        try package_path.appendSlice(self.heap.allocator, "/__init__.py");
+        if (self.vfs.existsNormalized(package_path.items)) return .{ .filename = try self.heap.allocator.dupe(u8, package_path.items), .is_package = true };
+
+        var module_path = std.ArrayList(u8).empty;
+        defer module_path.deinit(self.heap.allocator);
+        try module_path.appendSlice(self.heap.allocator, base.items);
+        try module_path.appendSlice(self.heap.allocator, ".py");
+        if (self.vfs.existsNormalized(module_path.items)) return .{ .filename = try self.heap.allocator.dupe(u8, module_path.items), .is_package = false };
+        return null;
+    }
+
+    fn executeImportModule(self: *Runtime, destination: u16, site_index: u32, line: u32, column: u32) bool {
+        const code = self.activeCode() orelse return self.engineFault();
+        if (!self.validRegister(destination) or site_index >= code.import_sites.len) return self.engineFault();
+        const site = code.import_sites[site_index];
+        if (site.kind != .module) return self.engineFault();
+        if (!self.initializeModuleWorld(line, column)) return false;
+        const name = self.resolveImportName(site.module_name, site.relative_level, line, column) orelse return false;
+        defer self.heap.allocator.free(name);
+        return self.startImportedModule(name, destination, line, column);
+    }
+
+    fn startImportedModule(self: *Runtime, name: []const u8, destination: u16, line: u32, column: u32) bool {
+        if (self.findCachedModule(name)) |cached| {
+            self.setRegister(destination, Value.object(&cached.header));
+            return true;
+        }
+        const resolved = self.resolveModuleFile(name) catch {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        } orelse {
+            self.setException(.{ .kind = .module_not_found_error, .message = "No module named in the session VFS" }, line, column, name);
+            return false;
+        };
+        defer self.heap.allocator.free(resolved.filename);
+        const source = self.vfs.readNormalized(resolved.filename) catch {
+            self.setException(.{ .kind = .module_not_found_error, .message = "No module named in the session VFS" }, line, column, name);
+            return false;
+        };
+
+        const environment = self.createEnvironment(line, column) orelse return false;
+        var environment_root = gc.Root{ .object = &environment.header };
+        var roots = gc.RootFrame{};
+        roots.push(&self.heap.roots);
+        roots.add(&environment_root);
+        var roots_active = true;
+        defer if (roots_active) roots.pop();
+        const package_name = if (resolved.is_package) name else if (std.mem.lastIndexOfScalar(u8, name, '.')) |separator| name[0..separator] else "";
+        const search_path = if (resolved.is_package) std.fs.path.dirname(resolved.filename) orelse "" else "";
+        const created = module_module.create(&self.heap, name, package_name, resolved.filename, search_path, &environment.header, resolved.is_package);
+        const selected = switch (created) {
+            .value => |module| module,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+        };
+        environment.module_owner = &selected.header;
+        var module_root = gc.Root{ .object = &selected.header };
+        roots.add(&module_root);
+        var cache_registered = false;
+        var frame_scheduled = false;
+        defer if (cache_registered and !frame_scheduled) self.removeCachedModule(selected);
+        if (!self.cacheModule(selected, line, column)) return false;
+        cache_registered = true;
+
+        var name_root = gc.Root{ .object = null };
+        var package_root = gc.Root{ .object = null };
+        var file_root = gc.Root{ .object = null };
+        roots.add(&name_root);
+        roots.add(&package_root);
+        roots.add(&file_root);
+        const name_value = self.createStringValue(name, line, column) orelse return false;
+        name_root.object = name_value.asObject();
+        const package_value = self.createStringValue(package_name, line, column) orelse return false;
+        package_root.object = package_value.asObject();
+        const file_value = self.createStringValue(resolved.filename, line, column) orelse return false;
+        file_root.object = file_value.asObject();
+        if (!self.environmentStore(&environment.header, "__name__", name_value) or
+            !self.environmentStore(&environment.header, "__package__", package_value) or
+            !self.environmentStore(&environment.header, "__file__", file_value))
+        {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        }
+        if (resolved.is_package) {
+            const path_text = self.createStringValue(search_path, line, column) orelse return false;
+            var path_text_root = gc.Root{ .object = path_text.asObject() };
+            roots.add(&path_text_root);
+            const path_values = [_]Value{path_text};
+            const path_list = switch (sequence.createList(&self.heap, &path_values)) {
+                .value => |list| list,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            var path_root = gc.Root{ .object = &path_list.header };
+            roots.add(&path_root);
+            if (!self.environmentStore(&environment.header, "__path__", Value.object(&path_list.header))) {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            }
+        }
+
+        // The importer cache now roots selected -> environment and all metadata.
+        // Pop this temporary frame before compile() pushes the Code's persistent roots.
+        roots.pop();
+        roots_active = false;
+        const root_boundary = self.heap.roots.top_frame;
+        const outcome = compiler.compile(&self.heap, source, resolved.filename);
+        const module_code = switch (outcome) {
+            .ready => |module_code| module_code,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .syntax_error => |diagnostic| {
+                self.setException(.{ .kind = .syntax_error, .message = diagnostic.message }, line, column, null);
+                return false;
+            },
+            .unsupported => |diagnostic| {
+                self.setException(.{ .kind = .syntax_error, .message = diagnostic.message }, line, column, null);
+                return false;
+            },
+        };
+        const code_root_count = countCodeRoots(module_code) orelse {
+            module_code.deinit(&self.heap);
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        };
+        if (code_root_count != 0) {
+            selected.code_roots = self.heap.allocator.alloc(?*gc.Header, code_root_count) catch {
+                module_code.deinit(&self.heap);
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            };
+            var root_cursor: usize = 0;
+            copyCodeRoots(module_code, selected.code_roots, &root_cursor);
+        }
+        if (!self.detachRootsTo(root_boundary)) {
+            module_code.deinit(&self.heap);
+            return self.engineFault();
+        }
+        self.imported_codes.append(self.heap.allocator, module_code) catch {
+            module_code.deinit(&self.heap);
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        };
+        const frame = self.allocateFrame(module_code, destination) catch {
+            _ = self.imported_codes.pop();
+            module_code.deinit(&self.heap);
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        };
+        setFrameEnvironment(frame, &environment.header);
+        frame.module_initializing = selected;
+        frame.return_override = Value.object(&selected.header);
+        frame.roots[frame.returnOverrideRootIndex()].object = &selected.header;
+        frame_scheduled = true;
+        return true;
+    }
+
+    fn executeImportMember(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
+        const code = self.activeCode() orelse return self.engineFault();
+        const site_index: usize = instruction.c();
+        if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b()) or site_index >= code.import_sites.len) return self.engineFault();
+        const site = code.import_sites[site_index];
+        if (site.kind != .member or site.name.len == 0) return self.engineFault();
+        const base_header = self.registers[instruction.b()].asObject() orelse return self.nativeTypeError(line, column, "from-import base is not a module");
+        const base = module_module.fromHeader(base_header) orelse return self.nativeTypeError(line, column, "from-import base is not a module");
+        if (environmentLookup(base.environment, site.name)) |value| {
+            self.setRegister(instruction.a(), value);
+            return true;
+        }
+        if (!base.is_package) {
+            self.setException(.{ .kind = .import_error, .message = "cannot import name from module" }, line, column, site.name);
+            return false;
+        }
+        const child_name = std.fmt.allocPrint(self.heap.allocator, "{s}.{s}", .{ base.name, site.name }) catch {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        };
+        defer self.heap.allocator.free(child_name);
+        if (self.findCachedModule(child_name) == null) {
+            const child_file = self.resolveModuleFile(child_name) catch {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            } orelse {
+                self.setException(.{ .kind = .import_error, .message = "cannot import name from package" }, line, column, site.name);
+                return false;
+            };
+            self.heap.allocator.free(child_file.filename);
+        }
+        if (!self.startImportedModule(child_name, instruction.a(), line, column)) return false;
+        return true;
+    }
+
+    fn executeImportStar(self: *Runtime, module_register: u16, destination: u16, line: u32, column: u32) bool {
+        if (!self.validRegister(module_register) or !self.validRegister(destination)) return self.engineFault();
+        const header = self.registers[module_register].asObject() orelse return self.nativeTypeError(line, column, "from-import base is not a module");
+        const selected = module_module.fromHeader(header) orelse return self.nativeTypeError(line, column, "from-import base is not a module");
+        if (environmentLookup(selected.environment, "__all__")) |all_value| {
+            const all_header = all_value.asObject() orelse return self.nativeTypeError(line, column, "module __all__ must be a sequence of strings");
+            const names = if (sequence.listFromHeader(all_header)) |list|
+                list.items.items
+            else if (sequence.tupleFromHeader(all_header)) |tuple|
+                tuple.items
+            else
+                return self.nativeTypeError(line, column, "module __all__ must be a sequence of strings");
+            for (names) |item| {
+                const item_header = item.asObject() orelse return self.nativeTypeError(line, column, "item in module __all__ must be a string");
+                const text = string.fromHeader(item_header) orelse return self.nativeTypeError(line, column, "item in module __all__ must be a string");
+                const imported_name = string.content(text);
+                var value = environmentLookup(selected.environment, imported_name);
+                if (value == null and selected.is_package) {
+                    const child_name = std.fmt.allocPrint(self.heap.allocator, "{s}.{s}", .{ selected.name, imported_name }) catch {
+                        self.setException(exceptions.memoryError(), line, column, null);
+                        return false;
+                    };
+                    defer self.heap.allocator.free(child_name);
+                    if (self.findCachedModule(child_name)) |cached| {
+                        value = Value.object(&cached.header);
+                        if (!self.environmentStore(selected.environment, imported_name, value.?)) {
+                            self.setException(exceptions.memoryError(), line, column, null);
+                            return false;
+                        }
+                    } else {
+                        const child_file = self.resolveModuleFile(child_name) catch {
+                            self.setException(exceptions.memoryError(), line, column, null);
+                            return false;
+                        } orelse {
+                            self.setException(.{ .kind = .attribute_error, .message = "module does not define name in __all__" }, line, column, imported_name);
+                            return false;
+                        };
+                        self.heap.allocator.free(child_file.filename);
+                        const caller = self.top_frame orelse return self.engineFault();
+                        if (!self.startImportedModule(child_name, destination, line, column)) return false;
+                        if (self.top_frame != caller) {
+                            if (caller.ip == 0) return self.engineFault();
+                            return self.setFrameInstruction(caller, @intCast(caller.ip - 1));
+                        }
+                        value = self.registers[destination];
+                        if (!self.environmentStore(selected.environment, imported_name, value.?)) {
+                            self.setException(exceptions.memoryError(), line, column, null);
+                            return false;
+                        }
+                    }
+                }
+                const selected_value = value orelse {
+                    self.setException(.{ .kind = .attribute_error, .message = "module does not define name in __all__" }, line, column, imported_name);
+                    return false;
+                };
+                if (!self.storeGlobal(imported_name, selected_value)) {
+                    self.setException(exceptions.memoryError(), line, column, null);
+                    return false;
+                }
+            }
+            return true;
+        }
+        const environment: *Environment = @ptrCast(@alignCast(selected.environment));
+        for (environment.entries.items) |entry| {
+            if (entry.name.len != 0 and entry.name[0] == '_') continue;
+            if (!self.storeGlobal(entry.name, entry.value)) {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            }
+        }
+        return true;
     }
 
     fn builtinValue(self: *const Runtime, name: []const u8) ?Value {
@@ -8356,14 +9029,15 @@ pub const Runtime = struct {
     }
 
     fn storeGlobal(self: *Runtime, name: []const u8, value: Value) bool {
-        for (self.environment.entries.items) |*entry| {
+        const environment = self.currentEnvironmentObject();
+        for (environment.entries.items) |*entry| {
             if (std.mem.eql(u8, entry.name, name)) {
                 entry.value = value;
                 return true;
             }
         }
         const owned_name = self.heap.allocator.dupe(u8, name) catch return false;
-        self.environment.entries.append(self.heap.allocator, .{ .name = owned_name, .value = value }) catch {
+        environment.entries.append(self.heap.allocator, .{ .name = owned_name, .value = value }) catch {
             self.heap.allocator.free(owned_name);
             return false;
         };

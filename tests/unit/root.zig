@@ -20,6 +20,7 @@ const class_tests = @import("class_tests");
 const generator_tests = @import("generator_tests");
 const annotation_tests = @import("annotation_tests");
 const match_tests = @import("match_tests");
+const import_tests = @import("import_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -968,4 +969,69 @@ test "match invalid captures and irrefutable cases have diagnostics" {
 
 test "excluded pattern forms have specific unsupported diagnostics" {
     try match_tests.testExcludedPatternFormsHaveSpecificDiagnostics();
+}
+
+test "imports cache modules, bind aliases, expose metadata, and use module globals" {
+    try import_tests.testImportCacheMetadataAndModuleGlobals();
+}
+
+test "packages resolve relative imports and prefer package initializers" {
+    try import_tests.testPackagesRelativeImportsAndPackagePrecedence();
+}
+
+test "circular imports observe initialized state and failed imports roll back" {
+    try import_tests.testCircularImportsAndFailedImportRollback();
+}
+
+test "missing top-level import raises ModuleNotFoundError" {
+    try import_tests.testMissingTopLevelModuleUsesModuleNotFoundError();
+}
+
+test "missing module member raises ImportError" {
+    try import_tests.testMissingModuleMemberUsesImportError();
+}
+
+test "missing package child raises ImportError" {
+    try import_tests.testMissingPackageMemberUsesImportError();
+}
+
+test "relative import outside a package raises ImportError" {
+    try import_tests.testRelativeImportOutsidePackageUsesImportError();
+}
+
+test "star imports honor private names and tuple __all__" {
+    try import_tests.testStarImportsHonorVisibilityAndTupleAll();
+}
+
+test "star import loads listed child modules with scheduled execution" {
+    try import_tests.testPackageAllLoadsUninitializedChildThroughScheduledFrame();
+}
+
+test "star import missing listed name raises AttributeError" {
+    try import_tests.testStarImportMissingListedNameRaisesAttributeError();
+}
+
+test "main module metadata exists without import statements and resets cleanly" {
+    try import_tests.testMainMetadataIsInitializedWithoutImportStatements();
+}
+
+test "main metadata allocation failure reports MemoryError and recovers" {
+    try import_tests.testMainMetadataAllocationFailureIsReportedAndRecoverable();
+}
+
+test "dotted relative from-import initializes intermediate packages" {
+    try import_tests.testDottedRelativeFromImportInitializesIntermediatePackages();
+}
+
+test "a module cannot be used as a package for dotted imports" {
+    try import_tests.testCannotImportChildOfSelectedModule();
+}
+
+
+test "imported modules run on scheduled frames and suspend for input" {
+    try import_tests.testImportedModuleRunsOnMainFrameAndSuspendsForInput();
+}
+
+test "import cache resets while home modules persist without retention" {
+    try import_tests.testImportCacheResetsAndHomeModulesPersistWithoutRetention();
 }

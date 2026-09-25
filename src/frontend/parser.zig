@@ -77,6 +77,7 @@ const Parser = struct {
     edges: std.ArrayList(NodeId) = .empty,
     failure: ?Diagnostic = null,
     function_depth: usize = 0,
+    class_depth: usize = 0,
     loop_depth: usize = 0,
     stop_in_keyword: usize = 0,
 
@@ -135,7 +136,10 @@ const Parser = struct {
             statements.append(self.allocator, try self.parseWith()) catch return error.OutOfMemory;
             return;
         }
-        if (self.atText("import") or self.atText("from")) return self.failUnsupported(.later_commit, "import statements are not parsed in this commit");
+        if (self.atText("import") or self.atText("from")) {
+            try statements.append(self.allocator, try self.parseImportStatement());
+            return;
+        }
         if (self.atText("match") and self.looksLikeMatchStatement()) {
             try statements.append(self.allocator, try self.parseMatch());
             return;
@@ -191,6 +195,7 @@ const Parser = struct {
     }
 
     fn parseSimpleStatement(self: *Parser) ParseError!NodeId {
+        if (self.atText("import") or self.atText("from")) return self.parseImportStatement();
         if (self.atText("pass")) return self.simpleLeaf(.pass_statement);
         if (self.atText("break")) {
             if (self.loop_depth == 0) return self.failAtCurrent("break outside loop");
@@ -253,6 +258,109 @@ const Parser = struct {
         }
         const node_span = self.node(left).span;
         return self.addNode(.expression_statement, node_span, "", 0, &.{left});
+    }
+
+    fn parseImportStatement(self: *Parser) ParseError!NodeId {
+        if (self.atText("import")) {
+            const start = self.advance();
+            var aliases: std.ArrayList(NodeId) = .empty;
+            var end = start.end;
+            while (true) {
+                const path = try self.parseDottedImportName();
+                const path_node = try self.addNode(.name, .{ .start = path.start, .end = path.end }, path.text, 0, &.{});
+                var bound = path.text;
+                var alias_flags: u32 = 0;
+                if (self.atText("as")) {
+                    _ = self.advance();
+                    if (!self.at(.identifier)) return self.failAtCurrent("expected identifier after 'as'");
+                    const alias_token = self.advance();
+                    bound = self.tokenText(alias_token);
+                    end = alias_token.end;
+                    alias_flags |= ast_module.import_alias_flags.has_alias;
+                } else {
+                    bound = std.mem.sliceTo(path.text, '.');
+                    end = path.end;
+                }
+                try aliases.append(self.allocator, try self.addNode(.import_alias, .{ .start = path.start, .end = end }, bound, alias_flags, &.{path_node}));
+                if (!self.atText(",")) break;
+                _ = self.advance();
+            }
+            return self.addNode(.import_statement, .{ .start = start.start, .end = end }, "", 0, aliases.items);
+        }
+
+        const start = self.advance();
+        var relative_level: u32 = 0;
+        while (self.atText(".")) : (relative_level += 1) _ = self.advance();
+        if (relative_level > 255) return self.failAtToken(start, "relative import level is too large");
+        var module_name: []const u8 = "";
+        var end = start.end;
+        if (self.at(.identifier) and !self.atText("import")) {
+            const parsed = try self.parseDottedImportName();
+            module_name = parsed.text;
+            end = parsed.end;
+        } else if (relative_level == 0) {
+            return self.failAtCurrent("expected module name after 'from'");
+        }
+        _ = try self.expectText("import", "expected 'import' in from-import statement");
+        var aliases: std.ArrayList(NodeId) = .empty;
+        var parenthesized = false;
+        if (self.atText("(")) {
+            _ = self.advance();
+            parenthesized = true;
+        }
+        if (self.atOperator("*")) {
+            const star = self.advance();
+            if (self.function_depth != 0 or self.class_depth != 0) return self.failAtToken(star, "'import *' only allowed at module level");
+            try aliases.append(self.allocator, try self.addNode(.import_alias, tokenSpan(star), "*", 0, &.{}));
+            end = star.end;
+        } else {
+            while (true) {
+                if (!self.at(.identifier)) return self.failAtCurrent("expected imported name");
+                const imported = self.advance();
+                const name = self.tokenText(imported);
+                var bound = name;
+                var alias_end = imported.end;
+                var alias_flags: u32 = 0;
+                if (self.atText("as")) {
+                    _ = self.advance();
+                    if (!self.at(.identifier)) return self.failAtCurrent("expected identifier after 'as'");
+                    const alias = self.advance();
+                    bound = self.tokenText(alias);
+                    alias_end = alias.end;
+                    alias_flags |= ast_module.import_alias_flags.has_alias;
+                }
+                const imported_node = try self.addNode(.name, tokenSpan(imported), name, 0, &.{});
+                try aliases.append(self.allocator, try self.addNode(.import_alias, .{ .start = imported.start, .end = alias_end }, bound, alias_flags, &.{imported_node}));
+                end = alias_end;
+                if (!self.atText(",")) break;
+                _ = self.advance();
+                if (parenthesized and self.atText(")")) break;
+            }
+        }
+        if (parenthesized) end = (try self.expectText(")", "expected ')' after imported names")).end;
+        const flags = ast_module.import_flags.from_import |
+            (if (aliases.items.len == 1 and std.mem.eql(u8, self.node(aliases.items[0]).text, "*")) ast_module.import_flags.wildcard else 0) |
+            (relative_level << ast_module.import_flags.relative_shift);
+        return self.addNode(.import_statement, .{ .start = start.start, .end = end }, module_name, flags, aliases.items);
+    }
+
+    const DottedImportName = struct { text: []const u8, start: usize, end: usize };
+
+    fn parseDottedImportName(self: *Parser) ParseError!DottedImportName {
+        if (!self.at(.identifier)) return self.failAtCurrent("expected module name");
+        const start = self.current().start;
+        var output: std.ArrayList(u8) = .empty;
+        try output.appendSlice(self.allocator, self.tokenText(self.advance()));
+        var end = self.tokens[self.position - 1].end;
+        while (self.atText(".")) {
+            _ = self.advance();
+            if (!self.at(.identifier)) return self.failAtCurrent("expected name after '.' in module path");
+            const component = self.advance();
+            try output.append(self.allocator, '.');
+            try output.appendSlice(self.allocator, self.tokenText(component));
+            end = component.end;
+        }
+        return .{ .text = try output.toOwnedSlice(self.allocator), .start = start, .end = end };
     }
 
     fn parseReturn(self: *Parser) ParseError!NodeId {
@@ -666,10 +774,13 @@ const Parser = struct {
         _ = try self.expectText(":", "expected ':' after class header");
         const enclosing_function_depth = self.function_depth;
         self.function_depth = 0;
+        self.class_depth += 1;
         const body = self.parseSuite() catch |err| {
+            self.class_depth -= 1;
             self.function_depth = enclosing_function_depth;
             return err;
         };
+        self.class_depth -= 1;
         self.function_depth = enclosing_function_depth;
         var children: std.ArrayList(NodeId) = .empty;
         try children.appendSlice(self.allocator, decorators);

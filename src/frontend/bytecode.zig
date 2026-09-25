@@ -61,6 +61,9 @@ pub const Opcode = enum(u8) {
     set_attribute,
     delete_attribute,
     store_annotation,
+    import_module,
+    import_member,
+    import_star,
 };
 
 /// Fixed 64-bit register instruction. The least-significant byte is the opcode;
@@ -151,6 +154,9 @@ pub const Instruction = struct {
             56 => .set_attribute,
             57 => .delete_attribute,
             58 => .store_annotation,
+            59 => .import_module,
+            60 => .import_member,
+            61 => .import_star,
             else => null,
         };
     }
@@ -257,6 +263,16 @@ pub const FormatSite = struct {
     spec: []const u8,
 };
 
+pub const ImportKind = enum { module, member, star };
+
+pub const ImportSite = struct {
+    kind: ImportKind,
+    module_name: []const u8 = "",
+    name: []const u8 = "",
+    relative_level: u8 = 0,
+    bind_root: bool = false,
+};
+
 pub const TrySite = struct {
     body_start_ip: u32 = 0,
     handler_ip: u32 = 0,
@@ -292,6 +308,7 @@ pub const Code = struct {
     sequence_sites: []SequenceSite = &.{},
     slice_sites: []SliceSite = &.{},
     format_sites: []FormatSite = &.{},
+    import_sites: []ImportSite = &.{},
     try_sites: []TrySite = &.{},
     nested_codes: []*Code = &.{},
     positions: []SourcePosition = &.{},
@@ -332,6 +349,11 @@ pub const Code = struct {
         self.allocator.free(self.slice_sites);
         for (self.format_sites) |site| self.allocator.free(site.spec);
         self.allocator.free(self.format_sites);
+        for (self.import_sites) |site| {
+            if (site.module_name.len != 0) self.allocator.free(site.module_name);
+            if (site.name.len != 0) self.allocator.free(site.name);
+        }
+        self.allocator.free(self.import_sites);
         self.allocator.free(self.try_sites);
         self.allocator.free(self.nested_codes);
         self.allocator.free(self.positions);

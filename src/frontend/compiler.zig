@@ -152,6 +152,7 @@ const Compiler = struct {
     sequence_sites: std.ArrayList(bytecode.SequenceSite) = .empty,
     slice_sites: std.ArrayList(bytecode.SliceSite) = .empty,
     format_sites: std.ArrayList(bytecode.FormatSite) = .empty,
+    import_sites: std.ArrayList(bytecode.ImportSite) = .empty,
     try_sites: std.ArrayList(bytecode.TrySite) = .empty,
     nested_codes: std.ArrayList(*Code) = .empty,
     local_names: std.ArrayList([]const u8) = .empty,
@@ -337,6 +338,7 @@ const Compiler = struct {
         self.code.sequence_sites = try self.sequence_sites.toOwnedSlice(self.allocator);
         self.code.slice_sites = try self.slice_sites.toOwnedSlice(self.allocator);
         self.code.format_sites = try self.format_sites.toOwnedSlice(self.allocator);
+        self.code.import_sites = try self.import_sites.toOwnedSlice(self.allocator);
         self.code.try_sites = try self.try_sites.toOwnedSlice(self.allocator);
         self.code.nested_codes = try self.nested_codes.toOwnedSlice(self.allocator);
         self.code.positions = try self.positions.toOwnedSlice(self.allocator);
@@ -370,6 +372,11 @@ const Compiler = struct {
         self.slice_sites.deinit(self.allocator);
         for (self.format_sites.items) |site| self.allocator.free(site.spec);
         self.format_sites.deinit(self.allocator);
+        for (self.import_sites.items) |site| {
+            if (site.module_name.len != 0) self.allocator.free(site.module_name);
+            if (site.name.len != 0) self.allocator.free(site.name);
+        }
+        self.import_sites.deinit(self.allocator);
         self.try_sites.deinit(self.allocator);
         self.nested_codes.deinit(self.allocator);
         self.positions.deinit(self.allocator);
@@ -392,6 +399,7 @@ const Compiler = struct {
             .block => try self.compileBlock(node_id),
             .function_definition => try self.compileFunctionDefinition(node_id),
             .class_definition => try self.compileClassDefinition(node_id),
+            .import_statement => try self.compileImportStatement(node_id),
             .delete_statement => try self.compileDelete(node_id),
             .return_statement => try self.compileReturn(node_id),
             .raise_statement => try self.compileRaise(node_id),
@@ -419,6 +427,134 @@ const Compiler = struct {
 
     fn compileBlock(self: *Compiler, node_id: NodeId) CompileError!void {
         for (self.ast.children(node_id)) |statement| try self.compileStatement(statement);
+    }
+
+    fn addImportSite(
+        self: *Compiler,
+        kind: bytecode.ImportKind,
+        module_name: []const u8,
+        name: []const u8,
+        relative_level: u8,
+        bind_root: bool,
+    ) std.mem.Allocator.Error!u32 {
+        const owned_module = if (module_name.len == 0) &.{} else try self.allocator.dupe(u8, module_name);
+        errdefer if (owned_module.len != 0) self.allocator.free(owned_module);
+        const owned_name = if (name.len == 0) &.{} else try self.allocator.dupe(u8, name);
+        errdefer if (owned_name.len != 0) self.allocator.free(owned_name);
+        const index = std.math.cast(u32, self.import_sites.items.len) orelse return error.OutOfMemory;
+        try self.import_sites.append(self.allocator, .{
+            .kind = kind,
+            .module_name = owned_module,
+            .name = owned_name,
+            .relative_level = relative_level,
+            .bind_root = bind_root,
+        });
+        return index;
+    }
+
+    fn emitImportModule(self: *Compiler, name: []const u8, relative_level: u8, span: Span) CompileError!u16 {
+        const site = try self.addImportSite(.module, name, "", relative_level, false);
+        const destination = try self.acquireImportTemp(span);
+        try self.emitIndex(.import_module, destination, site, 0, span);
+        return destination;
+    }
+
+    fn acquireImportTemp(self: *Compiler, span: Span) CompileError!u16 {
+        return self.temps.acquire() catch return self.failUnsupported(span, "too many registers in import statement");
+    }
+
+    fn importPrefixes(self: *Compiler, module_name: []const u8, span: Span, registers: *std.ArrayList(u16)) CompileError!void {
+        if (module_name.len == 0) return;
+        var prefix_end: usize = 0;
+        while (prefix_end < module_name.len) {
+            const separator = std.mem.indexOfScalarPos(u8, module_name, prefix_end, '.') orelse module_name.len;
+            if (separator == prefix_end) return self.failUnsupported(span, "invalid dotted import name");
+            try registers.append(self.allocator, try self.emitImportModule(module_name[0..separator], 0, span));
+            if (separator == module_name.len) break;
+            prefix_end = separator + 1;
+            if (prefix_end == module_name.len) return self.failUnsupported(span, "invalid dotted import name");
+        }
+    }
+
+    fn relativeImportPrefixes(self: *Compiler, module_name: []const u8, relative_level: u8, span: Span, registers: *std.ArrayList(u16)) CompileError!void {
+        if (module_name.len == 0) {
+            try registers.append(self.allocator, try self.emitImportModule("", relative_level, span));
+            return;
+        }
+        var prefix_end: usize = 0;
+        while (prefix_end < module_name.len) {
+            const separator = std.mem.indexOfScalarPos(u8, module_name, prefix_end, '.') orelse module_name.len;
+            if (separator == prefix_end) return self.failUnsupported(span, "invalid dotted relative import name");
+            try registers.append(self.allocator, try self.emitImportModule(module_name[0..separator], relative_level, span));
+            if (separator == module_name.len) break;
+            prefix_end = separator + 1;
+            if (prefix_end == module_name.len) return self.failUnsupported(span, "invalid dotted relative import name");
+        }
+    }
+
+    fn compileImportStatement(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const aliases = self.ast.children(node_id);
+        const is_from = node.flags & ast_module.import_flags.from_import != 0;
+        if (is_from and std.mem.eql(u8, node.text, "__future__")) {
+            return self.failUnsupported(node.span, "future import flags are not supported in this runtime version");
+        }
+        if (!is_from) {
+            for (aliases) |alias_id| {
+                const alias = self.ast.node(alias_id);
+                const children = self.ast.children(alias_id);
+                if (alias.kind != .import_alias or children.len != 1) return self.failUnsupported(alias.span, "import alias shape is unsupported");
+                const path = self.ast.node(children[0]).text;
+                var registers: std.ArrayList(u16) = .empty;
+                defer registers.deinit(self.allocator);
+                try self.importPrefixes(path, alias.span, &registers);
+                if (registers.items.len == 0) return self.failUnsupported(alias.span, "empty import path");
+                const selected = if (alias.flags & ast_module.import_alias_flags.has_alias != 0) registers.items[registers.items.len - 1] else registers.items[0];
+                const binding = self.analysis.bindingOf(alias_id) orelse .global_implicit;
+                try self.compileStoreName(selected, alias.text, binding, alias.span);
+                var remaining = registers.items.len;
+                while (remaining != 0) {
+                    remaining -= 1;
+                    self.temps.release(registers.items[remaining]);
+                }
+            }
+            return;
+        }
+
+        const relative_level: u8 = @intCast((node.flags & ast_module.import_flags.relative_mask) >> ast_module.import_flags.relative_shift);
+        var module_registers: std.ArrayList(u16) = .empty;
+        defer module_registers.deinit(self.allocator);
+        if (relative_level != 0) {
+            try self.relativeImportPrefixes(node.text, relative_level, node.span, &module_registers);
+        } else {
+            try self.importPrefixes(node.text, node.span, &module_registers);
+        }
+        if (module_registers.items.len == 0) return self.failUnsupported(node.span, "empty absolute from-import module");
+        const base_register = module_registers.items[module_registers.items.len - 1];
+        for (aliases) |alias_id| {
+            const alias = self.ast.node(alias_id);
+            if (alias.kind != .import_alias) return self.failUnsupported(alias.span, "from-import alias shape is unsupported");
+            if (std.mem.eql(u8, alias.text, "*")) {
+                const destination = try self.acquireImportTemp(alias.span);
+                try self.emit(.import_star, base_register, destination, 0, 0, alias.span);
+                self.temps.release(destination);
+                continue;
+            }
+            const children = self.ast.children(alias_id);
+            if (children.len != 1) return self.failUnsupported(alias.span, "from-import alias shape is unsupported");
+            const imported_name = self.ast.node(children[0]).text;
+            const site = try self.addImportSite(.member, "", imported_name, 0, false);
+            const destination = try self.acquireImportTemp(alias.span);
+            try self.emit(.import_member, destination, base_register, site, 0, alias.span);
+            const binding = self.analysis.bindingOf(alias_id) orelse .global_implicit;
+            try self.compileStoreName(destination, alias.text, binding, alias.span);
+            self.temps.release(destination);
+        }
+        var remaining = module_registers.items.len;
+        while (remaining != 0) {
+            remaining -= 1;
+            self.temps.release(module_registers.items[remaining]);
+        }
     }
 
     fn compileReturn(self: *Compiler, node_id: NodeId) CompileError!void {
