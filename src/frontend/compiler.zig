@@ -163,6 +163,7 @@ const Compiler = struct {
     diagnostic: ?Diagnostic = null,
     pending_exception: ?exceptions.PythonException = null,
     loop_stack: std.ArrayList(LoopContext) = .empty,
+    contains_yield: bool = false,
 
     fn init(heap: *gc.Heap, ast: *const Ast, analysis: *const scope_module.Analysis, filename: []const u8, scratch_allocator: std.mem.Allocator) Compiler {
         const allocator = heap.allocator;
@@ -315,6 +316,7 @@ const Compiler = struct {
     }
 
     fn finishCode(self: *Compiler) std.mem.Allocator.Error!*Code {
+        if (self.contains_yield) self.code.flags |= bytecode.code_flags.generator;
         self.code.register_count = self.temps.high_water;
         self.code.instructions = try self.instructions.toOwnedSlice(self.allocator);
         self.code.constants = try self.constants.toOwnedSlice(self.allocator);
@@ -407,6 +409,8 @@ const Compiler = struct {
             .for_statement => try self.compileFor(node_id),
             .try_statement => try self.compileTry(node_id),
             .with_statement => try self.compileWith(node_id),
+            .annotated_assignment => try self.compileAnnotatedAssignment(node_id),
+            .match_statement => try self.compileMatch(node_id),
             .break_statement => try self.compileBreak(node_id),
             .continue_statement => try self.compileContinue(node_id),
             else => return self.failUnsupported(node.span, statementUnsupportedMessage(node.kind)),
@@ -1148,6 +1152,7 @@ const Compiler = struct {
             .call => return self.compileCall(node_id),
             .lambda_expression => return self.compileLambda(node_id),
             .named_expression => return self.compileNamedExpression(node_id),
+            .yield_expression => return self.compileYieldExpression(node_id),
             .string_concatenation => return self.compileStringConcatenation(node_id),
             .comprehension_expression => return self.compileComprehension(node_id),
             .formatted_string_literal => return self.compileFormattedString(node_id),
@@ -1162,6 +1167,140 @@ const Compiler = struct {
                 return self.loadConstant(value, node.span);
             },
             else => return self.failUnsupported(node.span, expressionUnsupportedMessage(node.kind)),
+        }
+    }
+
+    fn compileYieldExpression(self: *Compiler, node_id: NodeId) CompileError!u16 {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const value = if (children.len == 0) try self.loadConstant(Value.noneValue(), node.span) else try self.compileExpression(children[0]);
+        try self.emit(.yield_value, value, 0, 0, 0, node.span);
+        self.contains_yield = true;
+        return value;
+    }
+
+    fn compileAnnotatedAssignment(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len < 2 or children.len > 3) return self.failUnsupported(node.span, "annotated assignment shape is unsupported");
+        const target_id = children[0];
+        const target = self.ast.node(target_id);
+        const scope_kind = self.analysis.scope(self.scope_id orelse 0).kind;
+        const has_value = children.len == 3;
+
+        if (has_value) {
+            const value = try self.compileExpression(children[2]);
+            try self.compileStoreTarget(target_id, value);
+            self.temps.release(value);
+        } else if (target.kind != .name) {
+            try self.compileAnnotationTargetEffects(target_id);
+        }
+
+        if (scope_kind == .function) return;
+        const annotation = try self.compileExpression(children[1]);
+        if (target.kind != .name) {
+            self.temps.release(annotation);
+            return;
+        }
+        const name_index = try self.internName(target.text);
+        try self.emitIndex(.store_annotation, annotation, name_index, @intFromBool(scope_kind == .class), node.span);
+        self.temps.release(annotation);
+    }
+
+    fn compileAnnotationTargetEffects(self: *Compiler, target_id: NodeId) CompileError!void {
+        const target = self.ast.node(target_id);
+        const children = self.ast.children(target_id);
+        switch (target.kind) {
+            .attribute => {
+                if (children.len != 1) return self.failUnsupported(target.span, "annotation attribute target is malformed");
+                const receiver = try self.compileExpression(children[0]);
+                self.temps.release(receiver);
+            },
+            .subscript => {
+                if (children.len != 2) return self.failUnsupported(target.span, "annotation subscript target is malformed");
+                const receiver = try self.compileExpression(children[0]);
+                const index = self.compileExpression(children[1]) catch |err| {
+                    self.temps.release(receiver);
+                    return err;
+                };
+                self.temps.release(index);
+                self.temps.release(receiver);
+            },
+            else => return self.failUnsupported(target.span, "annotated target form is unsupported"),
+        }
+    }
+
+    fn compileMatch(self: *Compiler, node_id: NodeId) CompileError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        if (children.len < 2) return self.failUnsupported(node.span, "match statement has no cases");
+        const subject = try self.compileExpression(children[0]);
+        var exits: std.ArrayList(u32) = .empty;
+        defer exits.deinit(self.scratch_allocator);
+        for (children[1..]) |case_id| {
+            const case = self.ast.node(case_id);
+            const case_children = self.ast.children(case_id);
+            const has_guard = case.flags & ast_module.match_case_flags.has_guard != 0;
+            if (case_children.len != (if (has_guard) @as(usize, 3) else 2)) return self.failUnsupported(case.span, "match case shape is malformed");
+            var failures: std.ArrayList(u32) = .empty;
+            defer failures.deinit(self.scratch_allocator);
+            try self.compileMatchPattern(case_children[0], subject, &failures);
+            if (has_guard) {
+                const guard = try self.compileExpression(case_children[1]);
+                try failures.append(self.scratch_allocator, try self.emitJump(.jump_if_false, guard, 0, self.ast.node(case_children[1]).span));
+                self.temps.release(guard);
+            }
+            try self.compileStatement(case_children[if (has_guard) 2 else 1]);
+            try exits.append(self.scratch_allocator, try self.emitJump(.jump, 0, 0, case.span));
+            const next_case = try self.currentTarget(case.span);
+            for (failures.items) |jump| try self.patchJump(jump, next_case);
+        }
+        const end = try self.currentTarget(node.span);
+        for (exits.items) |jump| try self.patchJump(jump, end);
+        self.temps.release(subject);
+    }
+
+    fn compileMatchPattern(self: *Compiler, pattern_id: NodeId, subject: u16, failures: *std.ArrayList(u32)) CompileError!void {
+        const pattern = self.ast.node(pattern_id);
+        switch (pattern.kind) {
+            .wildcard_pattern => {},
+            .capture_pattern => {
+                const binding = self.analysis.bindingOf(pattern_id) orelse return self.failUnsupported(pattern.span, "match capture binding is missing");
+                try self.compileStoreName(subject, pattern.text, binding, pattern.span);
+            },
+            .integer_literal, .float_literal, .string_literal, .none_literal, .bool_literal, .unary_expression => {
+                const literal = try self.compileExpression(pattern_id);
+                const matched = try self.acquire(pattern.span);
+                const operation: u8 = switch (pattern.kind) {
+                    .none_literal, .bool_literal => 6, // singleton patterns use identity, unlike numeric literals
+                    else => 0,
+                };
+                try self.emit(.compare, matched, subject, literal, operation, pattern.span);
+                try failures.append(self.scratch_allocator, try self.emitJump(.jump_if_false, matched, 0, pattern.span));
+                self.temps.release(matched);
+                self.temps.release(literal);
+            },
+            .or_pattern => {
+                const alternatives = self.ast.children(pattern_id);
+                if (alternatives.len < 2) return self.failUnsupported(pattern.span, "OR pattern requires alternatives");
+                var successes: std.ArrayList(u32) = .empty;
+                defer successes.deinit(self.scratch_allocator);
+                for (alternatives, 0..) |alternative, index| {
+                    var alternative_failures: std.ArrayList(u32) = .empty;
+                    defer alternative_failures.deinit(self.scratch_allocator);
+                    try self.compileMatchPattern(alternative, subject, &alternative_failures);
+                    if (index + 1 < alternatives.len) {
+                        try successes.append(self.scratch_allocator, try self.emitJump(.jump, 0, 0, pattern.span));
+                        const next_alternative = try self.currentTarget(pattern.span);
+                        for (alternative_failures.items) |jump| try self.patchJump(jump, next_alternative);
+                    } else {
+                        try failures.appendSlice(self.scratch_allocator, alternative_failures.items);
+                    }
+                }
+                const end = try self.currentTarget(pattern.span);
+                for (successes.items) |jump| try self.patchJump(jump, end);
+            },
+            else => return self.failUnsupported(pattern.span, "match pattern form is not implemented"),
         }
     }
 
@@ -1684,6 +1823,8 @@ const Compiler = struct {
         const node = self.ast.node(node_id);
         const children = self.ast.children(node_id);
         if (children.len == 0) return self.failUnsupported(node.span, "call shape is unsupported");
+        const callee_node = self.ast.node(children[0]);
+        if (callee_node.kind == .attribute and std.mem.eql(u8, callee_node.text, "throw")) return self.failUnsupported(callee_node.span, "generator throw() is not supported yet");
         if (children.len == 4 and self.isUnshadowedBuiltinType(children[0])) {
             return self.failUnsupported(node.span, "three-argument dynamic type construction is permanently excluded");
         }

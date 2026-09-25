@@ -207,6 +207,10 @@ const Builder = struct {
             .for_statement => try self.visitFor(scope_id, node_id),
             .try_statement => try self.visitTry(scope_id, node_id),
             .with_statement => try self.visitWith(scope_id, node_id),
+            .match_statement => try self.visitMatch(scope_id, node_id),
+            .match_case => try self.visitMatchCase(scope_id, node_id),
+            .capture_pattern => try self.note(scope_id, node.text, symbol_flags.assign, node_id),
+            .wildcard_pattern => {},
             .named_expression => try self.visitNamedExpression(scope_id, node_id),
             .parameter => try self.visitChildren(scope_id, node_id),
             else => try self.visitChildren(scope_id, node_id),
@@ -376,7 +380,9 @@ const Builder = struct {
         const children = self.ast.children(node_id);
         if (children.len == 0) return;
         try self.visitTarget(scope_id, children[0], .assignment);
-        for (children[1..]) |expression| try self.visit(scope_id, expression);
+        const skip_function_local_annotation = self.scopes.items[@intCast(scope_id)].kind == .function and self.ast.node(children[0]).kind == .name;
+        const first_value_index: usize = if (skip_function_local_annotation) 2 else 1;
+        if (first_value_index < children.len) for (children[first_value_index..]) |expression| try self.visit(scope_id, expression);
     }
 
     fn visitAugmentedAssignment(self: *Builder, scope_id: ScopeId, node_id: NodeId) AnalyzeError!void {
@@ -452,6 +458,23 @@ const Builder = struct {
             }
         }
         try self.visit(scope_id, children[item_count]);
+    }
+
+    fn visitMatch(self: *Builder, scope_id: ScopeId, node_id: NodeId) AnalyzeError!void {
+        const children = self.ast.children(node_id);
+        if (children.len == 0) return error.ScopeAbort;
+        try self.visit(scope_id, children[0]);
+        for (children[1..]) |case_id| try self.visit(scope_id, case_id);
+    }
+
+    fn visitMatchCase(self: *Builder, scope_id: ScopeId, node_id: NodeId) AnalyzeError!void {
+        const node = self.ast.node(node_id);
+        const children = self.ast.children(node_id);
+        const required: usize = if (node.flags & ast_module.match_case_flags.has_guard != 0) 3 else 2;
+        if (children.len != required) return error.ScopeAbort;
+        try self.visit(scope_id, children[0]);
+        if (required == 3) try self.visit(scope_id, children[1]);
+        try self.visit(scope_id, children[required - 1]);
     }
 
     fn visitNamedExpression(self: *Builder, scope_id: ScopeId, node_id: NodeId) AnalyzeError!void {
@@ -653,7 +676,7 @@ const Builder = struct {
 
     fn assignOccurrenceBindings(self: *Builder) std.mem.Allocator.Error!void {
         for (self.ast.nodes, 0..) |node, index| {
-            if ((node.kind != .name and node.kind != .except_handler) or self.node_scopes[index] == no_scope) continue;
+            if ((node.kind != .name and node.kind != .except_handler and node.kind != .capture_pattern) or self.node_scopes[index] == no_scope) continue;
             const scope_id = self.node_scopes[index];
             if (self.symbolIndex(scope_id, node.text)) |symbol_index| {
                 self.node_bindings[index] = self.scopes.items[@intCast(scope_id)].symbols.items[symbol_index].value.binding;

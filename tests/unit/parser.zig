@@ -217,7 +217,8 @@ pub fn testUnsupportedFeatures() !void {
     try expectUnsupported("result = (yield from values)\n", .excluded, "yield from");
     try expectUnsupported("type Point = tuple[int, int]\n", .excluded, "type statement");
     try expectUnsupported("try:\n    pass\nexcept* Error:\n    pass\n", .excluded, "except*");
-    try expectUnsupported("match value:\n    case 1:\n        pass\n", .later_commit, "match");
+    var match_ast = try expectAst("match value:\n    case 1:\n        pass\n");
+    match_ast.deinit();
 }
 
 fn expectAst(source: []const u8) !Ast {

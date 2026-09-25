@@ -30,6 +30,11 @@ pub const Kind = enum {
     except_handler,
     with_statement,
     with_item,
+    match_statement,
+    match_case,
+    capture_pattern,
+    wildcard_pattern,
+    or_pattern,
     function_definition,
     class_definition,
     parameter,
@@ -63,6 +68,7 @@ pub const Kind = enum {
     conditional_expression,
     lambda_expression,
     named_expression,
+    yield_expression,
     comprehension_expression,
     comprehension_clause,
 };
@@ -107,6 +113,10 @@ pub const handler_flags = struct {
 
 pub const with_item_flags = struct {
     pub const has_target: u32 = 1 << 0;
+};
+
+pub const match_case_flags = struct {
+    pub const has_guard: u32 = 1 << 0;
 };
 
 /// Children occupy one contiguous range in Ast.children. Names, literal spellings,

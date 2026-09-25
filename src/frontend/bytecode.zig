@@ -60,6 +60,7 @@ pub const Opcode = enum(u8) {
     make_class,
     set_attribute,
     delete_attribute,
+    store_annotation,
 };
 
 /// Fixed 64-bit register instruction. The least-significant byte is the opcode;
@@ -149,6 +150,7 @@ pub const Instruction = struct {
             55 => .make_class,
             56 => .set_attribute,
             57 => .delete_attribute,
+            58 => .store_annotation,
             else => null,
         };
     }
@@ -266,6 +268,7 @@ pub const TrySite = struct {
 pub const code_flags = struct {
     pub const function: u32 = 1 << 0;
     pub const class_body: u32 = 1 << 1;
+    pub const generator: u32 = 1 << 2;
 };
 
 pub const Code = struct {

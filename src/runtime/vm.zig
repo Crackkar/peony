@@ -234,6 +234,7 @@ pub const Runtime = struct {
     register_frame: gc.RootFrame = .{},
     instruction_pointer: usize = 0,
     resuming_generator: ?*iterator.Iterator = null,
+    suspended_exception_frame: ?*Frame = null,
     synchronous_work_remaining: ?usize = null,
     sync_root_frame: gc.RootFrame = .{},
     sync_roots: [8]gc.Root = @splat(.{ .object = null }),
@@ -681,6 +682,7 @@ pub const Runtime = struct {
     }
 
     fn resetProgram(self: *Runtime, clear_output: bool) void {
+        self.suspended_exception_frame = null;
         if (self.sync_task) |task| {
             if (task.callback_in_progress) self.unwindFramesUntil(task.frame);
         }
@@ -854,11 +856,19 @@ pub const Runtime = struct {
     }
 
     fn hasExceptionContinuation(self: *const Runtime) bool {
+        if (self.suspended_exception_frame != null) return true;
         var frame = self.top_frame;
         while (frame) |current| : (frame = current.previous) {
             for (current.try_blocks.items) |block| {
                 if (block.phase == .handler or (block.phase == .finally_body and block.pending == .exception)) return true;
             }
+        }
+        return false;
+    }
+
+    fn frameHasExceptionContinuation(frame: *const Frame) bool {
+        for (frame.try_blocks.items) |block| {
+            if (block.phase == .handler or (block.phase == .finally_body and block.pending == .exception)) return true;
         }
         return false;
     }
@@ -914,7 +924,10 @@ pub const Runtime = struct {
                 continue;
             }
 
-            if (frame.generator_owner != null) return false;
+            if (frame.generator_owner != null) {
+                if (self.suspended_exception_frame == frame) self.suspended_exception_frame = null;
+                return false;
+            }
             const caller = frame.previous;
             if (caller == null) return false;
             self.appendTracebackCaller(caller.?);
@@ -1070,6 +1083,10 @@ pub const Runtime = struct {
         }
         const frame = self.popFrame() orelse return self.engineFault();
         if (frame.generator_owner != null) {
+            if (frame.generator_owner) |owner| {
+                owner.generator_return_value = result_value;
+                owner.generator_return_pending = true;
+            }
             self.forgetGeneratorFrame(frame);
             self.freeFrameStorage(frame);
             return true;
@@ -1733,7 +1750,7 @@ pub const Runtime = struct {
         };
         if (function.native) |native| {
             const resumable_native = switch (native) {
-                .list, .tuple, .sorted, .next, .list_sort => true,
+                .list, .tuple, .sorted, .next, .list_sort, .generator_send => true,
                 else => false,
             };
             if (resumable_native and self.sync_callback_depth == 0 and self.resuming_generator == null) {
@@ -1799,6 +1816,20 @@ pub const Runtime = struct {
         for (bound_roots) |*root| bound_root_frame.add(root);
         var bound_roots_active = true;
         defer if (bound_roots_active) bound_root_frame.pop();
+        if (function_code.flags & bytecode.code_flags.generator != 0) {
+            if (constructor_instance != null) return self.nativeTypeError(line, column, "__init__() should return None");
+            return switch (iterator.createFunctionGenerator(&self.heap, Value.object(&function.header), bound)) {
+                .value => |selected| blk: {
+                    self.setRegister(instruction.a(), Value.object(&selected.header));
+                    break :blk true;
+                },
+                .python_exception => |exception| blk: {
+                    self.setException(exception, line, column, null);
+                    break :blk false;
+                },
+                .engine_error => self.engineFault(),
+            };
+        }
         const frame = self.allocateFrame(function_code, instruction.a()) catch {
             self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return false;
@@ -2537,8 +2568,7 @@ pub const Runtime = struct {
                     },
                     .suspended => self.engineFault(),
                     .done => blk: {
-                        self.setException(.{ .kind = .stop_iteration, .message = "" }, line, column, null);
-                        break :blk false;
+                        break :blk self.setIteratorStopIteration(loop_iterator, line, column);
                     },
                     .python_exception => |exception| blk: {
                         self.setException(exception, line, column, null);
@@ -2547,6 +2577,8 @@ pub const Runtime = struct {
                     .engine_error => self.engineFault(),
                 };
             },
+            .generator_send => return self.executeGeneratorSend(destination, bound_self, positional, keywords, line, column),
+            .generator_close => return self.executeGeneratorClose(destination, bound_self, positional, keywords, line, column),
             .slice => return self.executeSliceBuiltin(destination, positional, keywords, line, column),
             .enumerate => {
                 if (keywords.len != 0 or positional.len == 0 or positional.len > 2) return self.nativeArity(line, column);
@@ -2562,6 +2594,91 @@ pub const Runtime = struct {
                 return self.storeIteratorOutcome(destination, iterator.createReversed(&self.heap, positional[0]), line, column);
             },
             else => return self.engineFault(),
+        }
+    }
+
+    fn executeGeneratorSend(
+        self: *Runtime,
+        destination: u16,
+        bound_self: Value,
+        positional: []const Value,
+        keywords: []const binder.Keyword,
+        line: u32,
+        column: u32,
+    ) bool {
+        if (keywords.len != 0 or positional.len != 1) return self.nativeArity(line, column);
+        const header = bound_self.asObject() orelse return self.engineFault();
+        const selected = iterator.iteratorFromHeader(header) orelse return self.engineFault();
+        if (selected.mode != .generator) return self.engineFault();
+        if (!selected.started and positional[0].tag() != .none) return self.nativeTypeError(line, column, "can't send non-None value to a just-started generator");
+        selected.generator_send_value = positional[0];
+        if (self.sync_callback_depth == 0 and self.resuming_generator == null) return self.startNextTask(destination, selected, line, column);
+        return switch (self.nextIteratorValue(selected, destination, line, column)) {
+            .item => |value| blk: {
+                self.setRegister(destination, value);
+                break :blk true;
+            },
+            .done => self.setIteratorStopIteration(selected, line, column),
+            .suspended => self.engineFault(),
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk false;
+            },
+            .engine_error => self.engineFault(),
+        };
+    }
+
+    fn executeGeneratorClose(
+        self: *Runtime,
+        destination: u16,
+        bound_self: Value,
+        positional: []const Value,
+        keywords: []const binder.Keyword,
+        line: u32,
+        column: u32,
+    ) bool {
+        if (keywords.len != 0 or positional.len != 0) return self.nativeArity(line, column);
+        const header = bound_self.asObject() orelse return self.engineFault();
+        const selected = iterator.iteratorFromHeader(header) orelse return self.engineFault();
+        if (selected.mode != .generator) return self.engineFault();
+        if (selected.generator_done or !selected.started) {
+            selected.generator_done = true;
+            self.setRegister(destination, Value.noneValue());
+            return true;
+        }
+        const saved_active = self.active_exception;
+        const saved_root = self.exception_root.object;
+        const saved_last = self.last_exception;
+        selected.generator_closing = true;
+        const result = self.resumeGenerator(selected, line, column);
+        selected.generator_closing = false;
+        switch (result) {
+            .done => {
+                self.active_exception = saved_active;
+                self.exception_root.object = saved_root;
+                self.last_exception = saved_last;
+                if (saved_last == null) self.clearErrorText();
+                self.setRegister(destination, Value.noneValue());
+                return true;
+            },
+            .python_exception => |exception| {
+                if (exception.kind == .generator_exit) {
+                    self.active_exception = saved_active;
+                    self.exception_root.object = saved_root;
+                    self.last_exception = saved_last;
+                    if (saved_last == null) self.clearErrorText();
+                    self.setRegister(destination, Value.noneValue());
+                    return true;
+                }
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .item => {
+                self.setException(.{ .kind = .runtime_error, .message = "generator ignored GeneratorExit" }, line, column, null);
+                return false;
+            },
+            .suspended => return self.engineFault(),
+            .engine_error => return self.engineFault(),
         }
     }
 
@@ -3991,6 +4108,7 @@ pub const Runtime = struct {
             selected.started = true;
         }
         const frame: *Frame = @ptrCast(@alignCast(selected.generator_frame orelse return .{ .engine_error = .internal_invariant }));
+        if (self.suspended_exception_frame == frame) self.suspended_exception_frame = null;
         const caller = self.top_frame orelse return .{ .engine_error = .internal_invariant };
         const previous_generator = self.resuming_generator;
         self.resuming_generator = selected;
@@ -4001,10 +4119,35 @@ pub const Runtime = struct {
         for (frame.roots) |*root| frame.root_frame.add(root);
         self.top_frame = frame;
         self.activateFrame(frame);
+        if (selected.generator_yield_register) |register| {
+            const slot: usize = register;
+            if (slot >= frame.registers.len or slot >= frame.roots.len) return .{ .engine_error = .internal_invariant };
+            frame.registers[slot] = selected.generator_send_value;
+            frame.roots[slot].object = selected.generator_send_value.asObject();
+            selected.generator_yield_register = null;
+        }
+        selected.generator_send_value = Value.noneValue();
+        if (selected.generator_closing) {
+            self.setException(.{ .kind = .generator_exit, .message = "" }, line, column, null);
+            if (!self.unwindPythonExceptionUntil(caller)) {
+                const failure: exceptions.PythonException = self.last_exception orelse .{ .kind = .generator_exit, .message = "" };
+                self.unwindFramesUntil(caller);
+                return .{ .python_exception = failure };
+            }
+        }
         var executed: u32 = 0;
         while (true) {
             if (selected.generator_yielded) |value| {
                 selected.generator_yielded = null;
+                if (selected.generator_closing) {
+                    selected.generator_yield_register = null;
+                    selected.generator_frame = null;
+                    selected.generator_roots = &.{};
+                    selected.generator_done = true;
+                    self.freeFrameStorage(frame);
+                    self.setException(.{ .kind = .runtime_error, .message = "generator ignored GeneratorExit" }, line, column, null);
+                    return .{ .python_exception = self.last_exception.? };
+                }
                 return .{ .item = value };
             }
             if (selected.generator_done) return .done;
@@ -4035,6 +4178,7 @@ pub const Runtime = struct {
             if (self.top_frame == active) active.ip = self.instruction_pointer;
             executed += 1;
             if (self.sync_task != null and self.sync_callback_depth == 0 and self.top_frame == frame and executed >= @max(self.sync_task_quantum, 1)) {
+                self.suspended_exception_frame = if (frameHasExceptionContinuation(frame)) frame else null;
                 if (frame.root_frame.stack != null) frame.root_frame.pop();
                 self.top_frame = caller;
                 frame.previous = null;
@@ -4042,6 +4186,24 @@ pub const Runtime = struct {
                 return .suspended;
             }
         }
+    }
+
+    fn setIteratorStopIteration(self: *Runtime, selected: *iterator.Iterator, line: u32, column: u32) bool {
+        var iterator_root = gc.Root{ .object = &selected.header };
+        var root_frame = gc.RootFrame{};
+        root_frame.push(&self.heap.roots);
+        root_frame.add(&iterator_root);
+        defer root_frame.pop();
+        const return_value = if (selected.generator_return_pending) selected.generator_return_value else Value.noneValue();
+        self.setException(.{ .kind = .stop_iteration, .message = "" }, line, column, null);
+        if (self.last_exception) |fault| {
+            if (fault.kind == .stop_iteration) if (self.active_exception) |instance| {
+                instance.value = return_value;
+                selected.generator_return_value = Value.noneValue();
+                selected.generator_return_pending = false;
+            };
+        }
+        return false;
     }
 
     fn createGeneratorFrame(self: *Runtime, selected: *iterator.Iterator, line: u32, column: u32) ?*Frame {
@@ -4061,28 +4223,33 @@ pub const Runtime = struct {
             self.setException(.{ .kind = .type_error, .message = "generator callback must be a Python function" }, line, column, null);
             return null;
         };
-        const outer = selected.inner orelse {
-            _ = self.engineFault();
-            return null;
-        };
-        const argument = Value.object(&outer.header);
         const allocator = self.heap.allocator;
-        const binding = binder.bindFunction(&self.heap, allocator, code.parameter_names, code.parameter_flags, function.defaults, &.{argument}, &.{}) catch |err| {
-            self.setBinderException(err, line, column);
-            return null;
+        var owned_values: ?[]Value = null;
+        const bound_values = if (selected.generator_function) selected.values else blk: {
+            const outer = selected.inner orelse {
+                _ = self.engineFault();
+                return null;
+            };
+            const argument = Value.object(&outer.header);
+            const binding = binder.bindFunction(&self.heap, allocator, code.parameter_names, code.parameter_flags, function.defaults, &.{argument}, &.{}) catch |err| {
+                self.setBinderException(err, line, column);
+                return null;
+            };
+            if (binding.extra_keywords.len != 0) allocator.free(binding.extra_keywords);
+            owned_values = binding.values;
+            break :blk binding.values;
         };
-        defer allocator.free(binding.values);
-        if (binding.extra_keywords.len != 0) allocator.free(binding.extra_keywords);
+        defer if (owned_values) |values| allocator.free(values);
         if (function.cells.len != code.free_names.len) {
             _ = self.engineFault();
             return null;
         }
-        const bound_roots = allocator.alloc(gc.Root, binding.values.len) catch {
+        const bound_roots = allocator.alloc(gc.Root, bound_values.len) catch {
             self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return null;
         };
         defer allocator.free(bound_roots);
-        for (binding.values, 0..) |value, index| bound_roots[index] = .{ .object = value.asObject() };
+        for (bound_values, 0..) |value, index| bound_roots[index] = .{ .object = value.asObject() };
         var bound_frame = gc.RootFrame{};
         bound_frame.push(&self.heap.roots);
         for (bound_roots) |*root| bound_frame.add(root);
@@ -4112,7 +4279,7 @@ pub const Runtime = struct {
         for (bound_roots) |*root| bound_frame.add(root);
         bound_roots_active = true;
         for (code.parameter_names, 0..) |name, index| {
-            const value = binding.values[index];
+            const value = bound_values[index];
             if (indexOfName(code.local_names, name)) |local_index| {
                 frame.locals[local_index] = value;
                 frame.roots[frame.localRootStart() + local_index].object = value.asObject();
@@ -4135,7 +4302,7 @@ pub const Runtime = struct {
             frame.local_cells[index] = cell;
             frame.roots[frame.cellRootStart() + index].object = &cell.header;
         }
-        for (code.parameter_names, 0..) |name, index| if (!self.storeFrameLocal(frame, name, binding.values[index])) {
+        for (code.parameter_names, 0..) |name, index| if (!self.storeFrameLocal(frame, name, bound_values[index])) {
             _ = self.engineFault();
             return null;
         };
@@ -4186,6 +4353,7 @@ pub const Runtime = struct {
         if (self.sync_task) |task| if (task.order.len != 0) self.heap.allocator.free(task.order);
         self.sync_roots = @splat(.{ .object = null });
         self.sync_task = null;
+        self.suspended_exception_frame = null;
         self.sync_yield_requested = false;
     }
 
@@ -4396,8 +4564,7 @@ pub const Runtime = struct {
                         return true;
                     },
                     .done => {
-                        self.setException(.{ .kind = .stop_iteration, .message = "" }, task.line, task.column, null);
-                        return false;
+                        return self.setIteratorStopIteration(selected, task.line, task.column);
                     },
                     .suspended => {
                         if (iteratorHasPendingCallback(selected)) return self.continueSyncTaskAfterCallback(task);
@@ -5390,6 +5557,46 @@ pub const Runtime = struct {
             if (!self.validRegister(register)) return self.engineFault();
             annotation.* = self.registers[register];
         }
+        const annotation_dict = switch (dict_module.create(&self.heap, false)) {
+            .value => |mapping| mapping,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        var annotation_dict_root = gc.Root{ .object = &annotation_dict.header };
+        var annotation_root_frame = gc.RootFrame{};
+        annotation_root_frame.push(&self.heap.roots);
+        annotation_root_frame.add(&annotation_dict_root);
+        defer annotation_root_frame.pop();
+        var annotation_value_index: usize = 0;
+        for (nested_code.parameter_flags, 0..) |flags, parameter_index| {
+            if (flags & ast_module.parameter_flags.has_annotation == 0) continue;
+            if (annotation_value_index >= site.annotation_count or annotation_value_index >= annotations.len) return self.engineFault();
+            const key = switch (string.create(&self.heap, nested_code.parameter_names[parameter_index])) {
+                .value => |value| value,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            if (!self.setMappingValue(annotation_dict, Value.object(&key.header), annotations[annotation_value_index], line, column)) return false;
+            annotation_value_index += 1;
+        }
+        if (site.has_return_annotation) {
+            if (annotation_value_index >= annotations.len) return self.engineFault();
+            const key = switch (string.create(&self.heap, "return")) {
+                .value => |value| value,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            if (!self.setMappingValue(annotation_dict, Value.object(&key.header), annotations[annotation_value_index], line, column)) return false;
+        }
         const captured = allocator.alloc(*functions.Cell, nested_code.free_names.len) catch {
             self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return false;
@@ -5398,7 +5605,7 @@ pub const Runtime = struct {
         for (nested_code.free_names, 0..) |name, index| {
             captured[index] = self.findCell(name) orelse return self.engineFault();
         }
-        switch (functions.createPython(&self.heap, nested_code, &self.environment.header, captured, defaults, annotations)) {
+        switch (functions.createPython(&self.heap, nested_code, &self.environment.header, captured, defaults, annotations, Value.object(&annotation_dict.header))) {
             .value => |function| self.setRegister(instruction.a(), Value.object(&function.header)),
             .python_exception => |exception| {
                 self.setException(exception, line, column, null);
@@ -5743,6 +5950,11 @@ pub const Runtime = struct {
                     return false;
                 }
             },
+            .store_annotation => {
+                if (!self.validRegister(instruction.a())) return self.engineFault();
+                const name = self.codeName(instruction.index32()) orelse return self.engineFault();
+                return self.storeAnnotation(name, self.registers[instruction.a()], instruction.flags() != 0, line, column);
+            },
             .load_local => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
                 const name = self.codeName(instruction.index32()) orelse return self.engineFault();
@@ -5836,6 +6048,7 @@ pub const Runtime = struct {
                 const frame = self.top_frame orelse return self.engineFault();
                 if (frame.generator_owner != selected) return self.engineFault();
                 selected.generator_yielded = self.registers[instruction.a()];
+                selected.generator_yield_register = instruction.a();
                 if (frame.root_frame.stack != null) frame.root_frame.pop();
                 self.top_frame = frame.previous;
                 frame.previous = null;
@@ -6105,6 +6318,78 @@ pub const Runtime = struct {
         return self.setMappingValueWithHash(mapping, key, value, key_hash, line, column);
     }
 
+    fn storeAnnotation(self: *Runtime, name: []const u8, annotation: Value, class_scope: bool, line: u32, column: u32) bool {
+        const class = if (class_scope) (self.top_frame orelse return self.engineFault()).class_namespace else null;
+        if (class_scope and class == null) return self.engineFault();
+        var mapping: *dict_module.Dict = undefined;
+        if (class) |selected_class| {
+            if (class_module.ownClassAttribute(selected_class, "__annotations__")) |existing| {
+                const header = existing.asObject() orelse return self.nativeTypeError(line, column, "'__annotations__' must be a dict");
+                mapping = dict_module.dictFromHeader(header) orelse return self.nativeTypeError(line, column, "'__annotations__' must be a dict");
+            } else {
+                mapping = switch (dict_module.create(&self.heap, false)) {
+                    .value => |created| created,
+                    .python_exception => |exception| {
+                        self.setException(exception, line, column, null);
+                        return false;
+                    },
+                    .engine_error => return self.engineFault(),
+                };
+                var roots = [_]gc.Root{ .{ .object = &selected_class.header }, .{ .object = &mapping.header } };
+                var root_frame = gc.RootFrame{};
+                root_frame.push(&self.heap.roots);
+                for (&roots) |*root| root_frame.add(root);
+                defer root_frame.pop();
+                class_module.setClassAttribute(&self.heap, selected_class, "__annotations__", Value.object(&mapping.header)) catch {
+                    self.setException(exceptions.memoryError(), line, column, null);
+                    return false;
+                };
+                return self.storeAnnotationEntry(mapping, name, annotation, line, column);
+            }
+        } else if (self.globalValue("__annotations__")) |existing| {
+            const header = existing.asObject() orelse return self.nativeTypeError(line, column, "'__annotations__' must be a dict");
+            mapping = dict_module.dictFromHeader(header) orelse return self.nativeTypeError(line, column, "'__annotations__' must be a dict");
+        } else {
+            mapping = switch (dict_module.create(&self.heap, false)) {
+                .value => |created| created,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            var roots = [_]gc.Root{ .{ .object = &mapping.header }, .{ .object = annotation.asObject() } };
+            var root_frame = gc.RootFrame{};
+            root_frame.push(&self.heap.roots);
+            for (&roots) |*root| root_frame.add(root);
+            defer root_frame.pop();
+            if (!self.storeGlobal("__annotations__", Value.object(&mapping.header))) {
+                self.setException(exceptions.memoryError(), line, column, null);
+                return false;
+            }
+            return self.storeAnnotationEntry(mapping, name, annotation, line, column);
+        }
+        return self.storeAnnotationEntry(mapping, name, annotation, line, column);
+    }
+
+    fn storeAnnotationEntry(self: *Runtime, mapping: *dict_module.Dict, name: []const u8, annotation: Value, line: u32, column: u32) bool {
+        var roots = [_]gc.Root{ .{ .object = &mapping.header }, .{ .object = annotation.asObject() }, .{ .object = null } };
+        var root_frame = gc.RootFrame{};
+        root_frame.push(&self.heap.roots);
+        for (&roots) |*root| root_frame.add(root);
+        defer root_frame.pop();
+        const key = switch (string.create(&self.heap, name)) {
+            .value => |value| value,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        roots[2].object = &key.header;
+        return self.setMappingValue(mapping, Value.object(&key.header), annotation, line, column);
+    }
+
     fn setMappingValueWithHash(self: *Runtime, mapping: *dict_module.Dict, key: Value, value: Value, key_hash: u64, line: u32, column: u32) bool {
         var context = DictEqualityContext{ .runtime = self, .line = line, .column = column };
         return switch (dict_module.set(&self.heap, mapping, key, value, key_hash, &context, dictKeysEqual)) {
@@ -6229,6 +6514,12 @@ pub const Runtime = struct {
 
     fn lookupAttributeValue(self: *Runtime, receiver: Value, name: []const u8, line: u32, column: u32) ?Value {
         const header = receiver.asObject() orelse return null;
+        if (functions.functionFromHeader(header)) |function| {
+            if (std.mem.eql(u8, name, "__annotations__")) return function.annotations_dict;
+        }
+        if (exceptions.instanceFromHeader(header)) |instance| {
+            if (instance.kind == .stop_iteration and std.mem.eql(u8, name, "value")) return instance.value;
+        }
         if (file_module.fromHeader(header)) |file| {
             if (std.mem.eql(u8, name, "closed")) return if (file.closed) Value.trueValue() else Value.falseValue();
             if (std.mem.eql(u8, name, "name")) return self.stringValueResult(string.create(&self.heap, file.path), line, column);
@@ -6429,6 +6720,18 @@ pub const Runtime = struct {
         if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
         const name = self.codeName(instruction.c()) orelse return self.engineFault();
         const receiver = self.registers[instruction.b()];
+        if (receiver.asObject()) |header| if (functions.functionFromHeader(header)) |function| {
+            if (std.mem.eql(u8, name, "__annotations__")) {
+                self.setRegister(instruction.a(), function.annotations_dict);
+                return true;
+            }
+        };
+        if (receiver.asObject()) |header| if (exceptions.instanceFromHeader(header)) |instance| {
+            if (instance.kind == .stop_iteration and std.mem.eql(u8, name, "value")) {
+                self.setRegister(instruction.a(), instance.value);
+                return true;
+            }
+        };
         if (receiver.asObject()) |header| if (file_module.fromHeader(header)) |file| {
             if (std.mem.eql(u8, name, "closed")) {
                 self.setRegister(instruction.a(), if (file.closed) Value.trueValue() else Value.falseValue());
@@ -8413,6 +8716,12 @@ fn builtinNative(name: []const u8) ?functions.Native {
 
 fn attributeNative(receiver: Value, name: []const u8) ?functions.Native {
     const header = receiver.asObject() orelse return null;
+    if (iterator.iteratorFromHeader(header)) |selected| {
+        if (selected.mode == .generator) {
+            if (std.mem.eql(u8, name, "send")) return .generator_send;
+            if (std.mem.eql(u8, name, "close")) return .generator_close;
+        }
+    }
     if (class_module.descriptorFromHeader(header)) |descriptor| if (descriptor.kind == .property) {
         if (std.mem.eql(u8, name, "setter")) return .descriptor_setter;
         if (std.mem.eql(u8, name, "deleter")) return .descriptor_deleter;

@@ -228,6 +228,25 @@ pub fn build(b: *std.Build) void {
     classes_test_module.addImport("frontend_parser", frontend_modules.parser);
     classes_test_module.addImport("frontend_ast", frontend_modules.ast);
     classes_test_module.addImport("frontend_scope", frontend_modules.scope);
+    const generators_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/generators.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    generators_test_module.addImport("runtime_vm", runtime_vm_module);
+    generators_test_module.addImport("runtime_host", native_runtime.host);
+    const annotations_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/annotations.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    annotations_test_module.addImport("runtime_vm", runtime_vm_module);
+    const match_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/match.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    match_test_module.addImport("runtime_vm", runtime_vm_module);
     lexer_test_module.addImport("frontend_lexer", frontend_modules.lexer);
     lexer_test_module.addImport("frontend_token", frontend_modules.token);
     const parser_test_module = b.createModule(.{
@@ -271,6 +290,9 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("vfs_tests", vfs_test_module);
     unit_test_root.addImport("file_tests", files_test_module);
     unit_test_root.addImport("class_tests", classes_test_module);
+    unit_test_root.addImport("generator_tests", generators_test_module);
+    unit_test_root.addImport("annotation_tests", annotations_test_module);
+    unit_test_root.addImport("match_tests", match_test_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -560,6 +582,7 @@ fn createRuntimeModules(
         .optimize = optimize,
     });
     exception_module.addImport("runtime_gc", gc_module);
+    exception_module.addImport("runtime_value", value_module);
     number_module.addImport("runtime_exception", exception_module);
     const host_module = b.createModule(.{
         .root_source_file = b.path("src/runtime/host.zig"),

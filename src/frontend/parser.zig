@@ -136,7 +136,10 @@ const Parser = struct {
             return;
         }
         if (self.atText("import") or self.atText("from")) return self.failUnsupported(.later_commit, "import statements are not parsed in this commit");
-        if (self.atText("match") and self.looksLikeMatchStatement()) return self.failUnsupported(.later_commit, "match statements are not parsed in this commit");
+        if (self.atText("match") and self.looksLikeMatchStatement()) {
+            try statements.append(self.allocator, try self.parseMatch());
+            return;
+        }
         if (self.atText("type") and self.peekKind(1, .identifier) and self.peekText(2, "=")) return self.failUnsupported(.excluded, "type statements and PEP 695 syntax are permanently excluded");
         if (self.atOperator("@")) {
             const decorators = try self.parseDecorators();
@@ -392,6 +395,122 @@ const Parser = struct {
         return self.addNode(.for_statement, .{ .start = start.start, .end = end }, "", 0, children.items);
     }
 
+    fn parseMatch(self: *Parser) ParseError!NodeId {
+        const start = self.advance();
+        const subject = try self.parseExpression(0);
+        _ = try self.expectText(":", "expected ':' after match subject");
+        if (!self.at(.newline)) return self.failAtCurrent("match requires an indented case block");
+        _ = self.advance();
+        while (self.at(.newline)) _ = self.advance();
+        if (!self.at(.indent)) return self.failAtCurrent("expected an indented block after 'match'");
+        const indent = self.advance();
+        var cases: std.ArrayList(NodeId) = .empty;
+        var prior_irrefutable = false;
+        var end = indent.end;
+        while (!self.at(.dedent) and !self.at(.endmarker)) {
+            if (self.at(.newline)) {
+                _ = self.advance();
+                continue;
+            }
+            if (!self.atText("case")) return self.failAtCurrent("expected 'case' in match block");
+            const case_token = self.advance();
+            if (prior_irrefutable) return self.failAtToken(case_token, "irrefutable pattern makes remaining patterns unreachable");
+            const pattern = try self.parseMatchPattern();
+            var guard: ?NodeId = null;
+            if (self.atText("if")) {
+                _ = self.advance();
+                guard = try self.parseExpression(0);
+            }
+            _ = try self.expectText(":", "expected ':' after case pattern");
+            const body = try self.parseSuite();
+            var children: std.ArrayList(NodeId) = .empty;
+            try children.append(self.allocator, pattern);
+            if (guard) |expression| try children.append(self.allocator, expression);
+            try children.append(self.allocator, body);
+            const flags = if (guard != null) ast_module.match_case_flags.has_guard else 0;
+            try cases.append(self.allocator, try self.addNode(.match_case, .{ .start = case_token.start, .end = self.node(body).span.end }, "", flags, children.items));
+            end = self.node(body).span.end;
+            prior_irrefutable = guard == null and self.patternIsIrrefutable(pattern);
+        }
+        if (!self.at(.dedent)) return self.failAtCurrent("expected end of match block");
+        _ = self.advance();
+        if (cases.items.len == 0) return self.failAtCurrent("match statement requires at least one case");
+        var children: std.ArrayList(NodeId) = .empty;
+        try children.append(self.allocator, subject);
+        try children.appendSlice(self.allocator, cases.items);
+        return self.addNode(.match_statement, .{ .start = start.start, .end = end }, "", 0, children.items);
+    }
+
+    fn parseMatchPattern(self: *Parser) ParseError!NodeId {
+        const first = try self.parseMatchPatternAtom();
+        var alternatives: std.ArrayList(NodeId) = .empty;
+        try alternatives.append(self.allocator, first);
+        if (!self.atOperator("|")) return first;
+        var expected_names = std.ArrayList([]const u8).empty;
+        try self.collectPatternCaptures(first, &expected_names);
+        while (self.atOperator("|")) {
+            _ = self.advance();
+            const alternative = try self.parseMatchPatternAtom();
+            var actual_names = std.ArrayList([]const u8).empty;
+            try self.collectPatternCaptures(alternative, &actual_names);
+            if (!sameNames(expected_names.items, actual_names.items)) return self.failSpan("alternative patterns bind different names", self.node(alternative).span);
+            if (self.patternIsIrrefutable(alternatives.items[alternatives.items.len - 1])) {
+                return self.failSpan("irrefutable pattern alternative is unreachable", self.node(alternatives.items[alternatives.items.len - 1]).span);
+            }
+            try alternatives.append(self.allocator, alternative);
+        }
+        return self.addNode(.or_pattern, .{ .start = self.node(first).span.start, .end = self.node(alternatives.items[alternatives.items.len - 1]).span.end }, "", 0, alternatives.items);
+    }
+
+    fn parseMatchPatternAtom(self: *Parser) ParseError!NodeId {
+        const token = self.current();
+        if (self.atText("[")) return self.failUnsupported(.later_commit, "sequence pattern matching is not supported yet");
+        if (self.atText("(")) {
+            _ = self.advance();
+            if (self.atText(")")) return self.failUnsupported(.later_commit, "sequence pattern matching is not supported yet");
+            const grouped = try self.parseMatchPattern();
+            if (self.atText(",")) return self.failUnsupported(.later_commit, "sequence pattern matching is not supported yet");
+            _ = try self.expectText(")", "expected ')' after grouped pattern");
+            return grouped;
+        }
+        if (self.atText("{")) return self.failUnsupported(.later_commit, "mapping pattern matching is not supported yet");
+        if (self.atOperator("-") and (self.peekKind(1, .integer) or self.peekKind(1, .float))) {
+            const minus = self.advance();
+            const literal = self.current();
+            const value = try self.leaf(if (literal.kind == .integer) .integer_literal else .float_literal, literal);
+            return self.addNode(.unary_expression, .{ .start = minus.start, .end = self.node(value).span.end }, "-", 0, &.{value});
+        }
+        if (token.kind == .integer) return self.leaf(.integer_literal, token);
+        if (token.kind == .float) return self.leaf(.float_literal, token);
+        if (token.kind == .string) return self.leaf(.string_literal, token);
+        if (token.kind != .identifier) return self.failAtCurrent("expected a literal or capture pattern");
+        const text = self.tokenText(token);
+        if (self.peekText(1, "(")) return self.failUnsupported(.later_commit, "class pattern matching is not supported yet");
+        if (std.mem.eql(u8, text, "None")) return self.leaf(.none_literal, token);
+        if (std.mem.eql(u8, text, "True") or std.mem.eql(u8, text, "False")) return self.leaf(.bool_literal, token);
+        _ = self.advance();
+        if (std.mem.eql(u8, text, "_")) return self.addNode(.wildcard_pattern, tokenSpan(token), text, 0, &.{});
+        return self.addNode(.capture_pattern, tokenSpan(token), text, 0, &.{});
+    }
+
+    fn collectPatternCaptures(self: *Parser, pattern: NodeId, output: *std.ArrayList([]const u8)) ParseError!void {
+        const selected_node = self.node(pattern);
+        if (selected_node.kind == .capture_pattern) {
+            try output.append(self.allocator, selected_node.text);
+            return;
+        }
+        if (selected_node.kind == .or_pattern) for (self.childrenOf(pattern)) |child| try self.collectPatternCaptures(child, output);
+    }
+
+    fn patternIsIrrefutable(self: *const Parser, pattern: NodeId) bool {
+        const selected_node = self.node(pattern);
+        if (selected_node.kind == .capture_pattern or selected_node.kind == .wildcard_pattern) return true;
+        if (selected_node.kind == .or_pattern) for (self.childrenOf(pattern)) |child| {
+            if (self.patternIsIrrefutable(child)) return true;
+        };
+        return false;
+    }
+
     fn parseTry(self: *Parser) ParseError!NodeId {
         const start = self.advance();
         _ = try self.expectText(":", "expected ':' after try");
@@ -545,7 +664,13 @@ const Parser = struct {
             _ = try self.expectText(")", "expected ')' after class bases");
         }
         _ = try self.expectText(":", "expected ':' after class header");
-        const body = try self.parseSuite();
+        const enclosing_function_depth = self.function_depth;
+        self.function_depth = 0;
+        const body = self.parseSuite() catch |err| {
+            self.function_depth = enclosing_function_depth;
+            return err;
+        };
+        self.function_depth = enclosing_function_depth;
         var children: std.ArrayList(NodeId) = .empty;
         try children.appendSlice(self.allocator, decorators);
         try children.appendSlice(self.allocator, bases.items);
@@ -771,7 +896,13 @@ const Parser = struct {
             if (std.mem.eql(u8, text, "await")) return self.failUnsupported(.excluded, "async/await syntax is permanently excluded");
             if (std.mem.eql(u8, text, "yield")) {
                 if (self.peekText(1, "from")) return self.failUnsupported(.excluded, "yield from syntax is permanently excluded");
-                return self.failUnsupported(.later_commit, "yield expressions are not parsed in this commit");
+                if (self.function_depth == 0) return self.failAtToken(token, "yield outside function");
+                _ = self.advance();
+                if (self.at(.newline) or self.at(.endmarker) or self.atText(")") or self.atText("]") or self.atText("}") or self.atText(";") or self.atText(",")) {
+                    return self.addNode(.yield_expression, .{ .start = token.start, .end = token.end }, "", 0, &.{});
+                }
+                const value = try self.parseExpression(0);
+                return self.addNode(.yield_expression, .{ .start = token.start, .end = self.node(value).span.end }, "", 0, &.{value});
             }
             if (isHardKeyword(text)) return self.failAtToken(token, "expected an expression");
             return self.leaf(.name, token);
@@ -1381,6 +1512,19 @@ fn findFstringFieldEnd(source: []const u8, start: usize) ?usize {
 
 fn tokenSpan(token: Token) Span {
     return .{ .start = token.start, .end = token.end };
+}
+
+fn sameNames(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left) |name| {
+        var found = false;
+        for (right) |candidate| if (std.mem.eql(u8, name, candidate)) {
+            found = true;
+            break;
+        };
+        if (!found) return false;
+    }
+    return true;
 }
 
 fn sourceLocation(source: []const u8, end: usize) struct { line: usize, column: usize } {

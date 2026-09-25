@@ -1,5 +1,7 @@
 const std = @import("std");
 const gc = @import("runtime_gc");
+const value_module = @import("runtime_value");
+const Value = value_module.Value;
 
 pub const PythonExceptionKind = enum {
     base_exception,
@@ -75,6 +77,7 @@ pub const ExceptionInstance = struct {
     allocator: std.mem.Allocator,
     kind: PythonExceptionKind,
     message: []u8,
+    value: Value = Value.noneValue(),
     cause: ?*ExceptionInstance = null,
     context: ?*ExceptionInstance = null,
     suppress_context: bool = false,
@@ -123,6 +126,7 @@ fn traceInstance(header: *gc.Header, tracer: *gc.Tracer) void {
     const instance: *ExceptionInstance = @ptrCast(@alignCast(header));
     if (instance.cause) |cause| tracer.visit(&cause.header);
     if (instance.context) |context| tracer.visit(&context.header);
+    tracer.visit(instance.value.asObject());
 }
 
 fn destroyInstance(header: *gc.Header, allocator: std.mem.Allocator) void {

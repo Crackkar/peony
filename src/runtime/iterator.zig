@@ -68,6 +68,12 @@ pub const Iterator = struct {
     generator_done: bool = false,
     generator_yielded: ?Value = null,
     generator_frame_destroy: ?*const fn (*anyopaque, std.mem.Allocator) void = null,
+    generator_function: bool = false,
+    generator_send_value: Value = Value.noneValue(),
+    generator_yield_register: ?u16 = null,
+    generator_return_value: Value = Value.noneValue(),
+    generator_return_pending: bool = false,
+    generator_closing: bool = false,
 };
 
 pub const NextResult = union(enum) {
@@ -107,6 +113,8 @@ fn traceIterator(header: *gc.Header, tracer: *gc.Tracer) void {
     tracer.visit(iterator.callback.asObject());
     if (iterator.user_object) |user| tracer.visit(user.asObject());
     if (iterator.generator_yielded) |value| tracer.visit(value.asObject());
+    tracer.visit(iterator.generator_send_value.asObject());
+    tracer.visit(iterator.generator_return_value.asObject());
     for (iterator.generator_roots) |root| tracer.visit(root.object);
 }
 
@@ -596,6 +604,31 @@ pub fn createGenerator(heap: *Heap, callback: Value, outer: Value) exceptions.Re
     for (&roots) |*root| frame.add(root);
     defer frame.pop();
     return createInitialized(heap, .{ .mode = .generator, .inner = source_iterator, .callback = callback });
+}
+
+pub fn createFunctionGenerator(heap: *Heap, callback: Value, bound_values: []const Value) exceptions.Result(*Iterator) {
+    const allocator = heap.allocator;
+    const roots = allocator.alloc(gc.Root, bound_values.len + 2) catch return pythonError(*Iterator, .memory_error, "session memory limit exceeded");
+    defer allocator.free(roots);
+    @memset(roots, .{ .object = null });
+    roots[0].object = callback.asObject();
+    for (bound_values, 0..) |value, index| roots[index + 1].object = value.asObject();
+    var frame = gc.RootFrame{};
+    frame.push(&heap.roots);
+    for (roots) |*root| frame.add(root);
+    defer frame.pop();
+
+    const created = createInitialized(heap, .{ .mode = .generator, .callback = callback });
+    const selected = switch (created) {
+        .value => |value| value,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    roots[bound_values.len + 1].object = &selected.header;
+    const owned = allocator.dupe(Value, bound_values) catch return pythonError(*Iterator, .memory_error, "session memory limit exceeded");
+    selected.values = owned;
+    selected.generator_function = true;
+    return .{ .value = selected };
 }
 
 pub fn createUserIterator(heap: *Heap, user: Value) exceptions.Result(*Iterator) {

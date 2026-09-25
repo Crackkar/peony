@@ -17,6 +17,9 @@ const host_codec_tests = @import("host_codec_tests");
 const vfs_tests = @import("vfs_tests");
 const file_tests = @import("file_tests");
 const class_tests = @import("class_tests");
+const generator_tests = @import("generator_tests");
+const annotation_tests = @import("annotation_tests");
+const match_tests = @import("match_tests");
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -905,4 +908,64 @@ test "dynamic type and metaclass construction remain explicitly unsupported" {
 
 test "shadowed builtin type remains callable in module and local scopes" {
     try class_tests.testShadowedTypeNameRemainsCallable();
+}
+
+test "yield is a resumable expression with send and StopIteration.value" {
+    try generator_tests.testYieldSendReturnValueAndExhaustion();
+}
+
+test "resumed generator exceptions unwind inside and outside the frame" {
+    try generator_tests.testGeneratorExceptionsInsideAndOutsideResumedFrame();
+}
+
+test "generator close runs finally once and rejects yielding during close" {
+    try generator_tests.testGeneratorCloseRunsFinallyOnceAndRejectsYieldDuringClose();
+}
+
+test "generator resumes across host input at quantum one" {
+    try generator_tests.testGeneratorResumesAcrossHostInputAtQuantumOne();
+}
+
+test "yield from and throw remain explicitly unsupported" {
+    try generator_tests.testYieldFromAndThrowRemainExplicitlyUnsupported();
+}
+
+test "yield is invalid in a class suite but valid inside a method" {
+    try generator_tests.testYieldIsRejectedInClassSuiteButAllowedInMethod();
+}
+
+test "function annotations evaluate in Python order and are stored" {
+    try annotation_tests.testFunctionAnnotationsEvaluateInPythonOrderAndAreStored();
+}
+
+test "module class target and local annotation rules" {
+    try annotation_tests.testModuleClassTargetAndLocalAnnotationRules();
+}
+
+test "future annotations is explicitly unsupported" {
+    try annotation_tests.testFutureAnnotationsIsExplicitlyUnsupported();
+}
+
+test "match literal singleton capture guards and subject-once behavior" {
+    try match_tests.testLiteralSingletonOrCaptureGuardAndSubjectOnce();
+}
+
+test "singleton match patterns use identity while numeric literals use equality" {
+    try match_tests.testSingletonPatternsUseIdentity();
+}
+
+test "signed numeric match patterns" {
+    try match_tests.testSignedNumericPatterns();
+}
+
+test "irrefutable OR alternatives have syntax diagnostics" {
+    try match_tests.testIrrefutableOrAlternativesHaveSyntaxDiagnostics();
+}
+
+test "match invalid captures and irrefutable cases have diagnostics" {
+    try match_tests.testInvalidMatchCapturesAndIrrefutableCaseDiagnostics();
+}
+
+test "excluded pattern forms have specific unsupported diagnostics" {
+    try match_tests.testExcludedPatternFormsHaveSpecificDiagnostics();
 }

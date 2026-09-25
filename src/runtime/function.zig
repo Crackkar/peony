@@ -97,6 +97,8 @@ pub const Native = enum {
     super_builtin,
     descriptor_setter,
     descriptor_deleter,
+    generator_send,
+    generator_close,
 };
 
 pub const Cell = struct {
@@ -112,6 +114,7 @@ pub const Function = struct {
     cells: []*Cell = &.{},
     defaults: []Value = &.{},
     annotations: []Value = &.{},
+    annotations_dict: Value = Value.noneValue(),
     native: ?Native = null,
     bound_self: Value = Value.noneValue(),
 };
@@ -163,6 +166,7 @@ pub fn createPython(
     cells: []const *Cell,
     defaults: []const Value,
     annotations: []const Value,
+    annotations_dict: Value,
 ) Result {
     const owned_cells = heap.allocator.dupe(*Cell, cells) catch return .{ .python_exception = memoryError() };
     const owned_defaults = heap.allocator.dupe(Value, defaults) catch {
@@ -188,6 +192,7 @@ pub fn createPython(
         .cells = owned_cells,
         .defaults = owned_defaults,
         .annotations = owned_annotations,
+        .annotations_dict = annotations_dict,
     };
     return .{ .value = function };
 }
@@ -203,6 +208,7 @@ fn traceFunction(header: *gc.Header, tracer: *gc.Tracer) void {
     for (function.cells) |cell| tracer.visit(&cell.header);
     for (function.defaults) |value| tracer.visit(value.asObject());
     for (function.annotations) |value| tracer.visit(value.asObject());
+    tracer.visit(function.annotations_dict.asObject());
     tracer.visit(function.bound_self.asObject());
 }
 
