@@ -97,8 +97,13 @@ pub fn build(b: *std.Build) void {
     compiler_module.addImport("runtime_bytes", native_runtime.bytes);
     compiler_module.addImport("runtime_exception", native_runtime.exception);
     const native_iterator_module = createRuntimeIteratorModule(b, target, optimize, native_runtime);
+    const native_format_rules_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/format.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const runtime_vm_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/vm.zig"),
+        .root_source_file = b.path("src/vm/runtime.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -123,6 +128,7 @@ pub fn build(b: *std.Build) void {
     runtime_vm_module.addImport("runtime_vfs", native_runtime.vfs);
     runtime_vm_module.addImport("runtime_file", native_runtime.file);
     runtime_vm_module.addImport("runtime_module", native_runtime.module);
+    runtime_vm_module.addImport("runtime_format_rules", native_format_rules_module);
     const compiler_vm_test_module = b.createModule(.{
         .root_source_file = b.path("tests/unit/compiler_vm.zig"),
         .target = target,
@@ -439,6 +445,11 @@ fn createExecutionVmModule(
     const function_module = createRuntimeFunctionModule(b, target, optimize, runtime, bytecode_module);
     runtime.class.addImport("runtime_function", function_module);
     const binder_module = createRuntimeBinderModule(b, target, optimize, runtime);
+    const format_rules_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime/format.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const compiler_module = b.createModule(.{
         .root_source_file = b.path("src/frontend/compiler.zig"),
         .target = target,
@@ -455,7 +466,7 @@ fn createExecutionVmModule(
     compiler_module.addImport("runtime_bytes", runtime.bytes);
     compiler_module.addImport("runtime_exception", runtime.exception);
     const vm_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/vm.zig"),
+        .root_source_file = b.path("src/vm/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .single_threaded = target.result.cpu.arch == .wasm32,
@@ -481,6 +492,7 @@ fn createExecutionVmModule(
     vm_module.addImport("runtime_vfs", runtime.vfs);
     vm_module.addImport("runtime_file", runtime.file);
     vm_module.addImport("runtime_module", runtime.module);
+    vm_module.addImport("runtime_format_rules", format_rules_module);
     return vm_module;
 }
 
