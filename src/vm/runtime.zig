@@ -14,6 +14,12 @@ const functions = @import("runtime_function");
 const host = @import("runtime_host");
 const vfs_module = @import("runtime_vfs");
 const class_module = @import("runtime_class");
+const native_types = @import("../stdlib/types.zig");
+const byte_module = @import("runtime_bytes");
+const dict_module = @import("runtime_dict");
+const slice_module = @import("runtime_slice");
+const file_module = @import("runtime_file");
+const module_module = @import("runtime_module");
 
 const Value = value_module.Value;
 const Code = bytecode.Code;
@@ -46,6 +52,7 @@ const text_ops = @import("text.zig");
 const builtins = @import("builtins.zig");
 const calls = @import("calls.zig");
 const control = @import("control.zig");
+const native_tasks = @import("native_tasks.zig");
 const GlobalEntry = state.GlobalEntry;
 const TryPhase = state.TryPhase;
 const PendingTransfer = state.PendingTransfer;
@@ -79,11 +86,15 @@ pub const Runtime = struct {
     environment_root: gc.Root = .{ .object = null },
     builtin_frame: gc.RootFrame = .{},
     module_cache_root: gc.Root = .{ .object = null },
+    native_task_root: gc.Root = .{ .object = null },
+    json_decode_error_root: gc.Root = .{ .object = null },
     print_builtin_root: gc.Root = .{ .object = null },
     input_builtin_root: gc.Root = .{ .object = null },
     range_builtin_root: gc.Root = .{ .object = null },
     object_class_root: gc.Root = .{ .object = null },
     type_class_root: gc.Root = .{ .object = null },
+    native_class_roots: [@typeInfo(native_types.TypeId).@"enum".fields.len]gc.Root = @splat(.{ .object = null }),
+    primitive_class_roots: [@typeInfo(class_module.PrimitiveType).@"enum".fields.len]gc.Root = @splat(.{ .object = null }),
     exception_frame: gc.RootFrame = .{},
     exception_root: gc.Root = .{ .object = null },
     emergency_exception_root: gc.Root = .{ .object = null },
@@ -115,9 +126,12 @@ pub const Runtime = struct {
     limit_reached: bool = false,
     configured_quantum: u32 = default_quantum,
     stdout_bytes: std.ArrayList(u8) = .empty,
+    stderr_bytes: std.ArrayList(u8) = .empty,
+    argv_items: std.ArrayList([]u8) = .empty,
     repr_path: std.ArrayList(*gc.Header) = .empty,
     value_equality_depth: usize = 0,
     hash_seed: u64 = 0,
+    random_seed: u64 = 0x7065_6f6e_792d_7631,
     last_exception: ?PythonException = null,
     error_text_owned: ?[]u8 = null,
     error_text_static: []const u8 = "",
@@ -175,6 +189,13 @@ pub const Runtime = struct {
     pub const invokeValueSync = calls.invokeValueSync;
     pub const restoreFrameRegister = calls.restoreFrameRegister;
     pub const invokePythonSync = calls.invokePythonSync;
+    pub const currentNativeTask = native_tasks.currentNativeTask;
+    pub const startNativeTask = native_tasks.startNativeTask;
+    pub const processNativeTask = native_tasks.processNativeTask;
+    pub const startTaskCall = native_tasks.startTaskCall;
+    pub const startTaskNext = native_tasks.startTaskNext;
+    pub const pendingNativeHost = native_tasks.pendingNativeHost;
+    pub const resumeNativeHost = native_tasks.resumeNativeHost;
     pub const executeMakeFunction = calls.executeMakeFunction;
     pub const executeMakeClass = calls.executeMakeClass;
     pub const setBinderException = calls.setBinderException;
@@ -360,6 +381,7 @@ pub const Runtime = struct {
     pub const resolveModuleFileUnder = modules.resolveModuleFileUnder;
     pub const executeImportModule = modules.executeImportModule;
     pub const startImportedModule = modules.startImportedModule;
+    pub const startNativeModule = modules.startNativeModule;
     pub const executeImportMember = modules.executeImportMember;
     pub const executeImportStar = modules.executeImportStar;
     pub const storeGlobal = modules.storeGlobal;
@@ -426,6 +448,10 @@ pub const Runtime = struct {
         self.builtin_frame.add(&self.object_class_root);
         self.builtin_frame.add(&self.type_class_root);
         self.builtin_frame.add(&self.module_cache_root);
+        self.builtin_frame.add(&self.native_task_root);
+        self.builtin_frame.add(&self.json_decode_error_root);
+        for (&self.native_class_roots) |*root| self.builtin_frame.add(root);
+        for (&self.primitive_class_roots) |*root| self.builtin_frame.add(root);
         self.exception_frame.push(&self.heap.roots);
         self.exception_frame.add(&self.exception_root);
         self.exception_frame.add(&self.emergency_exception_root);
@@ -484,6 +510,7 @@ pub const Runtime = struct {
         self.clearVfsOutput();
         self.vfs.deinit();
         self.stdout_bytes.deinit(self.heap.allocator);
+        self.stderr_bytes.deinit(self.heap.allocator);
         self.imported_codes.deinit(self.heap.allocator);
         self.repr_path.deinit(self.heap.allocator);
         if (self.traceback_json_owned) |json| self.heap.allocator.free(json);
@@ -497,12 +524,29 @@ pub const Runtime = struct {
     }
 
     pub fn compileAndStart(self: *Runtime, source: []const u8, filename: []const u8) CompileOutcome {
+        return self.compileAndStartArgs(source, filename, &.{});
+    }
+
+    pub fn compileAndStartArgs(self: *Runtime, source: []const u8, filename: []const u8, argv: []const []const u8) CompileOutcome {
         self.vfs.clearTemporary();
         self.clearVfsOutput();
         self.resetProgram(true);
         self.instructions_executed = 0;
         self.work_executed = 0;
         self.limit_reached = false;
+        for (argv) |argument| {
+            const owned = self.heap.allocator.dupe(u8, argument) catch {
+                const exception = PythonException{ .kind = .memory_error, .message = "session memory limit exceeded" };
+                self.setException(exception, 1, 1, null);
+                return .{ .python_exception = exception };
+            };
+            self.argv_items.append(self.heap.allocator, owned) catch {
+                self.heap.allocator.free(owned);
+                const exception = PythonException{ .kind = .memory_error, .message = "session memory limit exceeded" };
+                self.setException(exception, 1, 1, null);
+                return .{ .python_exception = exception };
+            };
+        }
         const outcome = compiler.compile(&self.heap, source, filename);
         switch (outcome) {
             .ready => |code| {
@@ -547,6 +591,7 @@ pub const Runtime = struct {
             return .cancelled;
         }
         if (self.pending_input != null) return .host_request;
+        if (self.currentNativeTask()) |task| if (task.stage == .waiting_host) return .host_request;
         if (self.limit_reached) return .limit;
         if (self.resumed_exception_pending) {
             self.resumed_exception_pending = false;
@@ -567,7 +612,19 @@ pub const Runtime = struct {
         self.sync_task_quantum = quantum;
         self.sync_yield_requested = false;
         var executed: u32 = 0;
+        var native_work_in_run: u64 = 0;
+        const native_work_budget: u64 = 16 * 1024;
         while (executed < quantum) : (executed += 1) {
+            if (self.currentNativeTask()) |task| {
+                if (task.stage == .ready) {
+                    const before_work = self.work_executed;
+                    if (self.processNativeTask(task)) |status| return status;
+                    if (self.limit_reached) return .limit;
+                    native_work_in_run += self.work_executed - before_work;
+                    if (native_work_in_run >= native_work_budget) return .timeslice;
+                    continue;
+                }
+            }
             const frame = self.top_frame orelse return .completed;
             if (frame.ip >= frame.code.instructions.len or frame.code.positions.len != frame.code.instructions.len) {
                 _ = self.engineFault();
@@ -576,6 +633,8 @@ pub const Runtime = struct {
             }
             const current = frame.code.positions[frame.ip];
             const instruction = frame.code.instructions[frame.ip];
+            const executing_generator = frame.generator_owner;
+            if (executing_generator != null) self.resuming_generator = executing_generator;
             if (!self.chargeBytecode()) return .limit;
             frame.ip += 1;
             self.activateFrame(frame);
@@ -601,6 +660,26 @@ pub const Runtime = struct {
             if (self.top_frame == frame) {
                 frame.ip = self.instruction_pointer;
             }
+            if (executing_generator) |generator| {
+                if (self.currentNativeTask()) |task| {
+                    if (task.stage == .waiting_next and task.next_iterator.asObject() == &generator.header and self.top_frame != frame) {
+                        if (generator.generator_yielded) |item| {
+                            generator.generator_yielded = null;
+                            task.child_value = item;
+                            task.child_done = false;
+                            task.child_ready = true;
+                            task.stage = .ready;
+                            self.resuming_generator = null;
+                        } else if (generator.generator_done) {
+                            task.child_value = Value.noneValue();
+                            task.child_done = true;
+                            task.child_ready = true;
+                            task.stage = .ready;
+                            self.resuming_generator = null;
+                        }
+                    }
+                }
+            }
             if (self.sync_task != null and self.sync_task.?.complete) self.clearSyncTask();
             if (self.limit_reached) {
                 if (self.sync_task != null) self.clearSyncTask();
@@ -622,6 +701,7 @@ pub const Runtime = struct {
 
     pub fn cancel(self: *Runtime) void {
         self.pending_input = null;
+        self.native_task_root.object = null;
         self.invalidateEvent();
         self.output_event_pending = false;
         self.cancel_requested = true;
@@ -632,6 +712,7 @@ pub const Runtime = struct {
         self.configured_quantum = config.quantum;
         if (config.seed.len != 0) {
             self.hash_seed = hash_module.mixSessionSeed(std.hash.Wyhash.hash(0, config.seed), @intFromPtr(self));
+            self.random_seed = std.hash.Wyhash.hash(0x7065_6f6e_792d_7631, config.seed);
         }
     }
 
@@ -641,6 +722,10 @@ pub const Runtime = struct {
 
     pub fn workCount(self: *const Runtime) u64 {
         return self.work_executed;
+    }
+
+    pub fn remainingNativeWork(self: *const Runtime) u64 {
+        return self.max_instructions -| self.work_executed;
     }
 
     pub fn mountCourseFile(self: *Runtime, path: []const u8, bytes: []const u8) vfs_module.Error!void {
@@ -664,6 +749,18 @@ pub const Runtime = struct {
         self.vfs_output = try self.vfs.list(path);
         self.vfs_output_owned = true;
         return self.vfs_output;
+    }
+
+    pub fn listVfsDirectories(self: *Runtime, path: []const u8) vfs_module.Error![]const u8 {
+        self.clearVfsOutput();
+        self.vfs_output = try self.vfs.listDirectories(path);
+        self.vfs_output_owned = true;
+        return self.vfs_output;
+    }
+
+    pub fn mkdirVfsDirectory(self: *Runtime, path: []const u8) vfs_module.Error!void {
+        self.clearVfsOutput();
+        try self.vfs.mkdir(path, true, true);
     }
 
     pub fn vfsData(self: *const Runtime) []const u8 {
@@ -696,6 +793,8 @@ pub const Runtime = struct {
 
     /// Accepts a fully decoded packet. A false return leaves the suspended input and event untouched.
     pub fn resumeHost(self: *Runtime, packet: *const host.DecodedPacket) bool {
+        if (!host.validDecodedPacket(packet)) return false;
+        if (self.pending_input == null) return self.resumeNativeHost(packet);
         const pending = self.pending_input orelse return false;
         if (packet.kind != .input or packet.request_id != pending.request_id or packet.flags != 0) return false;
         switch (packet.status) {
@@ -737,11 +836,38 @@ pub const Runtime = struct {
                 self.resumed_exception_pending = true;
             },
         }
+        if (self.currentNativeTask()) |task| {
+            if (task.stage == .waiting_call and task.caller_frame == @as(*anyopaque, @ptrCast(pending.frame))) {
+                if (self.last_exception != null) {
+                    task.child_error = self.active_exception;
+                    task.child_done = false;
+                    self.last_exception = null;
+                    self.active_exception = null;
+                    self.exception_root.object = null;
+                    self.resumed_exception_pending = false;
+                    self.clearErrorText();
+                } else {
+                    task.child_value = pending.frame.registers[pending.destination];
+                    task.child_error = null;
+                }
+                task.child_ready = true;
+                task.stage = .ready;
+            }
+        }
         return true;
     }
 
     pub fn stdout(self: *const Runtime) []const u8 {
         return self.stdout_bytes.items;
+    }
+
+    pub fn stderr(self: *const Runtime) []const u8 {
+        return self.stderr_bytes.items;
+    }
+
+    pub fn appendStderr(self: *Runtime, text: []const u8) bool {
+        self.stderr_bytes.appendSlice(self.heap.allocator, text) catch return false;
+        return true;
     }
 
     pub fn consumeStdout(self: *Runtime, length: usize) bool {
@@ -750,6 +876,15 @@ pub const Runtime = struct {
         const remaining = self.stdout_bytes.items.len - length;
         if (remaining != 0) std.mem.copyForwards(u8, self.stdout_bytes.items[0..remaining], self.stdout_bytes.items[length..]);
         self.stdout_bytes.items.len = remaining;
+        return true;
+    }
+
+    pub fn consumeStderr(self: *Runtime, length: usize) bool {
+        if (length > self.stderr_bytes.items.len) return false;
+        self.invalidateEvent();
+        const remaining = self.stderr_bytes.items.len - length;
+        if (remaining != 0) std.mem.copyForwards(u8, self.stderr_bytes.items[0..remaining], self.stderr_bytes.items[length..]);
+        self.stderr_bytes.items.len = remaining;
         return true;
     }
 
@@ -802,6 +937,7 @@ pub const Runtime = struct {
 
     fn resetProgram(self: *Runtime, clear_output: bool) void {
         self.suspended_exception_frame = null;
+        self.resuming_generator = null;
         if (self.sync_task) |task| {
             if (task.callback_in_progress) self.unwindFramesUntil(task.frame);
         }
@@ -809,10 +945,14 @@ pub const Runtime = struct {
         self.unwindFrames();
 
         self.pending_input = null;
+        self.native_task_root.object = null;
         self.output_event_pending = false;
         self.invalidateEvent();
 
         self.clearGlobals();
+        for (self.argv_items.items) |argument| self.heap.allocator.free(argument);
+        self.argv_items.deinit(self.heap.allocator);
+        self.argv_items = .empty;
         self.module_cache_root.object = null;
         while (self.imported_codes.items.len != 0) {
             const imported = self.imported_codes.pop().?;
@@ -833,21 +973,25 @@ pub const Runtime = struct {
         if (self.traceback_json_owned) |json| self.heap.allocator.free(json);
         self.traceback_json_owned = null;
         if (clear_output) self.stdout_bytes.clearRetainingCapacity();
+        if (clear_output) self.stderr_bytes.clearRetainingCapacity();
+        for (&self.native_class_roots) |*root| root.object = null;
+        self.json_decode_error_root.object = null;
+        for (&self.primitive_class_roots) |*root| root.object = null;
         _ = self.heap.collect();
     }
 
-    fn invalidateEvent(self: *Runtime) void {
+    pub fn invalidateEvent(self: *Runtime) void {
         if (self.event_packet) |packet| self.heap.allocator.free(packet);
         self.event_packet = null;
     }
 
-    fn createEventPacket(self: *Runtime, packet: host.Packet) bool {
+    pub fn createEventPacket(self: *Runtime, packet: host.Packet) bool {
         self.invalidateEvent();
         self.event_packet = host.encode(self.heap.allocator, packet) catch return false;
         return true;
     }
 
-    fn nextEventId(self: *Runtime) u32 {
+    pub fn nextEventId(self: *Runtime) u32 {
         const result = self.next_host_request_id;
         self.next_host_request_id +%= 1;
         if (self.next_host_request_id == 0) self.next_host_request_id = 1;
@@ -1011,6 +1155,9 @@ pub const Runtime = struct {
                     if (!self.ensureBuiltinClasses(line, column)) return false;
                     const root = if (std.mem.eql(u8, name, "object")) self.object_class_root.object else self.type_class_root.object;
                     self.setRegister(instruction.a(), Value.object(root orelse return self.engineFault()));
+                } else if (Runtime.primitiveBuiltin(name)) |primitive| {
+                    const class = self.ensurePrimitiveClass(primitive, line, column) orelse return false;
+                    self.setRegister(instruction.a(), Value.object(&class.header));
                 } else if (self.builtinValue(name)) |value| {
                     self.setRegister(instruction.a(), value);
                 } else if (builtins.builtinNative(name)) |native| {
@@ -1061,6 +1208,13 @@ pub const Runtime = struct {
             .unary => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
                 const input = self.registers[instruction.a()];
+                if (input.asObject()) |header| if (native_types.fromHeader(header)) |object| if (object.ops) |ops| if (ops.unary) |unary| {
+                    if (unary(self, object, @intCast(instruction.flags()), line, column)) |value| {
+                        self.setRegister(instruction.a(), value);
+                        return true;
+                    }
+                    if (self.last_exception != null) return false;
+                };
                 if (instruction.flags() == 3) {
                     const truth = self.valueTruthy(input, line, column) orelse return false;
                     self.setRegister(instruction.a(), if (truth) Value.falseValue() else Value.trueValue());
@@ -1226,13 +1380,19 @@ pub const Runtime = struct {
                 if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b()) or !self.validRegister(instruction.c())) return self.engineFault();
                 const header = self.registers[instruction.b()].asObject() orelse return self.engineFault();
                 const loop_iterator = iterator.iteratorFromHeader(header) orelse return self.engineFault();
+                const previous_task = self.currentNativeTask();
                 switch (self.nextIteratorValue(loop_iterator, instruction.a(), line, column)) {
                     .item => |item| {
                         self.setRegister(instruction.a(), item);
                         self.setRegister(instruction.c(), Value.trueValue());
                     },
                     .done => self.setRegister(instruction.c(), Value.falseValue()),
-                    .suspended => return self.engineFault(),
+                    .suspended => {
+                        const task = self.currentNativeTask() orelse return self.engineFault();
+                        const caller = self.top_frame orelse return self.engineFault();
+                        if (task == previous_task or task.caller_frame != @as(*anyopaque, @ptrCast(caller)) or task.destination != instruction.a()) return self.engineFault();
+                        task.item_presence_destination = instruction.c();
+                    },
                     .python_exception => |exception| {
                         self.setException(exception, line, column, null);
                         return false;
@@ -1313,6 +1473,154 @@ pub const Runtime = struct {
         return class_module.classFromHeader(header);
     }
 
+    pub fn ensureNativeClass(self: *Runtime, type_id: native_types.TypeId, name: []const u8, line: u32, column: u32) ?*class_module.Class {
+        return self.ensureNativeClassWithBase(type_id, name, null, line, column);
+    }
+
+    /// Shared per-run JSON exception identity for `json.loads` and HTTP Response.json.
+    pub fn ensureJsonDecodeErrorClass(self: *Runtime, line: u32, column: u32) ?*exceptions.ExceptionClass {
+        if (self.json_decode_error_root.object) |header| return exceptions.classFromHeader(header);
+        const created = exceptions.createNativeClass(&self.heap, "JSONDecodeError", .value_error, null);
+        return switch (created) {
+            .value => |class| blk: {
+                self.json_decode_error_root.object = &class.header;
+                break :blk class;
+            },
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk null;
+            },
+            .engine_error => blk: {
+                _ = self.engineFault();
+                break :blk null;
+            },
+        };
+    }
+
+    pub fn ensureNativeClassWithBase(self: *Runtime, type_id: native_types.TypeId, name: []const u8, base_primitive: ?class_module.PrimitiveType, line: u32, column: u32) ?*class_module.Class {
+        const index = @intFromEnum(type_id);
+        if (self.native_class_roots[index].object) |header| return class_module.classFromHeader(header);
+        if (!self.ensureBuiltinClasses(line, column)) return null;
+        const object_header = self.object_class_root.object orelse return null;
+        const object_class = class_module.classFromHeader(object_header) orelse return null;
+        const base = if (base_primitive) |primitive| self.ensurePrimitiveClass(primitive, line, column) orelse return null else object_class;
+        return switch (class_module.createClass(&self.heap, name, &.{base}, object_class)) {
+            .value => |class| blk: {
+                class.native_type_id = @intFromEnum(type_id) + 1;
+                self.native_class_roots[index].object = &class.header;
+                break :blk class;
+            },
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk null;
+            },
+            .engine_error => blk: {
+                _ = self.engineFault();
+                break :blk null;
+            },
+        };
+    }
+
+    pub fn ensurePrimitiveClass(self: *Runtime, primitive: class_module.PrimitiveType, line: u32, column: u32) ?*class_module.Class {
+        const index = @intFromEnum(primitive);
+        if (self.primitive_class_roots[index].object) |header| return class_module.classFromHeader(header);
+        if (!self.ensureBuiltinClasses(line, column)) return null;
+        const object_header = self.object_class_root.object orelse return null;
+        const object_class = class_module.classFromHeader(object_header) orelse return null;
+        const base = if (primitive == .bool_type)
+            self.ensurePrimitiveClass(.int_type, line, column) orelse return null
+        else
+            object_class;
+        const name: []const u8 = switch (primitive) {
+            .none_type => "NoneType",
+            .bool_type => "bool",
+            .int_type => "int",
+            .float_type => "float",
+            .str_type => "str",
+            .bytes_type => "bytes",
+            .list_type => "list",
+            .tuple_type => "tuple",
+            .dict_type => "dict",
+            .set_type => "set",
+            .range_type => "range",
+            .slice_type => "slice",
+            .function_type => "function",
+            .module_type => "module",
+            .file_type => "TextIO",
+            .iterator_type => "iterator",
+        };
+        return switch (class_module.createClass(&self.heap, name, &.{base}, object_class)) {
+            .value => |class| blk: {
+                class.primitive = primitive;
+                self.primitive_class_roots[index].object = &class.header;
+                break :blk class;
+            },
+            .python_exception => |exception| blk: {
+                self.setException(exception, line, column, null);
+                break :blk null;
+            },
+            .engine_error => blk: {
+                _ = self.engineFault();
+                break :blk null;
+            },
+        };
+    }
+
+    pub fn primitiveBuiltin(name: []const u8) ?class_module.PrimitiveType {
+        const map = .{
+            .{ "bool", class_module.PrimitiveType.bool_type },
+            .{ "int", class_module.PrimitiveType.int_type },
+            .{ "float", class_module.PrimitiveType.float_type },
+            .{ "str", class_module.PrimitiveType.str_type },
+            .{ "bytes", class_module.PrimitiveType.bytes_type },
+            .{ "list", class_module.PrimitiveType.list_type },
+            .{ "tuple", class_module.PrimitiveType.tuple_type },
+            .{ "dict", class_module.PrimitiveType.dict_type },
+            .{ "set", class_module.PrimitiveType.set_type },
+            .{ "range", class_module.PrimitiveType.range_type },
+            .{ "slice", class_module.PrimitiveType.slice_type },
+        };
+        inline for (map) |entry| if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        return null;
+    }
+
+    pub fn pythonTypeOf(self: *Runtime, value: Value, line: u32, column: u32) ?Value {
+        const primitive: class_module.PrimitiveType = switch (value.tag()) {
+            .none => .none_type,
+            .boolean => .bool_type,
+            .small_int => .int_type,
+            .float => .float_type,
+            .exception_class => return if (self.typeClass()) |class| Value.object(&class.header) else null,
+            .heap_object => blk: {
+                const header = value.asObject().?;
+                if (class_module.instanceFromHeader(header)) |instance| return Value.object(&instance.class.header);
+                if (native_types.fromHeader(header)) |object| return Value.object(&object.class.header);
+                if (exceptions.instanceFromHeader(header)) |instance| {
+                    if (instance.native_class) |class| return Value.object(&class.header);
+                    return Value.exceptionClass(@intCast(@intFromEnum(instance.kind)));
+                }
+                if (exceptions.classFromHeader(header) != null) return if (self.typeClass()) |class| Value.object(&class.header) else null;
+                if (class_module.classFromHeader(header) != null) return if (self.typeClass()) |class| Value.object(&class.header) else null;
+                if (number.isIntegerValue(value)) break :blk .int_type;
+                if (string.fromHeader(header) != null) break :blk .str_type;
+                if (byte_module.fromHeader(header) != null) break :blk .bytes_type;
+                if (sequence.listFromHeader(header) != null) break :blk .list_type;
+                if (sequence.tupleFromHeader(header) != null) break :blk .tuple_type;
+                if (dict_module.dictFromHeader(header)) |mapping| break :blk if (mapping.is_set) .set_type else .dict_type;
+                if (iterator.rangeFromHeader(header) != null) break :blk .range_type;
+                if (slice_module.fromHeader(header) != null) break :blk .slice_type;
+                if (functions.functionFromHeader(header) != null) break :blk .function_type;
+                if (module_module.fromHeader(header) != null) break :blk .module_type;
+                if (file_module.fromHeader(header) != null) break :blk .file_type;
+                if (iterator.iteratorFromHeader(header) != null) break :blk .iterator_type;
+                break :blk .none_type;
+            },
+            .unbound, .deleted => return null,
+        };
+        const class = self.ensurePrimitiveClass(primitive, line, column) orelse return null;
+        return Value.object(&class.header);
+    }
+
     pub fn activeCode(self: *const Runtime) ?*Code {
         const frame = self.top_frame orelse return null;
         return frame.code;
@@ -1335,7 +1643,6 @@ pub const Runtime = struct {
         return false;
     }
 };
-
 
 pub fn indexOfName(names: []const []const u8, name: []const u8) ?usize {
     for (names, 0..) |candidate, index| if (std.mem.eql(u8, candidate, name)) return index;

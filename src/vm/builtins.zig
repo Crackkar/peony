@@ -15,6 +15,8 @@ const functions = @import("runtime_function");
 const binder = @import("runtime_binder");
 const file_module = @import("runtime_file");
 const class_module = @import("runtime_class");
+const native_types = @import("../stdlib/types.zig");
+const native_sys = @import("../stdlib/sys.zig");
 
 const Runtime = @import("runtime.zig").Runtime;
 const state = @import("state.zig");
@@ -95,7 +97,15 @@ pub fn executeNativeCall(
                     ending = string.content(text);
                 }
             }
-            if (!self.executePrintValues(arguments.values, separator, ending, line, column)) return false;
+            if (arguments.file) |file_value| {
+                if (file_value.tag() != .none) {
+                    const file_header = file_value.asObject() orelse return self.nativeTypeError(line, column, "file must have a write method");
+                    if (native_types.fromHeader(file_header)) |object| {
+                        if (object.type_id != .sys_stream) return self.nativeTypeError(line, column, "file must have a write method");
+                        if (!native_sys.writePrint(Runtime, self, object, arguments.values, separator, ending, line, column)) return false;
+                    } else return self.nativeTypeError(line, column, "file must have a write method");
+                } else if (!self.executePrintValues(arguments.values, separator, ending, line, column)) return false;
+            } else if (!self.executePrintValues(arguments.values, separator, ending, line, column)) return false;
             if (arguments.flush) |flush_value| {
                 const should_flush = self.valueTruthy(flush_value, line, column) orelse return false;
                 if (should_flush and !self.beginOutputEvent(line, column)) return false;
@@ -125,6 +135,12 @@ pub fn executeNativeCall(
             return true;
         },
         .open => return self.executeOpen(destination, positional, keywords, line, column),
+        .import_builtin => {
+            if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
+            const name = self.valueString(positional[0]) orelse return self.nativeTypeError(line, column, "__import__() name must be str");
+            if (!self.initializeModuleWorld(line, column)) return false;
+            return self.startImportedModule(name, destination, line, column);
+        },
         else => return self.executeOtherNativeCall(destination, native, bound_self, positional, keywords, line, column),
     }
 }
@@ -142,19 +158,47 @@ pub fn executeOtherNativeCall(
     switch (native) {
         .isinstance_builtin => {
             if (positional.len != 2 or keywords.len != 0) return self.nativeArity(line, column);
-            const target_header = positional[1].asObject() orelse return self.nativeTypeError(line, column, "isinstance() arg 2 must be a type");
-            const target = class_module.classFromHeader(target_header) orelse return self.nativeTypeError(line, column, "isinstance() arg 2 must be a type");
-            const actual_header = positional[0].asObject() orelse {
-                const is_exception_type = if (positional[0].asExceptionClass()) |index| index < exceptions.allKinds.len else false;
-                self.setRegister(destination, if (target == self.typeClass() and is_exception_type) Value.trueValue() else Value.falseValue());
+            if (positional[1].asExceptionClass()) |class_index| {
+                if (class_index >= exceptions.allKinds.len) return self.engineFault();
+                const instance = if (positional[0].asObject()) |header| exceptions.instanceFromHeader(header) else null;
+                const matched = if (instance) |selected| exceptions.isSubclass(selected.kind, exceptions.allKinds[class_index]) else false;
+                self.setRegister(destination, if (matched) Value.trueValue() else Value.falseValue());
                 return true;
-            };
-            const actual = if (class_module.instanceFromHeader(actual_header)) |instance| instance.class else if (class_module.classFromHeader(actual_header) != null) self.typeClass() else null;
-            self.setRegister(destination, if (actual) |selected| if (mroContains(selected, target)) Value.trueValue() else Value.falseValue() else Value.falseValue());
+            }
+            const target_header = positional[1].asObject() orelse return self.nativeTypeError(line, column, "isinstance() arg 2 must be a type");
+            if (exceptions.classFromHeader(target_header)) |target| {
+                const instance = if (positional[0].asObject()) |header| exceptions.instanceFromHeader(header) else null;
+                const matched = if (instance) |selected| exceptions.instanceMatchesClass(selected, target) else false;
+                self.setRegister(destination, if (matched) Value.trueValue() else Value.falseValue());
+                return true;
+            }
+            const target = class_module.classFromHeader(target_header) orelse return self.nativeTypeError(line, column, "isinstance() arg 2 must be a type");
+            const actual_value = self.pythonTypeOf(positional[0], line, column) orelse return false;
+            const actual_header = actual_value.asObject() orelse return self.engineFault();
+            const actual = class_module.classFromHeader(actual_header) orelse return self.engineFault();
+            self.setRegister(destination, if (mroContains(actual, target)) Value.trueValue() else Value.falseValue());
             return true;
         },
         .issubclass_builtin => {
             if (positional.len != 2 or keywords.len != 0) return self.nativeArity(line, column);
+            const left_builtin = positional[0].asExceptionClass();
+            const right_builtin = positional[1].asExceptionClass();
+            const left_native = if (positional[0].asObject()) |header| exceptions.classFromHeader(header) else null;
+            const right_native = if (positional[1].asObject()) |header| exceptions.classFromHeader(header) else null;
+            if (left_builtin != null or right_builtin != null or left_native != null or right_native != null) {
+                if (left_builtin) |index| if (index >= exceptions.allKinds.len) return self.engineFault();
+                if (right_builtin) |index| if (index >= exceptions.allKinds.len) return self.engineFault();
+                if (left_builtin == null and left_native == null) return self.nativeTypeError(line, column, "issubclass() arg 1 must be a class");
+                if (right_builtin == null and right_native == null) return self.nativeTypeError(line, column, "issubclass() arg 2 must be a class");
+                const matched = if (left_native) |left_class|
+                    if (right_native) |right_class| exceptions.nativeSubclassOf(left_class, right_class) else exceptions.isSubclass(left_class.kind, exceptions.allKinds[right_builtin.?])
+                else if (right_builtin) |right_index|
+                    exceptions.isSubclass(exceptions.allKinds[left_builtin.?], exceptions.allKinds[right_index])
+                else
+                    false;
+                self.setRegister(destination, if (matched) Value.trueValue() else Value.falseValue());
+                return true;
+            }
             const left_header = positional[0].asObject() orelse return self.nativeTypeError(line, column, "issubclass() arg 1 must be a class");
             const right_header = positional[1].asObject() orelse return self.nativeTypeError(line, column, "issubclass() arg 2 must be a class");
             const left = class_module.classFromHeader(left_header) orelse return self.nativeTypeError(line, column, "issubclass() arg 1 must be a class");
@@ -322,6 +366,70 @@ pub fn executeOtherNativeCall(
             const value = number.fromInt(&self.heap, signed);
             return self.storeValueResult(destination, value, line, column);
         },
+        .id_builtin => {
+            if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
+            const value = positional[0];
+            const identity: u64 = if (value.asObject()) |header|
+                @intFromPtr(header)
+            else switch (value.tag()) {
+                .small_int => 0x8100_0000_0000_0000 | (@as(u64, @bitCast(value.asSmallInt().?)) & 0x00ff_ffff_ffff_ffff),
+                .float => 0x8200_0000_0000_0000 ^ @as(u64, @bitCast(value.asFloat().?)),
+                .boolean => if (value.asBool().?) 0x8300_0000_0000_0001 else 0x8300_0000_0000_0000,
+                .none => 0x8400_0000_0000_0000,
+                .exception_class => 0x8500_0000_0000_0000 | @as(u64, value.asExceptionClass().?),
+                .unbound, .deleted, .heap_object => return self.engineFault(),
+            };
+            return self.storeValueResult(destination, number.fromInt(&self.heap, @intCast(identity)), line, column);
+        },
+        .int_constructor => {
+            if (positional.len > 2) return self.nativeArity(line, column);
+            var base_value: ?Value = if (positional.len == 2) positional[1] else null;
+            for (keywords) |keyword| {
+                if (!std.mem.eql(u8, keyword.name, "base")) return self.nativeTypeError(line, column, "unexpected keyword argument");
+                if (base_value != null) return self.nativeTypeError(line, column, "multiple values for base");
+                base_value = keyword.value;
+            }
+            if (positional.len == 0) {
+                if (base_value != null) return self.nativeTypeError(line, column, "int() missing string argument");
+                self.setRegister(destination, Value.fromSmallInt(0).?);
+                return true;
+            }
+            const argument = positional[0];
+            var text: ?[]const u8 = null;
+            if (argument.asObject()) |header| {
+                if (string.fromHeader(header)) |value| text = string.content(value);
+                if (byte_module.fromHeader(header)) |value| text = value.data;
+            }
+            if (text) |source| {
+                var base: i64 = 10;
+                if (base_value) |value| {
+                    base = if (value.asBool()) |boolean| @intFromBool(boolean) else number.toInt(i64, value) orelse return self.nativeTypeError(line, column, "int() base must be an integer");
+                }
+                if (!self.chargeBulkWork(@intCast(source.len))) return false;
+                return self.storeValueResult(destination, number.parseIntegerText(&self.heap, source, base), line, column);
+            }
+            if (base_value != null) return self.nativeTypeError(line, column, "int() explicit base requires str or bytes");
+            if (argument.asBool()) |boolean| {
+                self.setRegister(destination, Value.fromSmallInt(@intFromBool(boolean)).?);
+                return true;
+            }
+            if (number.isIntegerValue(argument)) {
+                self.setRegister(destination, argument);
+                return true;
+            }
+            if (argument.asFloat()) |float_value| {
+                if (std.math.isNan(float_value)) {
+                    self.setException(.{ .kind = .value_error, .message = "cannot convert float NaN to integer" }, line, column, null);
+                    return false;
+                }
+                if (!std.math.isFinite(float_value)) {
+                    self.setException(.{ .kind = .overflow_error, .message = "cannot convert float infinity to integer" }, line, column, null);
+                    return false;
+                }
+                return self.storeValueResult(destination, number.fromIntegralFloat(&self.heap, @trunc(float_value)), line, column);
+            }
+            return self.nativeTypeError(line, column, "int() argument must be a number, str, or bytes");
+        },
         .str_constructor => {
             if (positional.len > 1 or keywords.len != 0) return self.nativeArity(line, column);
             const owned = if (positional.len == 0) blk: {
@@ -332,6 +440,36 @@ pub fn executeOtherNativeCall(
             } else self.renderValueOwned(positional[0], false, line, column) orelse return false;
             defer self.heap.allocator.free(owned);
             return self.storeStringResult(destination, string.create(&self.heap, owned), line, column);
+        },
+        .float_constructor => {
+            if (positional.len > 1 or keywords.len != 0) return self.nativeArity(line, column);
+            if (positional.len == 0) {
+                self.setRegister(destination, Value.fromFloat(0));
+                return true;
+            }
+            const argument = positional[0];
+            if (argument.asObject()) |header| if (string.fromHeader(header)) |text| {
+                const source = std.mem.trim(u8, string.content(text), " \t\r\n\x0b\x0c");
+                if (source.len == 0) return self.nativeTypeError(line, column, "could not convert string to float");
+                const result = std.fmt.parseFloat(f64, source) catch {
+                    self.setException(.{ .kind = .value_error, .message = "could not convert string to float" }, line, column, null);
+                    return false;
+                };
+                self.setRegister(destination, Value.fromFloat(result));
+                return true;
+            };
+            const result = number.toFloat(&self.heap, argument);
+            return switch (result) {
+                .value => |value| blk: {
+                    self.setRegister(destination, Value.fromFloat(value));
+                    break :blk true;
+                },
+                .python_exception => |exception| blk: {
+                    self.setException(exception, line, column, null);
+                    break :blk false;
+                },
+                .engine_error => self.engineFault(),
+            };
         },
         .format_builtin => {
             if (positional.len == 0 or positional.len > 2 or keywords.len != 0) return self.nativeArity(line, column);
@@ -518,6 +656,10 @@ pub fn executeOtherNativeCall(
         .len => {
             if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
             const value = positional[0];
+            if (value.asObject()) |header| if (native_types.fromHeader(header)) |object| if (object.ops) |ops| if (ops.mapping) |mapping| {
+                const backing = mapping(object) orelse return self.engineFault();
+                return self.setSmallInt(destination, backing.size, line, column);
+            };
             if (sequence.length(value)) |length_value| return self.setSmallInt(destination, length_value, line, column);
             if (value.asObject()) |value_header| if (class_module.instanceFromHeader(value_header) != null) {
                 const result = self.invokeSpecialSync(value, "__len__", &.{}, line, column) orelse {
@@ -574,11 +716,48 @@ pub fn executeOtherNativeCall(
         },
         .iter => {
             if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
+            if (positional[0].asObject()) |header| if (native_types.fromHeader(header)) |native_object| {
+                const ops = native_object.ops orelse return self.nativeTypeError(line, column, "object is not iterable");
+                const iterate = ops.iter orelse return self.nativeTypeError(line, column, "object is not iterable");
+                const result = iterate(self, native_object, line, column) orelse return false;
+                const iterated_header = result.asObject() orelse return self.nativeTypeError(line, column, "iter() returned a non-iterator");
+                if (native_types.fromHeader(iterated_header)) |selected| {
+                    if (selected.ops) |selected_ops| if (selected_ops.next != null) {
+                        self.setRegister(destination, result);
+                        return true;
+                    };
+                }
+                if (iterator.iteratorFromHeader(iterated_header) != null) {
+                    self.setRegister(destination, result);
+                    return true;
+                }
+                return self.nativeTypeError(line, column, "iter() returned a non-iterator");
+            };
             return self.createIteratorResult(destination, positional[0], line, column);
         },
         .next => {
             if (positional.len != 1 or keywords.len != 0) return self.nativeArity(line, column);
             const header = positional[0].asObject() orelse return self.nativeTypeError(line, column, "object is not an iterator");
+            if (native_types.fromHeader(header)) |native_object| {
+                const ops = native_object.ops orelse return self.nativeTypeError(line, column, "object is not an iterator");
+                const next = ops.next orelse return self.nativeTypeError(line, column, "object is not an iterator");
+                return switch (next(self, native_object, destination, line, column)) {
+                    .item => |value| blk: {
+                        self.setRegister(destination, value);
+                        break :blk true;
+                    },
+                    .done => blk: {
+                        self.setException(.{ .kind = .stop_iteration, .message = "" }, line, column, null);
+                        break :blk false;
+                    },
+                    .suspended => self.currentNativeTask() != null,
+                    .python_exception => |exception| blk: {
+                        self.setException(exception, line, column, null);
+                        break :blk false;
+                    },
+                    .engine_error => self.engineFault(),
+                };
+            }
             const loop_iterator = iterator.iteratorFromHeader(header) orelse return self.nativeTypeError(line, column, "object is not an iterator");
             if (self.sync_callback_depth == 0 and self.resuming_generator == null) return self.startNextTask(destination, loop_iterator, line, column);
             return switch (self.nextIteratorValue(loop_iterator, destination, line, column)) {
@@ -704,7 +883,7 @@ pub fn executeGeneratorClose(
 
 pub fn executeOpen(self: *Runtime, destination: u16, positional: []const Value, keywords: []const binder.Keyword, line: u32, column: u32) bool {
     if (positional.len == 0 or positional.len > 2) return self.nativeArity(line, column);
-    const path = self.valueString(positional[0]) orelse return self.nativeTypeError(line, column, "open() path must be a string");
+    const path = self.valueString(positional[0]) orelse @import("../stdlib/native.zig").pathText(positional[0]) orelse return self.nativeTypeError(line, column, "open() path must be a string or Path");
     var mode: []const u8 = "r";
     var mode_supplied = positional.len > 1;
     if (mode_supplied) mode = self.valueString(positional[1]) orelse return self.nativeTypeError(line, column, "open() mode must be a string");
@@ -1008,6 +1187,13 @@ pub fn executeMappingConstructor(self: *Runtime, destination: u16, is_set: bool,
 }
 
 pub fn updateDictFromValue(self: *Runtime, mapping: *dict_module.Dict, source_value: Value, line: u32, column: u32) bool {
+    if (source_value.asObject()) |source_header| if (native_types.fromHeader(source_header)) |object| if (object.ops) |ops| if (ops.mapping) |backing| {
+        const source = backing(object) orelse return self.engineFault();
+        for (source.entries.items) |entry| {
+            if (entry.alive and !self.setMappingValueWithHash(mapping, entry.key, entry.value, entry.hash, line, column)) return false;
+        }
+        return true;
+    };
     if (source_value.asObject()) |source_header| if (dict_module.dictFromHeader(source_header)) |source| {
         if (!source.is_set) {
             for (source.entries.items) |entry| {
@@ -1648,6 +1834,7 @@ pub fn builtinNative(name: []const u8) ?functions.Native {
     if (std.mem.eql(u8, name, "dict")) return .dict;
     if (std.mem.eql(u8, name, "set")) return .set;
     if (std.mem.eql(u8, name, "hash")) return .hash;
+    if (std.mem.eql(u8, name, "id")) return .id_builtin;
     if (std.mem.eql(u8, name, "len")) return .len;
     if (std.mem.eql(u8, name, "list")) return .list;
     if (std.mem.eql(u8, name, "tuple")) return .tuple;
@@ -1669,5 +1856,6 @@ pub fn builtinNative(name: []const u8) ?functions.Native {
     if (std.mem.eql(u8, name, "staticmethod")) return .staticmethod_builtin;
     if (std.mem.eql(u8, name, "classmethod")) return .classmethod_builtin;
     if (std.mem.eql(u8, name, "super")) return .super_builtin;
+    if (std.mem.eql(u8, name, "__import__")) return .import_builtin;
     return null;
 }

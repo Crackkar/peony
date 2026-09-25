@@ -10,6 +10,7 @@ const iterator = @import("runtime_iterator");
 const functions = @import("runtime_function");
 const binder = @import("runtime_binder");
 const class_module = @import("runtime_class");
+const native_types = @import("../stdlib/types.zig");
 
 const Runtime = @import("runtime.zig").Runtime;
 const state = @import("state.zig");
@@ -55,6 +56,15 @@ pub fn createIteratorResult(self: *Runtime, destination: u16, value: Value, line
 }
 
 pub fn createVmIterator(self: *Runtime, value: Value, line: u32, column: u32) exceptions.Result(*iterator.Iterator) {
+    if (value.asObject()) |header| if (native_types.fromHeader(header)) |native_object| {
+        const ops = native_object.ops orelse return .{ .python_exception = .{ .kind = .type_error, .message = "object is not iterable" } };
+        const iterate = ops.iter orelse return .{ .python_exception = .{ .kind = .type_error, .message = "object is not iterable" } };
+        const iterated = iterate(self, native_object, line, column) orelse return .{ .python_exception = self.last_exception orelse .{ .kind = .type_error, .message = "native iteration failed" } };
+        const iterated_header = iterated.asObject() orelse return .{ .python_exception = .{ .kind = .type_error, .message = "iter() returned a non-iterator" } };
+        if (iterator.iteratorFromHeader(iterated_header)) |selected| return .{ .value = selected };
+        if (native_types.fromHeader(iterated_header)) |selected| if (selected.ops) |selected_ops| if (selected_ops.next != null) return iterator.createUserIterator(&self.heap, iterated);
+        return .{ .python_exception = .{ .kind = .type_error, .message = "iter() returned a non-iterator" } };
+    };
     if (value.asObject()) |header| if (class_module.instanceFromHeader(header) != null) {
         const iterated = self.invokeSpecialSync(value, "__iter__", &.{}, line, column) orelse {
             if (self.last_exception) |exception| return .{ .python_exception = exception };
@@ -87,6 +97,29 @@ pub fn storeIteratorOutcome(self: *Runtime, destination: u16, outcome: exception
 
 pub fn nextIteratorValue(self: *Runtime, selected: *iterator.Iterator, destination: u16, line: u32, column: u32) iterator.NextResult {
     if (selected.user_object) |user| {
+        if (user.asObject()) |user_header| if (native_types.fromHeader(user_header)) |native_object| {
+            if (selected.native_pending_value) |pending| {
+                selected.native_pending_value = null;
+                return .{ .item = pending };
+            }
+            if (selected.native_pending_done) {
+                selected.native_pending_done = false;
+                selected.finished = true;
+                return .done;
+            }
+            if (selected.finished) return .done;
+            const ops = native_object.ops orelse return .{ .python_exception = .{ .kind = .type_error, .message = "object is not an iterator" } };
+            const next = ops.next orelse return .{ .python_exception = .{ .kind = .type_error, .message = "object is not an iterator" } };
+            const result = next(self, native_object, destination, line, column);
+            if (result == .suspended and self.sync_task != null) {
+                const task = self.currentNativeTask() orelse return .{ .engine_error = .internal_invariant };
+                if (task.parent == null) {
+                    task.sync_next_delivery = true;
+                    task.sync_delivery_iterator = Value.object(&selected.header);
+                }
+            }
+            return result;
+        };
         const item = self.invokeSpecialSync(user, "__next__", &.{}, line, column) orelse {
             if (self.last_exception) |exception| {
                 if (exception.kind == .stop_iteration) {

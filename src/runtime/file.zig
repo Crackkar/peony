@@ -20,6 +20,8 @@ pub const Mode = struct {
 pub const File = struct {
     header: gc.Header align(8),
     fs: *vfs_module.Vfs,
+    node: *vfs_module.FileNode,
+    node_retained: bool = true,
     path: []u8,
     mode_text: []u8,
     mode: Mode,
@@ -83,6 +85,11 @@ pub fn open(
         };
     }
 
+    const node = fs.fileNodeNormalized(normalized) catch |err| {
+        heap.allocator.free(normalized);
+        return .{ .python_exception = pathException(err) };
+    };
+
     const owned_mode = heap.allocator.dupe(u8, mode_text) catch {
         heap.allocator.free(normalized);
         return pythonError(*File, .memory_error, "session memory limit exceeded");
@@ -95,6 +102,7 @@ pub fn open(
     object.* = .{
         .header = object.header,
         .fs = fs,
+        .node = node,
         .path = normalized,
         .mode_text = owned_mode,
         .mode = mode,
@@ -102,13 +110,14 @@ pub fn open(
         .recognize_newlines = newline == null or (newline != null and newline.?.len == 0),
         .cursor = if (mode.append) (existing catch @as([]const u8, &.{})).len else 0,
     };
+    fs.retainFile(node);
     return .{ .value = object };
 }
 
 pub fn readBuffer(heap: *Heap, fs: *vfs_module.Vfs, file: *File, size: ?i64, line_mode: bool) exceptions.Result([]u8) {
     if (file.closed) return pythonError([]u8, .value_error, "I/O operation on closed file");
     if (!file.mode.readable) return pythonError([]u8, .os_error, "file not open for reading");
-    const contents = fs.readNormalized(file.path) catch |err| return .{ .python_exception = pathException(err) };
+    const contents = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const limit: ?usize = if (size) |selected| if (selected < 0) null else std.math.cast(usize, selected) orelse return pythonError([]u8, .overflow_error, "read length is too large") else null;
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(heap.allocator);
@@ -153,7 +162,7 @@ pub fn writeBuffer(heap: *Heap, fs: *vfs_module.Vfs, file: *File, bytes: []const
     if (file.closed) return pythonError(usize, .value_error, "I/O operation on closed file");
     if (!file.mode.writable) return pythonError(usize, .os_error, "file not open for writing");
     if (!file.mode.binary and !std.unicode.utf8ValidateSlice(bytes)) return pythonError(usize, .unicode_encode_error, "text file write contains invalid UTF-8");
-    const old = fs.readNormalized(file.path) catch |err| return .{ .python_exception = pathException(err) };
+    const old = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const position = if (file.mode.append) old.len else file.cursor;
     const end = std.math.add(usize, position, bytes.len) catch return pythonError(usize, .memory_error, "session memory limit exceeded");
     const new_len = @max(old.len, end);
@@ -163,7 +172,7 @@ pub fn writeBuffer(heap: *Heap, fs: *vfs_module.Vfs, file: *File, bytes: []const
     if (position > old.len) @memset(replacement[old.len..position], 0);
     @memcpy(replacement[position..end], bytes);
     if (end < old.len) @memcpy(replacement[end..], old[end..]);
-    fs.writeNormalized(file.path, replacement, .replace) catch |err| return .{ .python_exception = pathException(err) };
+    fs.writeNode(file.node, replacement, .replace) catch |err| return .{ .python_exception = pathException(err) };
     file.cursor = end;
     return .{ .value = if (file.mode.binary) bytes.len else std.unicode.utf8CountCodepoints(bytes) catch bytes.len };
 }
@@ -172,7 +181,7 @@ pub fn seek(fs: *vfs_module.Vfs, file: *File, offset: i64, whence: i64) exceptio
     if (file.closed) return pythonError(usize, .value_error, "I/O operation on closed file");
     if (whence < 0 or whence > 2) return pythonError(usize, .value_error, "invalid whence value");
     if (!file.mode.binary and ((whence != 0 and offset != 0) or (whence == 0 and offset < 0))) return pythonError(usize, .value_error, "invalid seek in text mode");
-    const contents = fs.readNormalized(file.path) catch |err| return .{ .python_exception = pathException(err) };
+    const contents = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const base: i128 = switch (whence) {
         0 => 0,
         1 => @intCast(file.cursor),
@@ -189,17 +198,21 @@ pub fn truncate(heap: *Heap, fs: *vfs_module.Vfs, file: *File, requested: ?i64) 
     if (file.closed) return pythonError(usize, .value_error, "I/O operation on closed file");
     if (!file.mode.writable) return pythonError(usize, .os_error, "file not open for writing");
     const target = if (requested) |selected| if (selected < 0) return pythonError(usize, .value_error, "negative size value") else std.math.cast(usize, selected) orelse return pythonError(usize, .overflow_error, "file size is too large") else file.cursor;
-    const old = fs.readNormalized(file.path) catch |err| return .{ .python_exception = pathException(err) };
+    const old = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const replacement = heap.allocator.alloc(u8, target) catch return pythonError(usize, .memory_error, "session memory limit exceeded");
     defer if (replacement.len != 0) heap.allocator.free(replacement);
     const copied = @min(old.len, target);
     if (copied != 0) @memcpy(replacement[0..copied], old[0..copied]);
     if (target > copied) @memset(replacement[copied..], 0);
-    fs.writeNormalized(file.path, replacement, .replace) catch |err| return .{ .python_exception = pathException(err) };
+    fs.writeNode(file.node, replacement, .replace) catch |err| return .{ .python_exception = pathException(err) };
     return .{ .value = target };
 }
 
 pub fn close(file: *File) void {
+    if (file.node_retained) {
+        file.fs.releaseFile(file.node);
+        file.node_retained = false;
+    }
     file.closed = true;
 }
 
@@ -215,6 +228,7 @@ pub fn valueException(kind: exceptions.PythonExceptionKind, message: []const u8)
 pub fn pathException(err: vfs_module.Error) exceptions.PythonException {
     return switch (err) {
         error.InvalidPath => valueException(.value_error, "invalid or unsafe path"),
+        error.InvalidMove => valueException(.os_error, "cannot move a directory into itself"),
         error.NotFound => valueException(.file_not_found_error, "file or directory not found"),
         error.Exists => valueException(.file_exists_error, "file already exists"),
         error.NotDirectory => valueException(.os_error, "parent path is not a directory"),
@@ -295,11 +309,11 @@ fn isUtf8Encoding(encoding: []const u8) bool {
 
 fn destroyFile(header: *gc.Header, allocator: std.mem.Allocator) void {
     const file: *File = @ptrCast(@alignCast(header));
+    close(file);
     allocator.free(file.path);
     file.path = &.{};
     allocator.free(file.mode_text);
     file.mode_text = &.{};
-    file.closed = true;
 }
 
 fn pythonError(comptime T: type, kind: exceptions.PythonExceptionKind, message: []const u8) exceptions.Result(T) {

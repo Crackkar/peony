@@ -57,6 +57,7 @@ pub const allKinds = [_]PythonExceptionKind{
 pub const PythonException = struct {
     kind: PythonExceptionKind,
     message: []const u8,
+    native_class: ?*ExceptionClass = null,
 };
 
 pub const TracebackFrame = struct {
@@ -70,21 +71,27 @@ pub const TracebackFrame = struct {
 pub const ExceptionClass = struct {
     header: gc.Header align(8),
     kind: PythonExceptionKind,
+    native_name: ?[]u8 = null,
+    native_parent: ?*ExceptionClass = null,
 };
+
+pub const Attribute = struct { name: []u8, value: Value };
 
 pub const ExceptionInstance = struct {
     header: gc.Header align(8),
     allocator: std.mem.Allocator,
     kind: PythonExceptionKind,
+    native_class: ?*ExceptionClass = null,
     message: []u8,
     value: Value = Value.noneValue(),
     cause: ?*ExceptionInstance = null,
     context: ?*ExceptionInstance = null,
     suppress_context: bool = false,
     frames: std.ArrayList(TracebackFrame) = .empty,
+    attributes: std.ArrayList(Attribute) = .empty,
 };
 
-const class_kind = gc.Kind{};
+const class_kind = gc.Kind{ .trace = traceClass, .destroy = destroyClass };
 const instance_kind = gc.Kind{ .trace = traceInstance, .destroy = destroyInstance };
 
 pub fn classFromHeader(header: *gc.Header) ?*ExceptionClass {
@@ -101,6 +108,80 @@ pub fn createClass(heap: *gc.Heap, kind: PythonExceptionKind) Result(*ExceptionC
     const class = heap.createObject(ExceptionClass, &class_kind) catch return .{ .python_exception = memoryError() };
     class.* = .{ .header = class.header, .kind = kind };
     return .{ .value = class };
+}
+
+pub fn createNativeClass(heap: *gc.Heap, name: []const u8, base_kind: PythonExceptionKind, parent_class: ?*ExceptionClass) Result(*ExceptionClass) {
+    const owned_name = heap.allocator.dupe(u8, name) catch return .{ .python_exception = memoryError() };
+    var parent_root = gc.Root{ .object = if (parent_class) |base_class| &base_class.header else null };
+    var roots = gc.RootFrame{};
+    roots.push(&heap.roots);
+    roots.add(&parent_root);
+    defer roots.pop();
+    const class = heap.createObject(ExceptionClass, &class_kind) catch {
+        heap.allocator.free(owned_name);
+        return .{ .python_exception = memoryError() };
+    };
+    class.* = .{
+        .header = class.header,
+        .kind = if (parent_class) |base_class| base_class.kind else base_kind,
+        .native_name = owned_name,
+        .native_parent = parent_class,
+    };
+    return .{ .value = class };
+}
+
+pub fn createNativeInstance(heap: *gc.Heap, class: *ExceptionClass, message: []const u8) Result(*ExceptionInstance) {
+    var class_root = gc.Root{ .object = &class.header };
+    var roots = gc.RootFrame{};
+    roots.push(&heap.roots);
+    roots.add(&class_root);
+    defer roots.pop();
+    const instance = switch (createInstance(heap, class.kind, message)) {
+        .value => |created| created,
+        .python_exception => |exception| return .{ .python_exception = exception },
+        .engine_error => |failure| return .{ .engine_error = failure },
+    };
+    instance.native_class = class;
+    return .{ .value = instance };
+}
+
+pub fn nativeSubclassOf(class: *const ExceptionClass, candidate: *const ExceptionClass) bool {
+    if (candidate.native_name == null) return isSubclass(class.kind, candidate.kind);
+    var cursor: ?*const ExceptionClass = class;
+    while (cursor) |current| {
+        if (current == candidate) return true;
+        cursor = current.native_parent;
+    }
+    return false;
+}
+
+pub fn instanceMatchesClass(instance: *const ExceptionInstance, candidate: *const ExceptionClass) bool {
+    if (candidate.native_name == null) return isSubclass(instance.kind, candidate.kind);
+    const actual = instance.native_class orelse return false;
+    return nativeSubclassOf(actual, candidate);
+}
+
+pub fn setAttribute(heap: *gc.Heap, instance: *ExceptionInstance, name: []const u8, value: Value) error{OutOfMemory}!void {
+    for (instance.attributes.items) |*entry| if (std.mem.eql(u8, entry.name, name)) {
+        entry.value = value;
+        return;
+    };
+    const owned_name = try heap.allocator.dupe(u8, name);
+    errdefer heap.allocator.free(owned_name);
+    try instance.attributes.append(heap.allocator, .{ .name = owned_name, .value = value });
+}
+
+pub fn getAttribute(instance: *const ExceptionInstance, name: []const u8) ?Value {
+    for (instance.attributes.items) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
+    return null;
+}
+
+pub fn className(class: *const ExceptionClass) []const u8 {
+    return class.native_name orelse exceptionName(class.kind);
+}
+
+pub fn instanceName(instance: *const ExceptionInstance) []const u8 {
+    return if (instance.native_class) |class| className(class) else exceptionName(instance.kind);
 }
 
 pub fn createInstance(heap: *gc.Heap, kind: PythonExceptionKind, message: []const u8) Result(*ExceptionInstance) {
@@ -124,15 +205,29 @@ pub fn memoryError() PythonException {
 
 fn traceInstance(header: *gc.Header, tracer: *gc.Tracer) void {
     const instance: *ExceptionInstance = @ptrCast(@alignCast(header));
+    if (instance.native_class) |class| tracer.visit(&class.header);
     if (instance.cause) |cause| tracer.visit(&cause.header);
     if (instance.context) |context| tracer.visit(&context.header);
     tracer.visit(instance.value.asObject());
+    for (instance.attributes.items) |entry| tracer.visit(entry.value.asObject());
+}
+
+fn traceClass(header: *gc.Header, tracer: *gc.Tracer) void {
+    const class: *ExceptionClass = @ptrCast(@alignCast(header));
+    if (class.native_parent) |parent_class| tracer.visit(&parent_class.header);
+}
+
+fn destroyClass(header: *gc.Header, allocator: std.mem.Allocator) void {
+    const class: *ExceptionClass = @ptrCast(@alignCast(header));
+    if (class.native_name) |name| allocator.free(name);
 }
 
 fn destroyInstance(header: *gc.Header, allocator: std.mem.Allocator) void {
     const instance: *ExceptionInstance = @ptrCast(@alignCast(header));
     allocator.free(instance.message);
     instance.frames.deinit(allocator);
+    for (instance.attributes.items) |entry| allocator.free(entry.name);
+    instance.attributes.deinit(allocator);
 }
 
 pub const EngineError = enum {

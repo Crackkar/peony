@@ -62,6 +62,21 @@ pub const DecodedPacket = struct {
     }
 };
 
+/// Validate a packet supplied by an embedding host before any pending request
+/// state changes. Byte-decoded packets pass the same bounds in `decode`.
+pub fn validDecodedPacket(packet: *const DecodedPacket) bool {
+    if (packet.request_id == 0 or packet.flags != 0 or packet.sections.len > max_packet_sections) return false;
+    const descriptors = std.math.mul(usize, packet.sections.len, section_descriptor_size) catch return false;
+    var total = std.math.add(usize, packet_header_size, descriptors) catch return false;
+    if (total > max_packet_bytes) return false;
+    for (packet.sections) |section| {
+        if (section.kind == .utf8 and !std.unicode.utf8ValidateSlice(section.bytes)) return false;
+        total = std.math.add(usize, total, section.bytes.len) catch return false;
+        if (total > max_packet_bytes) return false;
+    }
+    return true;
+}
+
 pub const Config = struct {
     max_memory_bytes: u32,
     max_instructions: u64,

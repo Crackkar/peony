@@ -21,6 +21,180 @@ const generator_tests = @import("generator_tests");
 const annotation_tests = @import("annotation_tests");
 const match_tests = @import("match_tests");
 const import_tests = @import("import_tests");
+const library_bridge_tests = @import("library_bridge_tests");
+const library_regex_tests = @import("library_regex_tests");
+const library_http_tests = @import("library_http_tests");
+const library_numeric_tests = @import("library_numeric_tests");
+const library_data_tests = @import("library_data_tests");
+const library_vfs_tests = @import("library_vfs_tests");
+const library_collections_tests = @import("library_collections_tests");
+
+test "math contract" {
+    try library_numeric_tests.testMathContract();
+}
+test "math errors and binding" {
+    try library_numeric_tests.testMathErrorsAndBinding();
+}
+test "random contract and validation" {
+    try library_numeric_tests.testRandomContractAndValidation();
+}
+test "random work budget and cancellation" {
+    try library_numeric_tests.testRandomWorkBudgetAndCancellation();
+}
+test "statistics contract and one-pass iterables" {
+    try library_numeric_tests.testStatisticsContractAndOnePassIterables();
+}
+test "numeric GC and reset isolation" {
+    try library_numeric_tests.testNumericGcAndResetIsolation();
+}
+test "JSON loads dumps and options" {
+    try library_data_tests.testJsonLoadsDumpsAndOptions();
+}
+test "native JSON Value adapter preserves bigint Unicode and GC roots" {
+    try library_data_tests.testNativeJsonValueAdapter();
+}
+test "JSON errors metadata and cycles" {
+    try library_data_tests.testJsonErrorsMetadataAndCycles();
+}
+test "JSON file-like callbacks" {
+    try library_data_tests.testJsonFileLikeCallbacks();
+}
+test "CSV reader writer and Unicode" {
+    try library_data_tests.testCsvReaderWriterAndUnicode();
+}
+test "CSV dictionary variants and errors" {
+    try library_data_tests.testCsvDictionaryVariantsAndErrors();
+}
+test "data callbacks resume input once" {
+    try library_data_tests.testDataCallbacksResumeInputOnce();
+}
+test "data GC cap and reset" {
+    try library_data_tests.testDataGcCapAndReset();
+}
+test "large JSON parse and dump yield and cancel at native checkpoints" {
+    try library_data_tests.testJsonLargeQuantumAndCancellation();
+}
+test "Path lexical contract" {
+    try library_vfs_tests.testPathLexicalContract();
+}
+test "Path VFS methods and open protocol" {
+    try library_vfs_tests.testPathVfsMethodsAndOpenProtocol();
+}
+test "os.path and mutation contract" {
+    try library_vfs_tests.testOsPathAndMutationContract();
+}
+test "VFS readonly and error atomicity" {
+    try library_vfs_tests.testVfsReadonlyAndErrorAtomicity();
+}
+test "VFS GC and reset persistence" {
+    try library_vfs_tests.testVfsGcAndResetPersistence();
+}
+test "Counter construction and methods" {
+    try library_collections_tests.testCounterConstructionAndMethods();
+}
+test "Counter operators and comparisons" {
+    try library_collections_tests.testCounterOperatorsAndComparisons();
+}
+test "defaultdict contract" {
+    try library_collections_tests.testDefaultdictContract();
+}
+test "copy graphs instances and resources" {
+    try library_collections_tests.testCopyGraphsInstancesAndResources();
+}
+test "collection and copy hooks resume input once" {
+    try library_collections_tests.testCollectionAndCopyHooksResumeInputOnce();
+}
+test "collections GC cap and reset" {
+    try library_collections_tests.testCollectionsGcCapAndReset();
+}
+
+test "native registry precedence and first-class binder" {
+    try library_bridge_tests.testNativeRegistryPrecedenceAndFirstClassBinder();
+}
+
+test "primitive type identity and callable instance keywords" {
+    try library_bridge_tests.testPrimitiveTypeIdentityAndCallableKeywords();
+}
+
+test "native stream callable identity and binder" {
+    try library_bridge_tests.testNativeStreamCallableIdentityAndBinder();
+}
+
+test "lazy sys streams and metadata under cap" {
+    try library_bridge_tests.testLazySysStreamsAndRunMetadataUnderCap();
+}
+
+test "nested native factory callback resumes input once" {
+    try library_bridge_tests.testNestedNativeFactoryCallbackResumesInputOnce();
+}
+
+test "native task callback resumes input at quantum one without replay" {
+    try library_bridge_tests.testNativeTaskCallInputQuantumOneNoReplay();
+}
+
+test "native task chunks share one bounded run quantum" {
+    try library_bridge_tests.testNativeTaskChunksShareOneRunQuantum();
+}
+
+test "native task next resumes a generator with two input requests at quantum one" {
+    try library_bridge_tests.testNativeTaskNextGeneratorInputQuantumOne();
+}
+
+test "native task calls a callable instance with keyword binding and input" {
+    try library_bridge_tests.testNativeTaskCallableInstanceKeywordsInput();
+}
+
+test "native task next resumes a user iterator and consumes StopIteration" {
+    try library_bridge_tests.testNativeTaskNextUserIteratorStopIteration();
+}
+
+test "regex syntax flags Unicode and bytes" {
+    try library_regex_tests.testRegexSyntaxFlagsUnicodeAndBytes();
+}
+
+test "regex ordered captures objects and positions" {
+    try library_regex_tests.testRegexOrderedCapturesObjectsAndPositions();
+}
+
+test "regex split sub templates escape and pattern methods" {
+    try library_regex_tests.testRegexSplitSubTemplatesEscapeAndPatternMethods();
+}
+
+test "regex callable replacement resumes input exactly once" {
+    try library_regex_tests.testRegexCallableReplacementResumesInputExactlyOnce();
+}
+
+test "regex work limit GC and reset" {
+    try library_regex_tests.testRegexWorkLimitGcAndReset();
+}
+
+test "urlopen response cursor context SSL and validation" {
+    try library_http_tests.testUrlopenResponseCursorContextSslAndValidation();
+}
+
+test "urlopen POST context manager and errors" {
+    try library_http_tests.testUrlopenPostContextManagerAndErrors();
+}
+
+test "requests query form headers encoding and JSON" {
+    try library_http_tests.testRequestsQueryFormHeadersEncodingAndJson();
+}
+
+test "requests status and transport exceptions" {
+    try library_http_tests.testRequestsStatusAndTransportExceptions();
+}
+
+test "time clock sleep validation and cancellation" {
+    try library_http_tests.testTimeClockSleepValidationAndCancellation();
+}
+
+test "SSLContext identity constructor and mutation" {
+    try library_http_tests.testSslContextTypeAndMutation();
+}
+
+test "host reply identity schema and size retain pending request" {
+    try library_http_tests.testHostReplyIdentitySchemaAndSizeDoNotConsumePendingRequest();
+}
 
 test "ABI module compiles" {
     _ = @import("abi");
@@ -1026,7 +1200,6 @@ test "dotted relative from-import initializes intermediate packages" {
 test "a module cannot be used as a package for dotted imports" {
     try import_tests.testCannotImportChildOfSelectedModule();
 }
-
 
 test "imported modules run on scheduled frames and suspend for input" {
     try import_tests.testImportedModuleRunsOnMainFrameAndSuspendsForInput();

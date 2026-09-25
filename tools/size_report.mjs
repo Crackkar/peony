@@ -15,7 +15,7 @@ if (toolchain !== '0.16.0') {
 }
 
 await mkdir(path.dirname(unicodeBlob), { recursive: true });
-exec('python', ['tools/generate_unicode15_probe.py', '.zig-cache/size-probes/unicode15-property-prototype.bin']);
+exec('node', ['tools/generate_unicode15_probe.mjs', '.zig-cache/size-probes/unicode15-property-prototype.bin']);
 await prepareProbeSources();
 exec('zig', ['build', 'wasm']);
 
@@ -46,7 +46,7 @@ const report = {
   probes: results,
   commands: [
     'zig version',
-    'python tools/generate_unicode15_probe.py .zig-cache/size-probes/unicode15-property-prototype.bin',
+    'node tools/generate_unicode15_probe.mjs .zig-cache/size-probes/unicode15-property-prototype.bin',
     'zig build wasm',
     ...probes.map((name) => `zig build probe-${name}`),
     'node tools/size_report.mjs [--json]',
@@ -72,6 +72,7 @@ function exec(command, args) {
   return execFileSync(command, args, {
     cwd: root,
     encoding: 'utf8',
+    windowsHide: true,
     stdio: ['ignore', 'pipe', 'inherit'],
     maxBuffer: 4 * 1024 * 1024,
   }).trim();

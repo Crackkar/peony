@@ -15,6 +15,8 @@ const functions = @import("runtime_function");
 const file_module = @import("runtime_file");
 const class_module = @import("runtime_class");
 const module_module = @import("runtime_module");
+const native_types = @import("../stdlib/types.zig");
+const native_library = @import("../stdlib/native.zig");
 
 const Runtime = @import("runtime.zig").Runtime;
 const state = @import("state.zig");
@@ -162,6 +164,7 @@ pub fn executeMakeSlice(self: *Runtime, instruction: bytecode.Instruction, line:
 
 pub fn lookupAttributeValue(self: *Runtime, receiver: Value, name: []const u8, line: u32, column: u32) ?Value {
     const header = receiver.asObject() orelse return null;
+    if (native_types.fromHeader(header)) |object| return native_library.getAttribute(Runtime, self, object, name, line, column);
     if (module_module.fromHeader(header)) |selected| {
         if (std.mem.eql(u8, name, "__name__")) return self.createStringValue(selected.name, line, column);
         if (std.mem.eql(u8, name, "__package__")) return self.createStringValue(selected.package, line, column);
@@ -172,7 +175,12 @@ pub fn lookupAttributeValue(self: *Runtime, receiver: Value, name: []const u8, l
         if (std.mem.eql(u8, name, "__annotations__")) return function.annotations_dict;
     }
     if (exceptions.instanceFromHeader(header)) |instance| {
+        if (exceptions.getAttribute(instance, name)) |attribute| return attribute;
         if (instance.kind == .stop_iteration and std.mem.eql(u8, name, "value")) return instance.value;
+        if (instance.kind == .system_exit and std.mem.eql(u8, name, "code")) return instance.value;
+    }
+    if (exceptions.classFromHeader(header)) |class| {
+        if (std.mem.eql(u8, name, "__name__")) return self.createStringValue(exceptions.className(class), line, column);
     }
     if (file_module.fromHeader(header)) |file| {
         if (std.mem.eql(u8, name, "closed")) return if (file.closed) Value.trueValue() else Value.falseValue();
@@ -326,6 +334,7 @@ pub fn lookupAttributeValue(self: *Runtime, receiver: Value, name: []const u8, l
 
 pub fn setUserAttribute(self: *Runtime, receiver: Value, name: []const u8, value: Value, line: u32, column: u32) bool {
     const header = receiver.asObject() orelse return self.nativeAttributeError(line, column, "attribute assignment requires an object");
+    if (native_types.fromHeader(header)) |object| return native_library.setAttribute(Runtime, self, object, name, value, line, column);
     if (class_module.instanceFromHeader(header)) |instance| {
         if (class_module.classAttribute(instance.class, name)) |class_value| if (class_value.asObject()) |class_header| if (class_module.descriptorFromHeader(class_header)) |descriptor| {
             if (descriptor.kind == .property) {
@@ -374,6 +383,14 @@ pub fn executeGetAttribute(self: *Runtime, instruction: bytecode.Instruction, li
     if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();
     const name = self.codeName(instruction.c()) orelse return self.engineFault();
     const receiver = self.registers[instruction.b()];
+    if (receiver.asObject()) |header| if (native_types.fromHeader(header)) |object| {
+        const value = native_library.getAttribute(Runtime, self, object, name, line, column) orelse {
+            if (self.last_exception != null) return false;
+            return self.nativeAttributeError(line, column, "object has no such attribute");
+        };
+        self.setRegister(instruction.a(), value);
+        return true;
+    };
     if (receiver.asObject()) |header| if (module_module.fromHeader(header)) |selected| {
         if (std.mem.eql(u8, name, "__name__")) return self.storeStringResult(instruction.a(), string.create(&self.heap, selected.name), line, column);
         if (std.mem.eql(u8, name, "__package__")) return self.storeStringResult(instruction.a(), string.create(&self.heap, selected.package), line, column);
@@ -392,10 +409,21 @@ pub fn executeGetAttribute(self: *Runtime, instruction: bytecode.Instruction, li
         }
     };
     if (receiver.asObject()) |header| if (exceptions.instanceFromHeader(header)) |instance| {
+        if (exceptions.getAttribute(instance, name)) |attribute| {
+            self.setRegister(instruction.a(), attribute);
+            return true;
+        }
         if (instance.kind == .stop_iteration and std.mem.eql(u8, name, "value")) {
             self.setRegister(instruction.a(), instance.value);
             return true;
         }
+        if (instance.kind == .system_exit and std.mem.eql(u8, name, "code")) {
+            self.setRegister(instruction.a(), instance.value);
+            return true;
+        }
+    };
+    if (receiver.asObject()) |header| if (exceptions.classFromHeader(header)) |class| {
+        if (std.mem.eql(u8, name, "__name__")) return self.storeStringResult(instruction.a(), string.create(&self.heap, exceptions.className(class)), line, column);
     };
     if (receiver.asObject()) |header| if (file_module.fromHeader(header)) |file| {
         if (std.mem.eql(u8, name, "closed")) {
@@ -530,6 +558,7 @@ pub fn executeSetAttribute(self: *Runtime, instruction: bytecode.Instruction, li
     const receiver = self.registers[instruction.a()];
     const value = self.registers[instruction.b()];
     const header = receiver.asObject() orelse return self.nativeAttributeError(line, column, "attribute assignment requires an object");
+    if (native_types.fromHeader(header)) |object| return native_library.setAttribute(Runtime, self, object, name, value, line, column);
     if (module_module.fromHeader(header)) |selected| {
         if (!self.environmentStore(selected.environment, name, value)) {
             self.setException(exceptions.memoryError(), line, column, null);
@@ -605,6 +634,16 @@ pub fn executeGetItem(self: *Runtime, instruction: bytecode.Instruction, line: u
         self.setException(.{ .kind = .type_error, .message = "object is not subscriptable" }, line, column, null);
         return false;
     };
+    if (native_types.fromHeader(header)) |native_object| {
+        const ops = native_object.ops orelse return self.nativeTypeError(line, column, "object is not subscriptable");
+        const get_item = ops.get_item orelse return self.nativeTypeError(line, column, "object is not subscriptable");
+        const previous_task = self.currentNativeTask();
+        if (get_item(self, native_object, index_value, instruction.a(), line, column)) |value| {
+            self.setRegister(instruction.a(), value);
+            return true;
+        }
+        return self.currentNativeTask() != previous_task and self.last_exception == null;
+    }
     if (index_value.asObject()) |index_header| {
         if (slice.fromHeader(index_header) != null) return self.executeSliceItem(instruction.a(), container, index_value, line, column);
     }
@@ -847,6 +886,11 @@ pub fn executeSetItem(self: *Runtime, instruction: bytecode.Instruction, line: u
         self.setException(.{ .kind = .type_error, .message = "object does not support item assignment" }, line, column, null);
         return false;
     };
+    if (native_types.fromHeader(container)) |native_object| {
+        const ops = native_object.ops orelse return self.nativeTypeError(line, column, "object does not support item assignment");
+        const set_item = ops.set_item orelse return self.nativeTypeError(line, column, "object does not support item assignment");
+        return set_item(self, native_object, self.registers[instruction.c()], self.registers[instruction.a()], line, column);
+    }
     if (dict_module.dictFromHeader(container)) |mapping| {
         if (mapping.is_set) return self.nativeTypeError(line, column, "'set' object does not support item assignment");
         return self.setMappingValue(mapping, self.registers[instruction.c()], self.registers[instruction.a()], line, column);
@@ -881,6 +925,11 @@ pub fn executeDeleteItem(self: *Runtime, instruction: bytecode.Instruction, line
         self.setException(.{ .kind = .type_error, .message = "object does not support item deletion" }, line, column, null);
         return false;
     };
+    if (native_types.fromHeader(container)) |native_object| {
+        const ops = native_object.ops orelse return self.nativeTypeError(line, column, "object does not support item deletion");
+        const delete_item = ops.delete_item orelse return self.nativeTypeError(line, column, "object does not support item deletion");
+        return delete_item(self, native_object, self.registers[instruction.c()], line, column);
+    }
     if (dict_module.dictFromHeader(container)) |mapping| {
         if (mapping.is_set) return self.nativeTypeError(line, column, "'set' object does not support item deletion");
         const key = self.registers[instruction.c()];

@@ -56,6 +56,21 @@ pub fn create(heap: *gc.Heap, input: []const u8) StringResult {
     return createOwned(heap, data);
 }
 
+pub fn repeat(heap: *gc.Heap, source: *const Str, repetitions: usize) StringResult {
+    const total = std.math.mul(usize, source.data.len, repetitions) catch return memoryError();
+    const data = heap.allocator.alloc(u8, total) catch return memoryError();
+    if (source.data.len != 0 and total != 0) {
+        @memcpy(data[0..source.data.len], source.data);
+        var written = source.data.len;
+        while (written < total) {
+            const chunk = @min(written, total - written);
+            @memcpy(data[written..][0..chunk], data[0..chunk]);
+            written += chunk;
+        }
+    }
+    return createOwned(heap, data);
+}
+
 pub fn content(value: *const Str) []const u8 {
     return value.data;
 }

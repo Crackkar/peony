@@ -27,6 +27,7 @@ pub const PrintArguments = struct {
     values: []const Value,
     separator: ?Value = null,
     ending: ?Value = null,
+    file: ?Value = null,
     flush: ?Value = null,
 };
 
@@ -127,6 +128,7 @@ pub fn bindPrint(positional: []const Value, keywords: []const Keyword) error{Une
     var result = PrintArguments{ .values = positional };
     var saw_separator = false;
     var saw_ending = false;
+    var saw_file = false;
     var saw_flush = false;
     for (keywords) |keyword| {
         if (std.mem.eql(u8, keyword.name, "sep")) {
@@ -137,6 +139,10 @@ pub fn bindPrint(positional: []const Value, keywords: []const Keyword) error{Une
             if (saw_ending) return error.MultipleValues;
             saw_ending = true;
             result.ending = keyword.value;
+        } else if (std.mem.eql(u8, keyword.name, "file")) {
+            if (saw_file) return error.MultipleValues;
+            saw_file = true;
+            result.file = keyword.value;
         } else if (std.mem.eql(u8, keyword.name, "flush")) {
             if (saw_flush) return error.MultipleValues;
             saw_flush = true;

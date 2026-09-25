@@ -201,7 +201,7 @@ test('WASM lambdas, walrus, lazy map and filter, stable keyed sorting and list.i
       'print(list(map(str, [1, 2])))',
       'print(sorted(["aa", "b"], key=len))',
     ].join('\n')), status.ok);
-    assert.equal(runToCompletion(api, handle), status.completed);
+    assert.equal(runToCompletion(api, handle), status.completed, errorText(api, handle));
     assert.equal(stdout(api, handle), '[11, 22]\n[1, 2]\n[\'1\', \'2\']\n[\'b\', \'aa\']\n');
 
     assert.equal(compile(api, handle, 'items = map(1, [1])\nprint("created")\nprint(list(items))\n'), status.ok);

@@ -14,6 +14,7 @@ const binder = @import("runtime_binder");
 const format_rules = @import("runtime_format_rules");
 const file_module = @import("runtime_file");
 const class_module = @import("runtime_class");
+const native_types = @import("../stdlib/types.zig");
 
 const Runtime = @import("runtime.zig").Runtime;
 const state = @import("state.zig");
@@ -622,7 +623,7 @@ pub fn appendValueMode(self: *Runtime, value: Value, nested: bool, line: u32, co
         }
         if (exceptions.instanceFromHeader(header)) |exception_value| {
             if (!nested) return self.appendOutput(exception_value.message);
-            if (!self.appendOutput(exceptions.exceptionName(exception_value.kind))) return false;
+            if (!self.appendOutput(exceptions.instanceName(exception_value))) return false;
             if (exception_value.message.len == 0) return true;
             if (!self.appendOutput("(")) return false;
             if (!self.appendQuoted(exception_value.message, false)) return false;
@@ -635,6 +636,17 @@ pub fn appendValueMode(self: *Runtime, value: Value, nested: bool, line: u32, co
         if (dict_module.viewFromHeader(header)) |view| return self.appendMappingView(header, view, line, column);
         if (iterator.rangeFromHeader(header)) |range| return self.appendRange(range, line, column);
         if (file_module.fromHeader(header)) |file| return self.appendFormatted("<_io.File name={s} mode={s}>", .{ file.path, file.mode_text });
+        if (native_types.fromHeader(header)) |object| {
+            if (object.ops) |ops| {
+                const render = if (!nested and ops.str != null) ops.str else ops.repr;
+                if (render) |callback| {
+                    const owned = callback(self, object, line, column) orelse return false;
+                    defer self.heap.allocator.free(owned);
+                    return self.appendOutput(owned);
+                }
+            }
+            return self.appendFormatted("<{s} object at 0x{x}>", .{ object.class.name, @intFromPtr(header) });
+        }
         if (class_module.instanceFromHeader(header)) |instance| {
             const method_name = if (nested or class_module.classAttribute(instance.class, "__str__") == null) "__repr__" else "__str__";
             if (self.invokeSpecialSync(value, method_name, &.{}, line, column)) |representation| {
@@ -652,6 +664,7 @@ pub fn appendValueMode(self: *Runtime, value: Value, nested: bool, line: u32, co
             return self.appendFormatted("<{s} object at 0x{x}>", .{ instance.class.name, @intFromPtr(header) });
         }
         if (class_module.classFromHeader(header)) |class| return self.appendFormatted("<class '{s}'>", .{class.name});
+        if (exceptions.classFromHeader(header)) |class| return self.appendFormatted("<class '{s}'>", .{exceptions.className(class)});
         self.setException(.{ .kind = .type_error, .message = "object has no printable representation" }, line, column, null);
         return false;
     }

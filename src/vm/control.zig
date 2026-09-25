@@ -6,6 +6,7 @@ const functions = @import("runtime_function");
 const exceptions = @import("runtime_exception");
 const file_module = @import("runtime_file");
 const class_module = @import("runtime_class");
+const native_types = @import("../stdlib/types.zig");
 const sequence = @import("runtime_sequence");
 const Runtime = @import("runtime.zig").Runtime;
 const state = @import("state.zig");
@@ -177,9 +178,44 @@ pub fn unwindPythonExceptionUntil(self: *Runtime, boundary: ?*Frame) bool {
             continue;
         }
 
-        if (frame.generator_owner != null) {
+        if (frame.generator_owner) |generator| {
+            if (self.currentNativeTask()) |task| {
+                if (task.stage == .waiting_next and task.next_iterator.asObject() == &generator.header) {
+                    task.child_error = self.active_exception;
+                    task.child_ready = true;
+                    task.child_done = false;
+                    task.stage = .ready;
+                    self.last_exception = null;
+                    self.active_exception = null;
+                    self.exception_root.object = null;
+                    self.clearErrorText();
+                    self.resuming_generator = null;
+                    const popped = self.popFrame() orelse return self.engineFault();
+                    self.forgetGeneratorFrame(popped);
+                    self.freeFrameStorage(popped);
+                    return true;
+                }
+            }
             if (self.suspended_exception_frame == frame) self.suspended_exception_frame = null;
             return false;
+        }
+        if (frame.return_to_task) |task| {
+            if (task.stage == .waiting_next and self.active_exception != null and self.active_exception.?.kind == .stop_iteration) {
+                task.child_error = null;
+                task.child_done = true;
+            } else {
+                task.child_error = self.active_exception;
+                task.child_done = false;
+            }
+            task.child_ready = true;
+            task.stage = .ready;
+            self.last_exception = null;
+            self.active_exception = null;
+            self.exception_root.object = null;
+            self.clearErrorText();
+            const popped = self.popFrame() orelse return self.engineFault();
+            self.freeFrameStorage(popped);
+            return true;
         }
         const caller = frame.previous;
         if (caller == null) return false;
@@ -327,6 +363,30 @@ pub fn performReturn(self: *Runtime, result: Value, line: u32, column: u32) bool
         _ = override;
         result_value = returning_frame.return_override.?;
     }
+    if (returning_frame.return_to_task) |task| {
+        if (task.constructor_instance.tag() != .none) {
+            if (result_value.tag() != .none) {
+                self.setException(.{ .kind = .type_error, .message = "__init__() should return None" }, line, column, null);
+                task.child_error = self.active_exception;
+                self.last_exception = null;
+                self.active_exception = null;
+                self.exception_root.object = null;
+                self.clearErrorText();
+            } else {
+                task.child_value = task.constructor_instance;
+                task.child_error = null;
+            }
+            task.constructor_instance = Value.noneValue();
+        } else {
+            task.child_value = result_value;
+            task.child_error = null;
+        }
+        task.child_ready = true;
+        task.stage = .ready;
+        const frame = self.popFrame() orelse return self.engineFault();
+        self.freeFrameStorage(frame);
+        return true;
+    }
     if (self.sync_task) |*task| {
         if (task.callback_in_progress and framePreviousIsTask(self.top_frame, task.frame)) {
             task.callback_result = result_value;
@@ -418,6 +478,13 @@ pub fn testContextManager(value: Value) ?*TestContextManager {
 
 pub fn executeWithEnter(self: *Runtime, destination: u16, manager_value: Value, line: u32, column: u32) bool {
     if (manager_value.asObject()) |header| {
+        if (native_types.fromHeader(header)) |native_object| {
+            const ops = native_object.ops orelse return self.nativeTypeError(line, column, "object does not support the context manager protocol");
+            const enter = ops.enter orelse return self.nativeTypeError(line, column, "object does not support the context manager protocol");
+            const entered = enter(self, native_object, line, column) orelse return false;
+            self.setRegister(destination, entered);
+            return true;
+        }
         if (file_module.fromHeader(header)) |file| {
             if (file.closed) {
                 self.setException(.{ .kind = .value_error, .message = "I/O operation on closed file" }, line, column, null);
@@ -455,6 +522,13 @@ pub fn executeWithExit(self: *Runtime, destination: u16, manager_value: Value, l
     const block = &frame.try_blocks.items[frame.try_blocks.items.len - 1];
     if (block.phase != .finally_body) return self.engineFault();
     if (manager_value.asObject()) |header| {
+        if (native_types.fromHeader(header)) |native_object| {
+            const ops = native_object.ops orelse return self.nativeTypeError(line, column, "object does not support the context manager protocol");
+            const exit = ops.exit orelse return self.nativeTypeError(line, column, "object does not support the context manager protocol");
+            if (!(exit(self, native_object, line, column) orelse return false)) return false;
+            self.setRegister(destination, Value.noneValue());
+            return true;
+        }
         if (file_module.fromHeader(header)) |file| {
             file_module.close(file);
             return true;
@@ -543,6 +617,10 @@ pub fn activeExceptionKind(self: *const Runtime) ?PythonExceptionKind {
 }
 
 pub fn matchesExceptionType(self: *Runtime, candidate: Value, kind: PythonExceptionKind, line: u32, column: u32) ?bool {
+    const active = self.active_exception orelse {
+        _ = self.engineFault();
+        return null;
+    };
     if (candidate.asExceptionClass()) |class_index| {
         if (class_index >= exceptions.allKinds.len) {
             _ = self.engineFault();
@@ -554,7 +632,7 @@ pub fn matchesExceptionType(self: *Runtime, candidate: Value, kind: PythonExcept
         self.setException(.{ .kind = .type_error, .message = "catching classes that do not inherit from BaseException is not allowed" }, line, column, null);
         return null;
     };
-    if (exceptions.classFromHeader(header)) |class| return exceptions.isSubclass(kind, class.kind);
+    if (exceptions.classFromHeader(header)) |class| return exceptions.instanceMatchesClass(active, class);
     if (sequence.tupleFromHeader(header)) |tuple| {
         var matched = false;
         for (tuple.items) |entry| {
@@ -574,7 +652,7 @@ pub fn matchesExceptionType(self: *Runtime, candidate: Value, kind: PythonExcept
                 self.setException(.{ .kind = .type_error, .message = "catching classes that do not inherit from BaseException is not allowed" }, line, column, null);
                 return null;
             };
-            matched = matched or exceptions.isSubclass(kind, class.kind);
+            matched = matched or exceptions.instanceMatchesClass(active, class);
         }
         return matched;
     }
@@ -677,7 +755,7 @@ pub fn raiseExisting(self: *Runtime, instance: *exceptions.ExceptionInstance, li
     }
     self.active_exception = instance;
     self.exception_root.object = &instance.header;
-    self.last_exception = .{ .kind = instance.kind, .message = instance.message };
+    self.last_exception = .{ .kind = instance.kind, .message = instance.message, .native_class = instance.native_class };
     self.clearErrorText();
     if (add_traceback_frame) if (self.top_frame) |frame| {
         instance.frames.append(self.heap.allocator, .{
@@ -688,7 +766,7 @@ pub fn raiseExisting(self: *Runtime, instance: *exceptions.ExceptionInstance, li
             .source_line = sourceLine(frame.code.source, line),
         }) catch {};
     };
-    const error_text = std.fmt.allocPrint(self.heap.allocator, "{s}: {s} ({s}:{d}:{d})", .{ exceptionName(instance.kind), instance.message, self.currentFilename(), line, column }) catch null;
+    const error_text = std.fmt.allocPrint(self.heap.allocator, "{s}: {s} ({s}:{d}:{d})", .{ exceptions.instanceName(instance), instance.message, self.currentFilename(), line, column }) catch null;
     if (error_text) |owned| self.error_text_owned = owned else self.error_text_static = "Python exception";
 }
 
@@ -722,7 +800,7 @@ pub fn executeRaise(self: *Runtime, instruction: bytecode.Instruction, line: u32
         if (exceptions.instanceFromHeader(raised_header)) |existing| {
             instance = existing;
         } else if (exceptions.classFromHeader(raised_header)) |class| {
-            switch (exceptions.createInstance(&self.heap, class.kind, "")) {
+            switch (exceptions.createNativeInstance(&self.heap, class, "")) {
                 .value => |created| instance = created,
                 .python_exception => |exception| {
                     self.setException(exception, line, column, null);
@@ -767,7 +845,7 @@ pub fn executeRaise(self: *Runtime, instruction: bytecode.Instruction, line: u32
                 instance.cause = cause_instance;
                 instance.suppress_context = true;
             } else if (exceptions.classFromHeader(cause_header)) |cause_class| {
-                switch (exceptions.createInstance(&self.heap, cause_class.kind, "")) {
+                switch (exceptions.createNativeInstance(&self.heap, cause_class, "")) {
                     .value => |cause_instance| {
                         instance.cause = cause_instance;
                         instance.suppress_context = true;
@@ -793,7 +871,11 @@ pub fn executeRaise(self: *Runtime, instruction: bytecode.Instruction, line: u32
 pub fn setException(self: *Runtime, exception: PythonException, line: u32, column: u32, name: ?[]const u8) void {
     var selected = exception;
     const previous_exception = self.active_exception;
-    switch (exceptions.createInstance(&self.heap, exception.kind, exception.message)) {
+    const created = if (exception.native_class) |class|
+        exceptions.createNativeInstance(&self.heap, class, exception.message)
+    else
+        exceptions.createInstance(&self.heap, exception.kind, exception.message);
+    switch (created) {
         .value => |instance| {
             if (previous_exception) |context| if (context != instance) {
                 instance.context = context;
@@ -811,6 +893,7 @@ pub fn setException(self: *Runtime, exception: PythonException, line: u32, colum
                 instance.frames.append(self.heap.allocator, trace_frame) catch {};
             }
             selected.message = instance.message;
+            selected.native_class = instance.native_class;
         },
         .python_exception, .engine_error => {
             selected = exceptions.memoryError();
@@ -827,6 +910,7 @@ pub fn setException(self: *Runtime, exception: PythonException, line: u32, colum
                 return;
             };
             emergency.kind = .memory_error;
+            emergency.native_class = null;
             emergency.context = if (previous_exception == emergency) null else previous_exception;
             emergency.cause = null;
             emergency.suppress_context = false;
@@ -966,7 +1050,7 @@ fn appendExceptionText(allocator: std.mem.Allocator, output: *std.ArrayList(u8),
             try output.append(allocator, '\n');
         }
     }
-    try output.appendSlice(allocator, exceptionName(instance.kind));
+    try output.appendSlice(allocator, exceptions.instanceName(instance));
     if (instance.message.len != 0) {
         try output.appendSlice(allocator, ": ");
         try output.appendSlice(allocator, instance.message);

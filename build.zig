@@ -7,6 +7,7 @@ const abi_exports = [_][]const u8{
     "peony_session_new",
     "peony_session_destroy",
     "peony_compile_and_start",
+    "peony_compile_and_start_argv",
     "peony_run",
     "peony_resume",
     "peony_cancel",
@@ -15,6 +16,8 @@ const abi_exports = [_][]const u8{
     "peony_vfs_write",
     "peony_vfs_read",
     "peony_vfs_list",
+    "peony_vfs_dirs",
+    "peony_vfs_mkdir",
     "peony_vfs_data_ptr",
     "peony_vfs_data_len",
     "peony_event_ptr",
@@ -103,7 +106,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const runtime_vm_module = b.createModule(.{
-        .root_source_file = b.path("src/vm/runtime.zig"),
+        .root_source_file = b.path("src/engine.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -129,6 +132,13 @@ pub fn build(b: *std.Build) void {
     runtime_vm_module.addImport("runtime_file", native_runtime.file);
     runtime_vm_module.addImport("runtime_module", native_runtime.module);
     runtime_vm_module.addImport("runtime_format_rules", native_format_rules_module);
+    const native_regex_core = b.createModule(.{
+        .root_source_file = b.path("src/regex/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    runtime_vm_module.addImport("regex_core", native_regex_core);
+    runtime_vm_module.addImport("runtime_unicode", native_runtime.unicode);
     const compiler_vm_test_module = b.createModule(.{
         .root_source_file = b.path("tests/unit/compiler_vm.zig"),
         .target = target,
@@ -279,6 +289,55 @@ pub fn build(b: *std.Build) void {
     scope_test_module.addImport("frontend_parser", frontend_modules.parser);
     scope_test_module.addImport("frontend_ast", frontend_modules.ast);
     scope_test_module.addImport("frontend_scope", frontend_modules.scope);
+    const library_bridge_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    library_bridge_module.addImport("runtime_vm", runtime_vm_module);
+    library_bridge_module.addImport("runtime_host", native_runtime.host);
+    const library_regex_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_regex.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    library_regex_module.addImport("runtime_vm", runtime_vm_module);
+    library_regex_module.addImport("runtime_host", native_runtime.host);
+    const library_http_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_http.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    library_http_module.addImport("runtime_vm", runtime_vm_module);
+    library_http_module.addImport("runtime_host", native_runtime.host);
+    const library_numeric_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_numeric.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    library_numeric_module.addImport("runtime_vm", runtime_vm_module);
+    library_numeric_module.addImport("runtime_exception", native_runtime.exception);
+    const library_data_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_data.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    library_data_module.addImport("runtime_vm", runtime_vm_module);
+    library_data_module.addImport("runtime_host", native_runtime.host);
+    const library_vfs_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_vfs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    library_vfs_module.addImport("runtime_vm", runtime_vm_module);
+    library_vfs_module.addImport("runtime_host", native_runtime.host);
+    const library_collections_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_collections.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    library_collections_module.addImport("runtime_vm", runtime_vm_module);
+    library_collections_module.addImport("runtime_host", native_runtime.host);
     const unit_test_root = b.createModule(.{
         .root_source_file = b.path("tests/unit/root.zig"),
         .target = target,
@@ -309,10 +368,72 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("annotation_tests", annotations_test_module);
     unit_test_root.addImport("match_tests", match_test_module);
     unit_test_root.addImport("import_tests", imports_test_module);
+    unit_test_root.addImport("library_bridge_tests", library_bridge_module);
+    unit_test_root.addImport("library_regex_tests", library_regex_module);
+    unit_test_root.addImport("library_http_tests", library_http_module);
+    unit_test_root.addImport("library_numeric_tests", library_numeric_module);
+    unit_test_root.addImport("library_data_tests", library_data_module);
+    unit_test_root.addImport("library_vfs_tests", library_vfs_module);
+    unit_test_root.addImport("library_collections_tests", library_collections_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const library_bridge_root = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_bridge_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = true,
+    });
+    library_bridge_root.addImport("library_bridge_tests", library_bridge_module);
+    library_bridge_root.addImport("runtime_vm", runtime_vm_module);
+    const library_bridge_tests = b.addTest(.{ .root_module = library_bridge_root });
+    const run_library_bridge_tests = b.addRunArtifact(library_bridge_tests);
+    const bridge_step = b.step("test-bridge", "Run focused native library bridge tests");
+    bridge_step.dependOn(&run_library_bridge_tests.step);
+    const library_b_root = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_b_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = true,
+    });
+    library_b_root.addImport("library_regex_tests", library_regex_module);
+    library_b_root.addImport("library_http_tests", library_http_module);
+    const library_b_tests = b.addTest(.{ .root_module = library_b_root });
+    const run_library_b_tests = b.addRunArtifact(library_b_tests);
+    const library_b_step = b.step("test-library-b", "Run focused native regex/HTTP library tests");
+    library_b_step.dependOn(&run_library_b_tests.step);
+    const library_a_root = b.createModule(.{
+        .root_source_file = b.path("tests/unit/library_a_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = true,
+    });
+    library_a_root.addImport("library_numeric_tests", library_numeric_module);
+    library_a_root.addImport("library_data_tests", library_data_module);
+    library_a_root.addImport("library_vfs_tests", library_vfs_module);
+    library_a_root.addImport("library_collections_tests", library_collections_module);
+    const library_a_tests = b.addTest(.{ .root_module = library_a_root });
+    const run_library_a_tests = b.addRunArtifact(library_a_tests);
+    const library_a_step = b.step("test-library-a", "Run focused native numeric/data/VFS/collections library tests");
+    library_a_step.dependOn(&run_library_a_tests.step);
+
+    const json_choice_root = b.createModule(.{
+        .root_source_file = b.path("tests/bench/json_choice.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = true,
+    });
+    json_choice_root.addImport("runtime_vm", runtime_vm_module);
+    json_choice_root.addImport("runtime_gc", native_runtime.gc);
+    json_choice_root.addImport("runtime_dict", native_runtime.dict);
+    json_choice_root.addImport("runtime_number", native_runtime.number);
+    json_choice_root.addImport("runtime_sequence", native_runtime.sequence);
+    const json_choice_exe = b.addExecutable(.{ .name = "peony-json-choice", .root_module = json_choice_root });
+    const json_choice_run = b.addRunArtifact(json_choice_exe);
+    const json_choice_step = b.step("bench-json-choice", "Compare native Value JSON paths with std.json DOM conversion");
+    json_choice_step.dependOn(&json_choice_run.step);
 
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -466,7 +587,7 @@ fn createExecutionVmModule(
     compiler_module.addImport("runtime_bytes", runtime.bytes);
     compiler_module.addImport("runtime_exception", runtime.exception);
     const vm_module = b.createModule(.{
-        .root_source_file = b.path("src/vm/runtime.zig"),
+        .root_source_file = b.path("src/engine.zig"),
         .target = target,
         .optimize = optimize,
         .single_threaded = target.result.cpu.arch == .wasm32,
@@ -493,6 +614,13 @@ fn createExecutionVmModule(
     vm_module.addImport("runtime_file", runtime.file);
     vm_module.addImport("runtime_module", runtime.module);
     vm_module.addImport("runtime_format_rules", format_rules_module);
+    const regex_core = b.createModule(.{
+        .root_source_file = b.path("src/regex/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vm_module.addImport("regex_core", regex_core);
+    vm_module.addImport("runtime_unicode", runtime.unicode);
     return vm_module;
 }
 

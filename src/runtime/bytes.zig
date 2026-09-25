@@ -26,6 +26,21 @@ pub fn create(heap: *gc.Heap, input: []const u8) BytesResult {
     return createOwned(heap, data);
 }
 
+pub fn repeat(heap: *gc.Heap, source: *const Bytes, count: usize) BytesResult {
+    const total = std.math.mul(usize, source.data.len, count) catch return memoryError();
+    const data = heap.allocator.alloc(u8, total) catch return memoryError();
+    if (source.data.len != 0 and total != 0) {
+        @memcpy(data[0..source.data.len], source.data);
+        var written = source.data.len;
+        while (written < total) {
+            const chunk = @min(written, total - written);
+            @memcpy(data[written..][0..chunk], data[0..chunk]);
+            written += chunk;
+        }
+    }
+    return createOwned(heap, data);
+}
+
 pub fn fromIntegers(heap: *gc.Heap, values: []const i64) BytesResult {
     for (values) |value| {
         if (value < 0 or value > 255) return pythonError(*Bytes, .value_error, "bytes must be in range(0, 256)");

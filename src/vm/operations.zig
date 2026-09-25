@@ -13,6 +13,7 @@ const slice = @import("runtime_slice");
 const exceptions = @import("runtime_exception");
 const iterator = @import("runtime_iterator");
 const class_module = @import("runtime_class");
+const native_types = @import("../stdlib/types.zig");
 
 const Runtime = @import("runtime.zig").Runtime;
 const state = @import("state.zig");
@@ -47,6 +48,20 @@ const trimFloatZeros = @import("text.zig").trimFloatZeros;
 const roundDecimalTieEven = @import("text.zig").roundDecimalTieEven;
 
 pub fn executeBinary(self: *Runtime, destination: u16, left: Value, right: Value, operation: u8, line: u32, column: u32) bool {
+    if (left.asObject()) |header| if (native_types.fromHeader(header)) |object| if (object.ops) |ops| if (ops.binary) |binary| {
+        if (binary(self, object, right, operation, false, line, column)) |result| {
+            self.setRegister(destination, result);
+            return true;
+        }
+        if (self.last_exception != null) return false;
+    };
+    if (right.asObject()) |header| if (native_types.fromHeader(header)) |object| if (object.ops) |ops| if (ops.binary) |binary| {
+        if (binary(self, object, left, operation, true, line, column)) |result| {
+            self.setRegister(destination, result);
+            return true;
+        }
+        if (self.last_exception != null) return false;
+    };
     const left_method: ?[]const u8 = switch (operation) {
         0 => "__add__",
         1 => "__sub__",
@@ -170,6 +185,36 @@ pub fn executeBinary(self: *Runtime, destination: u16, left: Value, right: Value
         }
     }
     if (operation == 2) {
+        if (number.isIntegerValue(left) or number.isIntegerValue(right)) {
+            const multiplier = if (number.isIntegerValue(right)) right else left;
+            const source = if (number.isIntegerValue(right)) left else right;
+            if (source.asObject()) |header| {
+                const text = string.fromHeader(header);
+                const data = byte_module.fromHeader(header);
+                if (text != null or data != null) {
+                    const signed = number.toInt(i64, multiplier) orelse {
+                        self.setException(exceptions.memoryError(), line, column, null);
+                        return false;
+                    };
+                    const count: usize = if (signed <= 0) 0 else std.math.cast(usize, signed) orelse {
+                        self.setException(exceptions.memoryError(), line, column, null);
+                        return false;
+                    };
+                    const length = if (text) |selected| selected.data.len else data.?.data.len;
+                    const total = std.math.mul(usize, length, count) catch {
+                        self.setException(exceptions.memoryError(), line, column, null);
+                        return false;
+                    };
+                    if (!self.repeatResultFitsSessionHeap(total)) {
+                        self.setException(exceptions.memoryError(), line, column, null);
+                        return false;
+                    }
+                    if (!self.chargeBulkWork(@intCast(@max(total, 1)))) return false;
+                    if (text) |selected| return self.storeStringResult(destination, string.repeat(&self.heap, selected, count), line, column);
+                    return self.storeBytesResult(destination, byte_module.repeat(&self.heap, data.?, count), line, column);
+                }
+            }
+        }
         if (sequence.length(left) != null) {
             return self.executeSequenceRepeat(destination, left, right, line, column);
         }
@@ -230,6 +275,7 @@ pub fn valueTruthy(self: *Runtime, value: Value, line: u32, column: u32) ?bool {
     if (value.asFloat()) |float_value| return float_value != 0;
     if (number.isIntegerValue(value)) return !number.isZeroValue(value);
     if (value.asObject()) |header| {
+        if (native_types.fromHeader(header)) |object| if (object.ops) |ops| if (ops.truth) |truth| return truth(self, object, line, column);
         if (class_module.instanceFromHeader(header)) |instance| {
             if (class_module.classAttribute(instance.class, "__bool__") != null) {
                 const result = self.invokeSpecialSync(value, "__bool__", &.{}, line, column) orelse return null;
@@ -310,6 +356,19 @@ pub fn compareValues(self: *Runtime, left: Value, right: Value, operation: u8, l
     if (operation == 8 or operation == 9) {
         const contained = self.containsValue(left, right, line, column) orelse return null;
         return if (operation == 8) contained else !contained;
+    }
+    if (left.asObject()) |header| if (native_types.fromHeader(header)) |object| if (object.ops) |ops| if (ops.compare) |compare| return compare(self, object, right, operation, line, column);
+    if (right.asObject()) |header| if (native_types.fromHeader(header)) |object| if (object.ops) |ops| if (ops.compare) |compare| {
+        const reversed: u8 = switch (operation) { 2 => 4, 3 => 5, 4 => 2, 5 => 3, else => operation };
+        return compare(self, object, left, reversed, line, column);
+    };
+    if (operation == 0 or operation == 1) {
+        const left_native = if (left.asObject()) |header| native_types.fromHeader(header) else null;
+        const right_native = if (right.asObject()) |header| native_types.fromHeader(header) else null;
+        if (left_native != null or right_native != null) {
+            const equal = self.valuesEqual(left, right, line, column) orelse return null;
+            return if (operation == 0) equal else !equal;
+        }
     }
 
     const left_is_user = if (left.asObject()) |header| class_module.instanceFromHeader(header) != null else false;
@@ -409,6 +468,9 @@ pub fn containsValue(self: *Runtime, item: Value, container: Value, line: u32, c
         self.setException(.{ .kind = .type_error, .message = "argument of type is not iterable" }, line, column, null);
         return null;
     };
+    if (native_types.fromHeader(header)) |native_object| {
+        if (native_object.ops) |ops| if (ops.contains) |contains| return contains(self, native_object, item, line, column);
+    }
     if (class_module.instanceFromHeader(header) != null) {
         const args = [_]Value{item};
         if (self.invokeSpecialSync(container, "__contains__", &args, line, column)) |result| return self.valueTruthy(result, line, column);
@@ -574,6 +636,8 @@ pub fn findListItem(self: *Runtime, list: *sequence.List, needle: Value, line: u
 
 pub fn valuesEqual(self: *Runtime, left: Value, right: Value, line: u32, column: u32) ?bool {
     if (left.identical(right)) return true;
+    if (left.asObject()) |header| if (native_types.fromHeader(header)) |object| if (object.ops) |ops| if (ops.equals) |equals| return equals(self, object, right, line, column);
+    if (right.asObject()) |header| if (native_types.fromHeader(header)) |object| if (object.ops) |ops| if (ops.equals) |equals| return equals(self, object, left, line, column);
     if (self.value_equality_depth >= 128) {
         self.setException(.{ .kind = .recursion_error, .message = "maximum recursion depth exceeded in comparison" }, line, column, null);
         return null;
@@ -716,23 +780,19 @@ pub fn chargeSynchronousWork(self: *Runtime, line: u32, column: u32) bool {
     return true;
 }
 
-pub fn chargeBulkWork(self: *Runtime, amount: usize) bool {
-    const amount_u64 = std.math.cast(u64, amount) orelse {
-        self.limit_reached = true;
-        return false;
-    };
-    if (amount_u64 > self.max_instructions -| self.work_executed) {
+pub fn chargeBulkWork(self: *Runtime, amount: u64) bool {
+    if (amount > self.max_instructions -| self.work_executed) {
         self.limit_reached = true;
         return false;
     }
     if (self.synchronous_work_remaining) |remaining| {
-        if (amount > remaining) {
+        if (amount > @as(u64, @intCast(remaining))) {
             self.limit_reached = true;
             return false;
         }
-        self.synchronous_work_remaining = remaining - amount;
+        self.synchronous_work_remaining = remaining - @as(usize, @intCast(amount));
     }
-    self.work_executed += amount_u64;
+    self.work_executed += amount;
     return true;
 }
 
@@ -784,6 +844,13 @@ pub fn rightReflectedHasPriority(self: *Runtime, left: Value, right: Value, refl
 }
 
 pub fn pythonHash(self: *Runtime, value: Value, line: u32, column: u32) ?u64 {
+    if (value.asObject()) |header| if (native_types.fromHeader(header)) |object| if (object.ops) |ops| {
+        if (!ops.hashable) {
+            self.setException(.{ .kind = .type_error, .message = "unhashable native object" }, line, column, null);
+            return null;
+        }
+        if (ops.hash) |hash| return hash(self, object, line, column);
+    };
     if (value.asObject()) |header| if (class_module.instanceFromHeader(header)) |instance| {
         if (class_module.ownClassAttribute(instance.class, "__eq__") != null and
             class_module.ownClassAttribute(instance.class, "__hash__") == null)

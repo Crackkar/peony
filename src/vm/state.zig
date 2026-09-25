@@ -8,6 +8,7 @@ const sequence = @import("runtime_sequence");
 const exceptions = @import("runtime_exception");
 const module_module = @import("runtime_module");
 const class_module = @import("runtime_class");
+const native_types = @import("../stdlib/types.zig");
 
 const Value = value_module.Value;
 const PythonException = exceptions.PythonException;
@@ -70,6 +71,7 @@ pub const Frame = struct {
     return_destination: ?u16 = null,
     generator_owner: ?*iterator.Iterator = null,
     return_override: ?Value = null,
+    return_to_task: ?*native_types.Task = null,
     override_requires_none: bool = false,
     ip: usize = 0,
     registers: []Value = &.{},

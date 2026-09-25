@@ -9,6 +9,25 @@ pub const Result = exceptions.Result;
 
 pub const Attribute = struct { name: []u8, value: Value };
 
+pub const PrimitiveType = enum(u8) {
+    none_type,
+    bool_type,
+    int_type,
+    float_type,
+    str_type,
+    bytes_type,
+    list_type,
+    tuple_type,
+    dict_type,
+    set_type,
+    range_type,
+    slice_type,
+    function_type,
+    module_type,
+    file_type,
+    iterator_type,
+};
+
 pub const Class = struct {
     header: gc.Header align(8),
     allocator: std.mem.Allocator,
@@ -17,6 +36,8 @@ pub const Class = struct {
     mro: []*Class,
     attributes: std.ArrayList(Attribute) = .empty,
     class_cell: ?*functions.Cell = null,
+    primitive: ?PrimitiveType = null,
+    native_type_id: u8 = 0,
 };
 
 pub const Instance = struct {

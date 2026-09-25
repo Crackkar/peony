@@ -1,0 +1,2 @@
+# Preserve the official Unicode 15 source bytes, including its trailing blank line.
+data/ucd-15.0.0/SpecialCasing.txt whitespace=-blank-at-eof

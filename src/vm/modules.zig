@@ -10,6 +10,9 @@ const dict_module = @import("runtime_dict");
 const exceptions = @import("runtime_exception");
 const class_module = @import("runtime_class");
 const module_module = @import("runtime_module");
+const functions_module = @import("runtime_function");
+const native_registry = @import("../stdlib/registry.zig");
+const native_sys = @import("../stdlib/sys.zig");
 
 const Runtime = @import("runtime.zig").Runtime;
 const state = @import("state.zig");
@@ -306,44 +309,6 @@ pub fn initializeModuleWorld(self: *Runtime, line: u32, column: u32) bool {
     var sys_root = gc.Root{ .object = &sys.header };
     roots.add(&sys_root);
     if (!self.cacheModule(sys, line, column)) return false;
-    if (!self.environmentStore(&sys_environment.header, "modules", Value.object(&cache.header))) {
-        self.setException(exceptions.memoryError(), line, column, null);
-        return false;
-    }
-
-    {
-        const path_values = self.heap.allocator.alloc(Value, 3) catch {
-            self.setException(exceptions.memoryError(), line, column, null);
-            return false;
-        };
-        defer self.heap.allocator.free(path_values);
-        const path_texts = [_][]const u8{"/home", "/course", "/tmp"};
-        var path_roots = [_]gc.Root{.{ .object = null }, .{ .object = null }, .{ .object = null }};
-        var path_frame = gc.RootFrame{};
-        path_frame.push(&self.heap.roots);
-        for (&path_roots) |*root| path_frame.add(root);
-        defer path_frame.pop();
-        for (path_texts, 0..) |text, index| {
-            const value = self.createStringValue(text, line, column) orelse return false;
-            path_values[index] = value;
-            path_roots[index].object = value.asObject();
-        }
-        const path_list = switch (sequence.createList(&self.heap, path_values)) {
-            .value => |list| list,
-            .python_exception => |exception| {
-                self.setException(exception, line, column, null);
-                return false;
-            },
-            .engine_error => return self.engineFault(),
-        };
-        var path_root = gc.Root{ .object = &path_list.header };
-        path_frame.add(&path_root);
-        if (!self.environmentStore(&sys_environment.header, "path", Value.object(&path_list.header))) {
-            self.setException(exceptions.memoryError(), line, column, null);
-            return false;
-        }
-    }
-
     const filename = if (self.code) |code| code.filename else "<string>";
     const main_created = module_module.create(&self.heap, "__main__", "", filename, "", &self.environment.header, false);
     const main_module = switch (main_created) {
@@ -477,8 +442,26 @@ pub fn executeImportModule(self: *Runtime, destination: u16, site_index: u32, li
 
 pub fn startImportedModule(self: *Runtime, name: []const u8, destination: u16, line: u32, column: u32) bool {
     if (self.findCachedModule(name)) |cached| {
+        if (native_registry.moduleId(name) == .sys and !cached.initialized) {
+            if (!native_sys.populate(Runtime, self, cached.environment, line, column)) {
+                const environment: *Environment = @ptrCast(@alignCast(cached.environment));
+                for (environment.entries.items) |entry| self.heap.allocator.free(@constCast(entry.name));
+                environment.entries.clearRetainingCapacity();
+                return false;
+            }
+            cached.initialized = true;
+        }
         self.setRegister(destination, Value.object(&cached.header));
         return true;
+    }
+    if (native_registry.moduleId(name)) |native_id| {
+        if (std.mem.lastIndexOfScalar(u8, name, '.')) |separator| {
+            const parent_name = name[0..separator];
+            if (self.findCachedModule(parent_name) == null) if (native_registry.moduleId(parent_name)) |parent_id| {
+                if (!self.startNativeModule(parent_name, parent_id, destination, line, column)) return false;
+            };
+        }
+        return self.startNativeModule(name, native_id, destination, line, column);
     }
     const resolved = self.resolveModuleFile(name) catch {
         self.setException(exceptions.memoryError(), line, column, null);
@@ -617,6 +600,88 @@ pub fn startImportedModule(self: *Runtime, name: []const u8, destination: u16, l
     return true;
 }
 
+pub fn startNativeModule(self: *Runtime, name: []const u8, native_id: @import("../stdlib/types.zig").ModuleId, destination: u16, line: u32, column: u32) bool {
+    const environment = self.createEnvironment(line, column) orelse return false;
+    var env_root = gc.Root{ .object = &environment.header };
+    var roots = gc.RootFrame{};
+    roots.push(&self.heap.roots);
+    roots.add(&env_root);
+    defer roots.pop();
+    const package_name = if (std.mem.lastIndexOfScalar(u8, name, '.')) |separator| name[0..separator] else "";
+    const is_package = native_id == .urllib or native_id == .requests;
+    const native_module = switch (module_module.create(&self.heap, name, package_name, "<native>", "", &environment.header, is_package)) {
+        .value => |selected| selected,
+        .python_exception => |exception| {
+            self.setException(exception, line, column, null);
+            return false;
+        },
+    };
+    environment.module_owner = &native_module.header;
+    var module_root = gc.Root{ .object = &native_module.header };
+    roots.add(&module_root);
+    if (!self.cacheModule(native_module, line, column)) return false;
+    var completed = false;
+    var eager_child: ?*module_module.Module = null;
+    defer if (!completed) {
+        if (eager_child) |child| self.removeCachedModule(child);
+        self.removeCachedModule(native_module);
+    };
+
+    var name_root = gc.Root{ .object = null };
+    var package_root = gc.Root{ .object = null };
+    var file_root = gc.Root{ .object = null };
+    roots.add(&name_root);
+    roots.add(&package_root);
+    roots.add(&file_root);
+    const name_value = self.createStringValue(name, line, column) orelse return false;
+    name_root.object = name_value.asObject();
+    const package_value = self.createStringValue(package_name, line, column) orelse return false;
+    package_root.object = package_value.asObject();
+    const file_value = self.createStringValue("<native>", line, column) orelse return false;
+    file_root.object = file_value.asObject();
+    if (!self.environmentStore(&environment.header, "__name__", name_value) or
+        !self.environmentStore(&environment.header, "__package__", package_value) or
+        !self.environmentStore(&environment.header, "__file__", file_value))
+    {
+        self.setException(exceptions.memoryError(), line, column, null);
+        return false;
+    }
+
+    for (native_registry.functionSpecs(native_id)) |spec| {
+        if (!spec.exported or native_id == .random or native_id == .statistics or native_id == .json or native_id == .csv or native_id == .copy) continue;
+        const created = functions_module.createLibrary(&self.heap, @intFromEnum(native_id), spec.id, Value.noneValue());
+        const function = switch (created) {
+            .value => |selected| selected,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+        };
+        var function_root = gc.Root{ .object = &function.header };
+        var function_frame = gc.RootFrame{};
+        function_frame.push(&self.heap.roots);
+        function_frame.add(&function_root);
+        const stored = self.environmentStore(&environment.header, spec.name, Value.object(&function.header));
+        function_frame.pop();
+        if (!stored) {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return false;
+        }
+    }
+    if (!native_registry.populate(Runtime, self, native_id, &environment.header, line, column)) return false;
+    if (native_id == .requests or native_id == .os) {
+        const child_name: []const u8 = if (native_id == .requests) "requests.exceptions" else "os.path";
+        const child_id: @import("../stdlib/types.zig").ModuleId = if (native_id == .requests) .requests_exceptions else .os_path;
+        if (!self.startNativeModule(child_name, child_id, destination, line, column)) return false;
+        eager_child = self.findCachedModule(child_name) orelse return self.engineFault();
+    }
+    native_module.initialized = true;
+    if (!self.attachImportedChild(native_module, line, column)) return false;
+    self.setRegister(destination, Value.object(&native_module.header));
+    completed = true;
+    return true;
+}
+
 pub fn executeImportMember(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
     const code = self.activeCode() orelse return self.engineFault();
     const site_index: usize = instruction.c();
@@ -638,7 +703,7 @@ pub fn executeImportMember(self: *Runtime, instruction: bytecode.Instruction, li
         return false;
     };
     defer self.heap.allocator.free(child_name);
-    if (self.findCachedModule(child_name) == null) {
+    if (self.findCachedModule(child_name) == null and native_registry.moduleId(child_name) == null) {
         const child_file = self.resolveModuleFile(child_name) catch {
             self.setException(exceptions.memoryError(), line, column, null);
             return false;

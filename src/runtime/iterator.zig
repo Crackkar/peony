@@ -61,6 +61,8 @@ pub const Iterator = struct {
     callback: Value = Value.noneValue(),
     user_object: ?Value = null,
     callback_pending: bool = false,
+    native_pending_value: ?Value = null,
+    native_pending_done: bool = false,
     finished: bool = false,
     started: bool = false,
     generator_frame: ?*anyopaque = null,
@@ -112,6 +114,7 @@ fn traceIterator(header: *gc.Header, tracer: *gc.Tracer) void {
     tracer.visit(iterator.reverse_source.asObject());
     tracer.visit(iterator.callback.asObject());
     if (iterator.user_object) |user| tracer.visit(user.asObject());
+    if (iterator.native_pending_value) |value| tracer.visit(value.asObject());
     if (iterator.generator_yielded) |value| tracer.visit(value.asObject());
     tracer.visit(iterator.generator_send_value.asObject());
     tracer.visit(iterator.generator_return_value.asObject());

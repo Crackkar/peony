@@ -14,11 +14,14 @@ pub const Native = enum {
     dict,
     set,
     hash,
+    id_builtin,
     format_builtin,
     sorted,
     map,
     filter,
     str_constructor,
+    int_constructor,
+    float_constructor,
     len,
     list,
     tuple,
@@ -99,6 +102,7 @@ pub const Native = enum {
     descriptor_deleter,
     generator_send,
     generator_close,
+    import_builtin,
 };
 
 pub const Cell = struct {
@@ -116,6 +120,8 @@ pub const Function = struct {
     annotations: []Value = &.{},
     annotations_dict: Value = Value.noneValue(),
     native: ?Native = null,
+    library_module: u8 = 0,
+    library_function: u16 = 0,
     bound_self: Value = Value.noneValue(),
 };
 
@@ -157,6 +163,18 @@ pub fn createBoundNative(heap: *gc.Heap, native: Native, bound_self: Value) Resu
         },
         .python_exception => |exception| .{ .python_exception = exception },
     };
+}
+
+pub fn createLibrary(heap: *gc.Heap, module_id: u8, function_id: u16, bound_self: Value) Result {
+    const function = heap.createObject(Function, &function_kind) catch return .{ .python_exception = memoryError() };
+    function.* = .{
+        .header = function.header,
+        .allocator = heap.allocator,
+        .library_module = module_id,
+        .library_function = function_id,
+        .bound_self = bound_self,
+    };
+    return .{ .value = function };
 }
 
 pub fn createPython(

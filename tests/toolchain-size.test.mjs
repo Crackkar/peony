@@ -3,12 +3,13 @@ import { execFileSync } from 'node:child_process';
 import test from 'node:test';
 
 test('the required Zig compiler is exactly 0.16.0', () => {
-  assert.equal(execFileSync('zig', ['version'], { encoding: 'utf8' }).trim(), '0.16.0');
+  assert.equal(execFileSync('zig', ['version'], { encoding: 'utf8', windowsHide: true }).trim(), '0.16.0');
 });
 
 test('size report is repeatable and includes the baseline plus all feature deltas', () => {
   const run = () => JSON.parse(execFileSync('node', ['tools/size_report.mjs', '--json'], {
     encoding: 'utf8',
+    windowsHide: true,
     maxBuffer: 1024 * 1024,
   }));
   const first = run();

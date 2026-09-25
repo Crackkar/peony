@@ -81,6 +81,62 @@ pub fn parseIntegerLiteral(heap: *Heap, token: []const u8) ValueResult {
     return managedToValue(heap, integer);
 }
 
+/// Parse the supported Python int(str/bytes, base) form without narrowing the
+/// result through a machine integer. The VM charges source length as work.
+pub fn parseIntegerText(heap: *Heap, source: []const u8, requested_base: i64) ValueResult {
+    if (requested_base != 0 and (requested_base < 2 or requested_base > 36)) return pythonError(Value, .value_error, "int() base must be >= 2 and <= 36, or 0");
+    var text = std.mem.trim(u8, source, " \t\r\n\x0b\x0c");
+    if (text.len == 0) return pythonError(Value, .value_error, "invalid literal for int()");
+    const is_negative = text[0] == '-';
+    if (is_negative or text[0] == '+') text = text[1..];
+    if (text.len == 0) return pythonError(Value, .value_error, "invalid literal for int()");
+
+    var base: u8 = if (requested_base == 0) 10 else @intCast(requested_base);
+    var prefixed = false;
+    if (text.len >= 2 and text[0] == '0') {
+        const prefix_base: u8 = switch (text[1]) {
+            'x', 'X' => 16,
+            'o', 'O' => 8,
+            'b', 'B' => 2,
+            else => 0,
+        };
+        if (prefix_base != 0 and (requested_base == 0 or base == prefix_base)) {
+            base = prefix_base;
+            text = text[2..];
+            prefixed = true;
+        }
+    }
+    if (text.len == 0) return pythonError(Value, .value_error, "invalid literal for int()");
+    const digits = heap.allocator.alloc(u8, text.len) catch return memoryError(Value);
+    defer heap.allocator.free(digits);
+    var count: usize = 0;
+    var previous_underscore = false;
+    for (text, 0..) |character, index| {
+        if (character == '_') {
+            if (previous_underscore or (count == 0 and !prefixed) or index + 1 == text.len) return pythonError(Value, .value_error, "invalid literal for int()");
+            previous_underscore = true;
+            continue;
+        }
+        const digit: u8 = if (character >= '0' and character <= '9') character - '0' else if (character >= 'a' and character <= 'z') character - 'a' + 10 else if (character >= 'A' and character <= 'Z') character - 'A' + 10 else 255;
+        if (digit >= base) return pythonError(Value, .value_error, "invalid literal for int()");
+        digits[count] = character;
+        count += 1;
+        previous_underscore = false;
+    }
+    if (count == 0 or previous_underscore) return pythonError(Value, .value_error, "invalid literal for int()");
+    if (requested_base == 0 and !prefixed and count > 1 and digits[0] == '0') {
+        for (digits[1..count]) |digit| if (digit != '0') return pythonError(Value, .value_error, "invalid literal for int()");
+    }
+    var integer = BigIntStorage.init(heap.allocator) catch return memoryError(Value);
+    integer.setString(base, digits[0..count]) catch |err| {
+        integer.deinit();
+        if (err == error.OutOfMemory) return memoryError(Value);
+        return pythonError(Value, .value_error, "invalid literal for int()");
+    };
+    if (is_negative) integer.setSign(false);
+    return managedToValue(heap, integer);
+}
+
 pub fn toInt(comptime Int: type, value: Value) ?Int {
     if (smallInteger(value)) |integer| return std.math.cast(Int, integer);
     const big = bigInteger(value) orelse return null;
@@ -754,7 +810,7 @@ fn compareIntegerMagnitudeToFloat(integer: Value, float_integer: FloatInteger) C
     return comparisonFromOrder(magnitude_order);
 }
 
-fn integerBitCount(value: Value) usize {
+pub fn integerBitCount(value: Value) usize {
     if (smallInteger(value)) |integer| {
         if (integer == 0) return 0;
         const magnitude: u64 = @intCast(if (integer < 0) -@as(i128, integer) else integer);

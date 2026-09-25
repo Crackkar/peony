@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const Error = error{
     InvalidPath,
+    InvalidMove,
     NotFound,
     Exists,
     NotDirectory,
@@ -14,16 +15,27 @@ pub const Error = error{
 pub const EntryKind = enum { directory, file };
 pub const WriteMode = enum { replace, append, exclusive };
 
+/// File contents have identity independent of a namespace entry. Open files retain
+/// their node across rename and unlink; the byte budget is released with the last
+/// namespace link or open handle.
+pub const FileNode = struct {
+    bytes: []u8 = &.{},
+    links: usize = 1,
+    handles: usize = 0,
+    read_only: bool = false,
+};
+
 pub const Entry = struct {
     path: []u8,
     kind: EntryKind,
-    bytes: []u8 = &.{},
+    node: ?*FileNode = null,
     read_only: bool = false,
 };
 
 pub const Vfs = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry) = .empty,
+    nodes: std.ArrayList(*FileNode) = .empty,
     total_bytes: usize = 0,
     max_total_bytes: usize,
     max_file_bytes: usize,
@@ -43,11 +55,13 @@ pub const Vfs = struct {
     }
 
     pub fn deinit(self: *Vfs) void {
-        for (self.entries.items) |entry| {
-            self.allocator.free(entry.path);
-            if (entry.bytes.len != 0) self.allocator.free(entry.bytes);
-        }
+        for (self.entries.items) |entry| self.allocator.free(entry.path);
         self.entries.deinit(self.allocator);
+        for (self.nodes.items) |node| {
+            if (node.bytes.len != 0) self.allocator.free(node.bytes);
+            self.allocator.destroy(node);
+        }
+        self.nodes.deinit(self.allocator);
         self.total_bytes = 0;
     }
 
@@ -58,10 +72,7 @@ pub const Vfs = struct {
     pub fn read(self: *const Vfs, path: []const u8) Error![]const u8 {
         const normalized = try normalizePath(self.allocator, path);
         defer self.allocator.free(normalized);
-        const index = self.find(normalized) orelse return error.NotFound;
-        const entry = self.entries.items[index];
-        if (entry.kind == .directory) return error.IsDirectory;
-        return entry.bytes;
+        return self.readNormalized(normalized);
     }
 
     pub fn exists(self: *const Vfs, path: []const u8) bool {
@@ -75,10 +86,28 @@ pub const Vfs = struct {
     }
 
     pub fn readNormalized(self: *const Vfs, normalized: []const u8) Error![]const u8 {
+        return self.readNode(try self.fileNodeNormalized(normalized));
+    }
+
+    pub fn fileNodeNormalized(self: *const Vfs, normalized: []const u8) Error!*FileNode {
         const index = self.find(normalized) orelse return error.NotFound;
         const entry = self.entries.items[index];
         if (entry.kind == .directory) return error.IsDirectory;
-        return entry.bytes;
+        return entry.node.?;
+    }
+
+    pub fn readNode(_: *const Vfs, node: *const FileNode) Error![]const u8 {
+        return node.bytes;
+    }
+
+    pub fn retainFile(_: *Vfs, node: *FileNode) void {
+        node.handles += 1;
+    }
+
+    pub fn releaseFile(self: *Vfs, node: *FileNode) void {
+        std.debug.assert(node.handles != 0);
+        node.handles -= 1;
+        self.maybeDestroyNode(node);
     }
 
     pub fn isDirectoryNormalized(self: *const Vfs, normalized: []const u8) bool {
@@ -100,36 +129,38 @@ pub const Vfs = struct {
         if (self.entries.items[parent_index].kind != .directory) return error.NotDirectory;
 
         if (self.find(normalized)) |index| {
-            var entry = &self.entries.items[index];
+            const entry = self.entries.items[index];
             if (entry.kind == .directory) return error.IsDirectory;
             if (entry.read_only) return error.PermissionDenied;
             if (mode == .exclusive) return error.Exists;
-            const old_len = entry.bytes.len;
-            const new_len = if (mode == .append) std.math.add(usize, old_len, bytes.len) catch return error.TooLarge else bytes.len;
-            if (new_len > self.max_file_bytes) return error.TooLarge;
-            const total_without_old = self.total_bytes - old_len;
-            const new_total = std.math.add(usize, total_without_old, new_len) catch return error.TooLarge;
-            if (new_total > self.max_total_bytes) return error.TooLarge;
-            const replacement = self.allocator.alloc(u8, new_len) catch return error.OutOfMemory;
-            if (mode == .append) {
-                @memcpy(replacement[0..old_len], entry.bytes);
-                @memcpy(replacement[old_len..], bytes);
-            } else {
-                @memcpy(replacement, bytes);
-            }
-            if (entry.bytes.len != 0) self.allocator.free(entry.bytes);
-            entry.bytes = replacement;
-            self.total_bytes = new_total;
-            return;
+            return self.writeNode(entry.node.?, bytes, mode);
         }
 
-        const new_total = std.math.add(usize, self.total_bytes, bytes.len) catch return error.TooLarge;
+        if (mode == .append or mode == .replace or mode == .exclusive) {
+            try self.addFile(normalized, bytes, false);
+        }
+    }
+
+    pub fn writeNode(self: *Vfs, node: *FileNode, bytes: []const u8, mode: WriteMode) Error!void {
+        if (node.read_only) return error.PermissionDenied;
+        if (mode == .exclusive) return error.Exists;
+        const old_len = node.bytes.len;
+        const new_len = if (mode == .append)
+            std.math.add(usize, old_len, bytes.len) catch return error.TooLarge
+        else
+            bytes.len;
+        if (new_len > self.max_file_bytes) return error.TooLarge;
+        const new_total = std.math.add(usize, self.total_bytes - old_len, new_len) catch return error.TooLarge;
         if (new_total > self.max_total_bytes) return error.TooLarge;
-        const owned_bytes = self.allocator.dupe(u8, bytes) catch return error.OutOfMemory;
-        errdefer if (owned_bytes.len != 0) self.allocator.free(owned_bytes);
-        const owned_path = self.allocator.dupe(u8, normalized) catch return error.OutOfMemory;
-        errdefer self.allocator.free(owned_path);
-        self.entries.append(self.allocator, .{ .path = owned_path, .kind = .file, .bytes = owned_bytes }) catch return error.OutOfMemory;
+        const replacement = if (new_len == 0) @as([]u8, &.{}) else self.allocator.alloc(u8, new_len) catch return error.OutOfMemory;
+        if (mode == .append) {
+            @memcpy(replacement[0..old_len], node.bytes);
+            @memcpy(replacement[old_len..], bytes);
+        } else if (bytes.len != 0) {
+            @memcpy(replacement, bytes);
+        }
+        if (node.bytes.len != 0) self.allocator.free(node.bytes);
+        node.bytes = replacement;
         self.total_bytes = new_total;
     }
 
@@ -140,16 +171,10 @@ pub const Vfs = struct {
         defer self.allocator.free(normalized);
         if (!std.mem.startsWith(u8, normalized, "/course/") or normalized.len <= "/course/".len) return error.PermissionDenied;
         if (bytes.len > self.max_file_bytes) return error.TooLarge;
-        const existing = self.find(normalized);
-        if (existing) |index| {
-            if (self.entries.items[index].kind != .file or !self.entries.items[index].read_only) return error.Exists;
-            const new_total = self.total_bytes - self.entries.items[index].bytes.len + bytes.len;
-            if (new_total > self.max_total_bytes) return error.TooLarge;
-            const replacement = self.allocator.dupe(u8, bytes) catch return error.OutOfMemory;
-            self.allocator.free(self.entries.items[index].bytes);
-            self.entries.items[index].bytes = replacement;
-            self.total_bytes = new_total;
-            return;
+        if (self.find(normalized)) |index| {
+            const entry = self.entries.items[index];
+            if (entry.kind != .file or !entry.read_only) return error.Exists;
+            return self.replaceMountedBytes(entry.node.?, bytes);
         }
         const new_total = std.math.add(usize, self.total_bytes, bytes.len) catch return error.TooLarge;
         if (new_total > self.max_total_bytes) return error.TooLarge;
@@ -158,13 +183,138 @@ pub const Vfs = struct {
         errdefer self.rollbackEntries(original_len);
         const parent = parentPath(normalized) orelse return error.InvalidPath;
         try self.createMissingCourseParents(parent);
+        try self.addFile(normalized, bytes, true);
+    }
 
-        const owned_path = self.allocator.dupe(u8, normalized) catch return error.OutOfMemory;
-        errdefer self.allocator.free(owned_path);
-        const owned_bytes = self.allocator.dupe(u8, bytes) catch return error.OutOfMemory;
-        errdefer if (owned_bytes.len != 0) self.allocator.free(owned_bytes);
-        self.entries.append(self.allocator, .{ .path = owned_path, .kind = .file, .bytes = owned_bytes, .read_only = true }) catch return error.OutOfMemory;
-        self.total_bytes = new_total;
+    pub fn mkdir(self: *Vfs, path: []const u8, parents: bool, exist_ok: bool) Error!void {
+        const normalized = try normalizePath(self.allocator, path);
+        defer self.allocator.free(normalized);
+        try self.mkdirNormalized(normalized, parents, exist_ok);
+    }
+
+    pub fn mkdirNormalized(self: *Vfs, normalized: []const u8, parents: bool, exist_ok: bool) Error!void {
+        if (!isWritablePath(normalized) or std.mem.eql(u8, normalized, "/home") or std.mem.eql(u8, normalized, "/tmp")) {
+            if (self.find(normalized)) |index| {
+                if (self.entries.items[index].kind == .directory and exist_ok) return;
+                return error.Exists;
+            }
+            return error.PermissionDenied;
+        }
+        if (self.find(normalized)) |index| {
+            if (self.entries.items[index].kind == .directory and exist_ok) return;
+            return error.Exists;
+        }
+        if (!parents) {
+            const parent = parentPath(normalized) orelse return error.InvalidPath;
+            const parent_index = self.find(parent) orelse return error.NotFound;
+            if (self.entries.items[parent_index].kind != .directory) return error.NotDirectory;
+            return self.addDirectory(normalized, false);
+        }
+
+        var pending: std.ArrayList(Entry) = .empty;
+        defer {
+            for (pending.items) |entry| self.allocator.free(entry.path);
+            pending.deinit(self.allocator);
+        }
+        var cursor: usize = 1;
+        while (cursor <= normalized.len) {
+            const separator = std.mem.indexOfScalarPos(u8, normalized, cursor, '/') orelse normalized.len;
+            const prefix = normalized[0..separator];
+            if (self.find(prefix)) |index| {
+                if (self.entries.items[index].kind != .directory) return error.NotDirectory;
+            } else {
+                const owned = self.allocator.dupe(u8, prefix) catch return error.OutOfMemory;
+                pending.append(self.allocator, .{ .path = owned, .kind = .directory }) catch {
+                    self.allocator.free(owned);
+                    return error.OutOfMemory;
+                };
+            }
+            if (separator == normalized.len) break;
+            cursor = separator + 1;
+        }
+        self.entries.ensureUnusedCapacity(self.allocator, pending.items.len) catch return error.OutOfMemory;
+        for (pending.items) |entry| self.entries.appendAssumeCapacity(entry);
+        pending.clearRetainingCapacity();
+    }
+
+    /// Removes a file (`directory == false`) or an empty directory.
+    pub fn remove(self: *Vfs, path: []const u8, directory: bool) Error!void {
+        const normalized = try normalizePath(self.allocator, path);
+        defer self.allocator.free(normalized);
+        try self.removeNormalized(normalized, directory);
+    }
+
+    pub fn removeNormalized(self: *Vfs, normalized: []const u8, directory: bool) Error!void {
+        if (!isWritablePath(normalized)) return error.PermissionDenied;
+        const index = self.find(normalized) orelse return error.NotFound;
+        const entry = self.entries.items[index];
+        if (directory) {
+            if (entry.kind != .directory) return error.NotDirectory;
+            if (self.hasDescendants(normalized)) return error.Exists;
+        } else if (entry.kind == .directory) {
+            return error.IsDirectory;
+        }
+        self.removeEntryAt(index);
+    }
+
+    /// Moves a file or complete directory subtree. When `replace_destination` is
+    /// true, a same-kind file or empty directory destination is removed first.
+    pub fn rename(self: *Vfs, source: []const u8, destination: []const u8, replace_destination: bool) Error!void {
+        const normalized_source = try normalizePath(self.allocator, source);
+        defer self.allocator.free(normalized_source);
+        const normalized_destination = try normalizePath(self.allocator, destination);
+        defer self.allocator.free(normalized_destination);
+        try self.renameNormalized(normalized_source, normalized_destination, replace_destination);
+    }
+
+    pub fn renameNormalized(self: *Vfs, source: []const u8, destination: []const u8, replace_destination: bool) Error!void {
+        if (!isWritablePath(source) or !isWritablePath(destination)) return error.PermissionDenied;
+        if (std.mem.eql(u8, source, destination)) return;
+        const source_index = self.find(source) orelse return error.NotFound;
+        const source_kind = self.entries.items[source_index].kind;
+        if (source_kind == .directory and isDescendant(source, destination)) return error.InvalidMove;
+        const destination_parent = parentPath(destination) orelse return error.InvalidPath;
+        const parent_index = self.find(destination_parent) orelse return error.NotFound;
+        if (self.entries.items[parent_index].kind != .directory) return error.NotDirectory;
+
+        const destination_index = self.find(destination);
+        if (destination_index) |index| {
+            if (!replace_destination) return error.Exists;
+            const destination_kind = self.entries.items[index].kind;
+            if (source_kind == .directory and destination_kind != .directory) return error.NotDirectory;
+            if (source_kind == .file and destination_kind == .directory) return error.IsDirectory;
+            if (destination_kind == .directory and self.hasDescendants(destination)) return error.Exists;
+        }
+
+        const Move = struct { old_path: []const u8, new_path: []u8 };
+        var moves: std.ArrayList(Move) = .empty;
+        defer {
+            for (moves.items) |move| if (move.new_path.len != 0) self.allocator.free(move.new_path);
+            moves.deinit(self.allocator);
+        }
+        for (self.entries.items) |entry| {
+            if (!std.mem.eql(u8, entry.path, source) and !isDescendant(source, entry.path)) continue;
+            const suffix = entry.path[source.len..];
+            const new_path = std.mem.concat(self.allocator, u8, &.{ destination, suffix }) catch return error.OutOfMemory;
+            moves.append(self.allocator, .{ .old_path = entry.path, .new_path = new_path }) catch {
+                self.allocator.free(new_path);
+                return error.OutOfMemory;
+            };
+        }
+        for (moves.items) |move| {
+            if (self.find(move.new_path)) |index| {
+                const existing_path = self.entries.items[index].path;
+                if (!std.mem.eql(u8, existing_path, destination) and !std.mem.eql(u8, existing_path, source) and !isDescendant(source, existing_path)) return error.Exists;
+            }
+        }
+
+        if (destination_index != null) self.removeEntryAt(self.find(destination).?);
+        for (moves.items) |*move| {
+            const index = self.find(move.old_path).?;
+            self.allocator.free(self.entries.items[index].path);
+            self.entries.items[index].path = move.new_path;
+            move.new_path = &.{};
+        }
     }
 
     pub fn list(self: *const Vfs, path: []const u8) Error![]u8 {
@@ -183,32 +333,64 @@ pub const Vfs = struct {
             if (entry.kind != .file or !isDescendant(normalized, entry.path)) continue;
             paths.append(self.allocator, entry.path) catch return error.OutOfMemory;
         }
-        std.mem.sort([]const u8, paths.items, {}, struct {
-            fn lessThan(_: void, left: []const u8, right: []const u8) bool {
-                return std.mem.lessThan(u8, left, right);
-            }
-        }.lessThan);
-        var output: std.ArrayList(u8) = .empty;
-        errdefer output.deinit(self.allocator);
-        for (paths.items) |file_path| {
-            output.appendSlice(self.allocator, file_path) catch return error.OutOfMemory;
-            output.append(self.allocator, 0) catch return error.OutOfMemory;
+        sortSlices(paths.items);
+        return joinNul(self.allocator, paths.items);
+    }
+
+    /// Returns sorted, NUL-separated immediate child names, including directories.
+    pub fn listDirectory(self: *const Vfs, path: []const u8) Error![]u8 {
+        const normalized = try normalizePath(self.allocator, path);
+        defer self.allocator.free(normalized);
+        return self.listDirectoryNormalized(normalized);
+    }
+
+    pub fn listDirectoryNormalized(self: *const Vfs, normalized: []const u8) Error![]u8 {
+        const index = self.find(normalized) orelse return error.NotFound;
+        if (self.entries.items[index].kind != .directory) return error.NotDirectory;
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(self.allocator);
+        for (self.entries.items) |entry| {
+            if (!isDescendant(normalized, entry.path)) continue;
+            const offset = if (std.mem.eql(u8, normalized, "/")) 1 else normalized.len + 1;
+            const remainder = entry.path[offset..];
+            if (std.mem.indexOfScalar(u8, remainder, '/') != null) continue;
+            names.append(self.allocator, remainder) catch return error.OutOfMemory;
         }
-        return output.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+        sortSlices(names.items);
+        return joinNul(self.allocator, names.items);
+    }
+
+    /// Returns sorted, NUL-separated full directory paths beneath `path`.
+    /// The queried directory itself is excluded. Lexical sorting places every
+    /// parent before its descendants, which makes the result directly usable
+    /// by persistence restore code.
+    pub fn listDirectories(self: *const Vfs, path: []const u8) Error![]u8 {
+        const normalized = try normalizePath(self.allocator, path);
+        defer self.allocator.free(normalized);
+        return self.listDirectoriesNormalized(normalized);
+    }
+
+    pub fn listDirectoriesNormalized(self: *const Vfs, normalized: []const u8) Error![]u8 {
+        const index = self.find(normalized) orelse return error.NotFound;
+        if (self.entries.items[index].kind != .directory) return error.NotDirectory;
+        var paths: std.ArrayList([]const u8) = .empty;
+        defer paths.deinit(self.allocator);
+        for (self.entries.items) |entry| {
+            if (entry.kind != .directory or !isDescendant(normalized, entry.path)) continue;
+            paths.append(self.allocator, entry.path) catch return error.OutOfMemory;
+        }
+        sortSlices(paths.items);
+        return joinNul(self.allocator, paths.items);
     }
 
     pub fn clearTemporary(self: *Vfs) void {
         var index: usize = 0;
         while (index < self.entries.items.len) {
-            const entry = self.entries.items[index];
-            if (!std.mem.startsWith(u8, entry.path, "/tmp/")) {
+            if (!isDescendant("/tmp", self.entries.items[index].path)) {
                 index += 1;
                 continue;
             }
-            self.total_bytes -= entry.bytes.len;
-            self.allocator.free(entry.path);
-            if (entry.bytes.len != 0) self.allocator.free(entry.bytes);
-            _ = self.entries.orderedRemove(index);
+            self.removeEntryAt(index);
         }
     }
 
@@ -230,6 +412,59 @@ pub const Vfs = struct {
         self.entries.append(self.allocator, .{ .path = owned, .kind = .directory, .read_only = read_only }) catch return error.OutOfMemory;
     }
 
+    fn addFile(self: *Vfs, path: []const u8, bytes: []const u8, read_only: bool) Error!void {
+        const new_total = std.math.add(usize, self.total_bytes, bytes.len) catch return error.TooLarge;
+        if (bytes.len > self.max_file_bytes or new_total > self.max_total_bytes) return error.TooLarge;
+        const node = self.allocator.create(FileNode) catch return error.OutOfMemory;
+        errdefer self.allocator.destroy(node);
+        node.* = .{ .read_only = read_only };
+        if (bytes.len != 0) node.bytes = self.allocator.dupe(u8, bytes) catch return error.OutOfMemory;
+        errdefer if (node.bytes.len != 0) self.allocator.free(node.bytes);
+        self.nodes.append(self.allocator, node) catch return error.OutOfMemory;
+        errdefer _ = self.nodes.pop();
+        const owned_path = self.allocator.dupe(u8, path) catch return error.OutOfMemory;
+        errdefer self.allocator.free(owned_path);
+        self.entries.append(self.allocator, .{ .path = owned_path, .kind = .file, .node = node, .read_only = read_only }) catch return error.OutOfMemory;
+        self.total_bytes = new_total;
+    }
+
+    fn replaceMountedBytes(self: *Vfs, node: *FileNode, bytes: []const u8) Error!void {
+        const new_total = std.math.add(usize, self.total_bytes - node.bytes.len, bytes.len) catch return error.TooLarge;
+        if (bytes.len > self.max_file_bytes or new_total > self.max_total_bytes) return error.TooLarge;
+        const replacement = if (bytes.len == 0) @as([]u8, &.{}) else self.allocator.dupe(u8, bytes) catch return error.OutOfMemory;
+        if (node.bytes.len != 0) self.allocator.free(node.bytes);
+        node.bytes = replacement;
+        self.total_bytes = new_total;
+    }
+
+    fn removeEntryAt(self: *Vfs, index: usize) void {
+        const entry = self.entries.orderedRemove(index);
+        self.allocator.free(entry.path);
+        if (entry.node) |node| {
+            std.debug.assert(node.links != 0);
+            node.links -= 1;
+            self.maybeDestroyNode(node);
+        }
+    }
+
+    fn maybeDestroyNode(self: *Vfs, node: *FileNode) void {
+        if (node.links != 0 or node.handles != 0) return;
+        for (self.nodes.items, 0..) |candidate, index| {
+            if (candidate != node) continue;
+            self.total_bytes -= node.bytes.len;
+            if (node.bytes.len != 0) self.allocator.free(node.bytes);
+            self.allocator.destroy(node);
+            _ = self.nodes.orderedRemove(index);
+            return;
+        }
+        unreachable;
+    }
+
+    fn hasDescendants(self: *const Vfs, path: []const u8) bool {
+        for (self.entries.items) |entry| if (isDescendant(path, entry.path)) return true;
+        return false;
+    }
+
     fn createMissingCourseParents(self: *Vfs, path: []const u8) Error!void {
         if (!std.mem.startsWith(u8, path, "/course")) return error.PermissionDenied;
         var start: usize = "/course".len + 1;
@@ -247,11 +482,7 @@ pub const Vfs = struct {
     }
 
     fn rollbackEntries(self: *Vfs, original_len: usize) void {
-        while (self.entries.items.len > original_len) {
-            const entry = self.entries.pop().?;
-            self.allocator.free(entry.path);
-            if (entry.bytes.len != 0) self.allocator.free(entry.bytes);
-        }
+        while (self.entries.items.len > original_len) self.removeEntryAt(self.entries.items.len - 1);
     }
 };
 
@@ -289,10 +520,76 @@ fn parentPath(path: []const u8) ?[]const u8 {
 }
 
 fn isWritablePath(path: []const u8) bool {
-    return std.mem.startsWith(u8, path, "/home/") or std.mem.startsWith(u8, path, "/tmp/");
+    return std.mem.eql(u8, path, "/home") or std.mem.eql(u8, path, "/tmp") or
+        std.mem.startsWith(u8, path, "/home/") or std.mem.startsWith(u8, path, "/tmp/");
 }
 
 fn isDescendant(directory: []const u8, path: []const u8) bool {
     if (std.mem.eql(u8, directory, "/")) return path.len > 1 and path[0] == '/';
     return path.len > directory.len and std.mem.startsWith(u8, path, directory) and path[directory.len] == '/';
+}
+
+fn sortSlices(items: [][]const u8) void {
+    std.mem.sort([]const u8, items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+}
+
+fn joinNul(allocator: std.mem.Allocator, items: []const []const u8) Error![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    for (items) |item| {
+        output.appendSlice(allocator, item) catch return error.OutOfMemory;
+        output.append(allocator, 0) catch return error.OutOfMemory;
+    }
+    return output.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+test "directory mutations are atomic and retain empty directories" {
+    var fs = try Vfs.init(std.testing.allocator, 1024, 512);
+    defer fs.deinit();
+    try fs.mkdir("/home/tree/empty", true, false);
+    try fs.write("/home/tree/data", "value", .replace);
+    const before = try fs.listDirectory("/home/tree");
+    defer fs.allocator.free(before);
+    try std.testing.expectEqualStrings("data\x00empty\x00", before);
+    try std.testing.expectError(error.InvalidMove, fs.rename("/home/tree", "/home/tree/empty/moved", true));
+    try std.testing.expect(fs.exists("/home/tree/empty"));
+    try fs.rename("/home/tree", "/home/moved", true);
+    try std.testing.expect(fs.exists("/home/moved/empty"));
+    try std.testing.expectError(error.IsDirectory, fs.remove("/home/moved/empty", false));
+    try fs.remove("/home/moved/empty", true);
+}
+
+test "open file node survives rename and unlink" {
+    var fs = try Vfs.init(std.testing.allocator, 1024, 512);
+    defer fs.deinit();
+    try fs.write("/home/live", "old", .replace);
+    const node = try fs.fileNodeNormalized("/home/live");
+    fs.retainFile(node);
+    defer fs.releaseFile(node);
+    try fs.rename("/home/live", "/home/renamed", true);
+    try std.testing.expectEqualStrings("old", try fs.readNode(node));
+    try fs.remove("/home/renamed", false);
+    try fs.writeNode(node, "new", .replace);
+    try std.testing.expectEqualStrings("new", try fs.readNode(node));
+    try std.testing.expect(!fs.exists("/home/renamed"));
+}
+
+test "directory snapshot includes nested empty and read-only parents" {
+    var fs = try Vfs.init(std.testing.allocator, 1024, 512);
+    defer fs.deinit();
+    try fs.mkdir("/home/persist/nested/empty", true, false);
+    try fs.mountCourse("/course/unit/lesson.txt", "lesson");
+    const directories = try fs.listDirectories("/");
+    defer fs.allocator.free(directories);
+    try std.testing.expectEqualStrings(
+        "/course\x00/course/unit\x00/home\x00/home/persist\x00/home/persist/nested\x00/home/persist/nested/empty\x00/tmp\x00",
+        directories,
+    );
+    const nested = try fs.listDirectories("/home/persist");
+    defer fs.allocator.free(nested);
+    try std.testing.expectEqualStrings("/home/persist/nested\x00/home/persist/nested/empty\x00", nested);
 }

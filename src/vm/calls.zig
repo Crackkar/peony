@@ -14,6 +14,32 @@ const ast_module = @import("frontend_ast");
 const class_module = @import("runtime_class");
 
 const Runtime = @import("runtime.zig").Runtime;
+const native_library = @import("../stdlib/native.zig");
+
+fn executePrimitiveClassCall(
+    self: *Runtime,
+    destination: u16,
+    primitive: class_module.PrimitiveType,
+    positional: []const Value,
+    keywords: []const binder.Keyword,
+    line: u32,
+    column: u32,
+) bool {
+    const native: functions.Native = switch (primitive) {
+        .bool_type => .bool_constructor,
+        .int_type => .int_constructor,
+        .str_type => .str_constructor,
+        .float_type => .float_constructor,
+        .list_type => .list,
+        .tuple_type => .tuple,
+        .dict_type => .dict,
+        .set_type => .set,
+        .range_type => .range,
+        .slice_type => .slice,
+        else => return self.nativeTypeError(line, column, "type constructor is not supported"),
+    };
+    return self.executeNativeCall(destination, native, Value.noneValue(), positional, keywords, line, column);
+}
 const state = @import("state.zig");
 const GlobalEntry = state.GlobalEntry;
 const TryPhase = state.TryPhase;
@@ -177,18 +203,30 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
         if (self.typeClass()) |type_class| {
             if (user_class == type_class) {
                 if (keyword_count != 0 or positional.len != 1) return self.nativeTypeError(line, column, "type() takes exactly one argument");
-                const type_header = self.type_class_root.object orelse return self.engineFault();
-                const value_header = positional[0].asObject() orelse {
-                    self.setRegister(instruction.a(), Value.object(type_header));
-                    return true;
-                };
-                if (class_module.instanceFromHeader(value_header)) |instance| {
-                    self.setRegister(instruction.a(), Value.object(&instance.class.header));
-                    return true;
-                }
-                self.setRegister(instruction.a(), Value.object(type_header));
+                const result = self.pythonTypeOf(positional[0], line, column) orelse return false;
+                self.setRegister(instruction.a(), result);
                 return true;
             }
+        }
+        if (user_class.primitive) |primitive| {
+            if (primitive == .list_type or primitive == .tuple_type) {
+                if (keyword_count != 0 or positional.len > 1) return self.nativeArity(line, column);
+                if (positional.len == 1) {
+                    const source = positional[0];
+                    self.setRegister(instruction.a(), source);
+                    call_root_frame.pop();
+                    call_roots_active = false;
+                    return executePrimitiveClassCall(self, instruction.a(), primitive, &.{source}, &.{}, line, column);
+                }
+                call_root_frame.pop();
+                call_roots_active = false;
+                return executePrimitiveClassCall(self, instruction.a(), primitive, &.{}, &.{}, line, column);
+            }
+            return executePrimitiveClassCall(self, instruction.a(), primitive, positional, keywords[0..keyword_count], line, column);
+        }
+        if (user_class.native_type_id != 0) {
+            const type_id = std.enums.fromInt(@import("../stdlib/types.zig").TypeId, user_class.native_type_id - 1) orelse return self.engineFault();
+            return native_library.construct(Runtime, self, instruction.a(), type_id, Value.object(&user_class.header), positional, keywords[0..keyword_count], line, column);
         }
         const instance_result = class_module.createInstance(&self.heap, user_class);
         const instance = switch (instance_result) {
@@ -228,7 +266,7 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
             self.setException(.{ .kind = .type_error, .message = "exception message must be a string" }, line, column, null);
             return false;
         };
-        switch (exceptions.createInstance(&self.heap, exception_class.kind, message)) {
+        switch (exceptions.createNativeInstance(&self.heap, exception_class, message)) {
             .value => |instance| self.setRegister(instruction.a(), Value.object(&instance.header)),
             .python_exception => |exception| {
                 self.setException(exception, line, column, null);
@@ -247,23 +285,48 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
         header = bound_method.callable.asObject() orelse return self.engineFault();
     }
     if (class_module.instanceFromHeader(header)) |instance| {
-        if (class_module.classAttribute(instance.class, "__call__") != null) {
-            if (keyword_count != 0) return self.nativeTypeError(line, column, "callable instance keyword arguments are not supported yet");
-            const result = self.invokeSpecialSync(Value.object(header), "__call__", positional, line, column) orelse return false;
-            self.setRegister(instruction.a(), result);
-            return true;
+        if (class_module.classAttribute(instance.class, "__call__")) |call_attribute| {
+            const method = switch (class_module.createBoundMethod(&self.heap, call_attribute, Value.object(header))) {
+                .value => |selected| selected,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            call_roots[1].object = &method.header;
+            callee = Value.object(&method.header);
+            header = &method.header;
         }
+    }
+    if (class_module.boundMethodFromHeader(header)) |bound_method| {
+        positional_object.items.insert(allocator, 0, bound_method.receiver) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        positional = positional_object.items.items;
+        header = bound_method.callable.asObject() orelse return self.engineFault();
     }
     const function = functions.functionFromHeader(header) orelse {
         self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
         return false;
     };
+    if (function.library_module != 0) {
+        return native_library.call(Runtime, self, instruction.a(), function.library_module, function.library_function, function.bound_self, positional, keywords[0..keyword_count], line, column);
+    }
     if (function.native) |native| {
         const resumable_native = switch (native) {
             .list, .tuple, .sorted, .next, .list_sort, .generator_send => true,
             else => false,
         };
         if (resumable_native and self.sync_callback_depth == 0 and self.resuming_generator == null) {
+            if ((native == .list or native == .tuple) and positional.len == 1) {
+                const source = positional[0];
+                self.setRegister(instruction.a(), source);
+                call_root_frame.pop();
+                call_roots_active = false;
+                return self.executeNativeCall(instruction.a(), native, function.bound_self, &.{source}, keywords[0..keyword_count], line, column);
+            }
             call_root_frame.pop();
             call_roots_active = false;
         }
@@ -558,10 +621,42 @@ pub fn invokeCallableSync(self: *Runtime, callable: Value, args: []const Value, 
         @memcpy(expanded[1..], args);
         return self.invokeCallableSync(bound.callable, expanded, destination, line, column);
     }
+    if (class_module.instanceFromHeader(header)) |instance| {
+        const method = class_module.classAttribute(instance.class, "__call__") orelse {
+            self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
+            return null;
+        };
+        const expanded = self.heap.allocator.alloc(Value, args.len + 1) catch {
+            self.setException(exceptions.memoryError(), line, column, null);
+            return null;
+        };
+        defer self.heap.allocator.free(expanded);
+        expanded[0] = callable;
+        @memcpy(expanded[1..], args);
+        return self.invokeCallableSync(method, expanded, destination, line, column);
+    }
+    if (class_module.classFromHeader(header)) |class| {
+        if (class.primitive) |primitive| {
+            if (!executePrimitiveClassCall(self, destination, primitive, args, &.{}, line, column)) return null;
+            return self.registers[destination];
+        }
+        if (class.native_type_id != 0) {
+            const type_id = std.enums.fromInt(@import("../stdlib/types.zig").TypeId, class.native_type_id - 1) orelse {
+                _ = self.engineFault();
+                return null;
+            };
+            if (!native_library.construct(Runtime, self, destination, type_id, callable, args, &.{}, line, column)) return null;
+            return self.registers[destination];
+        }
+    }
     const function = functions.functionFromHeader(header) orelse {
         self.setException(.{ .kind = .type_error, .message = "object is not callable" }, line, column, null);
         return null;
     };
+    if (function.library_module != 0) {
+        if (!native_library.call(Runtime, self, destination, function.library_module, function.library_function, function.bound_self, args, &.{}, line, column)) return null;
+        return self.registers[destination];
+    }
     if (function.native) |native| {
         if (!self.executeNativeCall(destination, native, function.bound_self, args, &.{}, line, column)) return null;
         return self.registers[destination];
@@ -1014,6 +1109,11 @@ pub fn loadLocal(self: *Runtime, destination: u16, name: []const u8, binding: u8
                 if (!self.ensureBuiltinClasses(line, column)) return false;
                 const root = if (std.mem.eql(u8, name, "object")) self.object_class_root.object else self.type_class_root.object;
                 self.setRegister(destination, Value.object(root orelse return self.engineFault()));
+                return true;
+            }
+            if (Runtime.primitiveBuiltin(name)) |primitive| {
+                const primitive_class = self.ensurePrimitiveClass(primitive, line, column) orelse return false;
+                self.setRegister(destination, Value.object(&primitive_class.header));
                 return true;
             }
             if (self.builtinValue(name)) |fallback| {
