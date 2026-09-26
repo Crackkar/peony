@@ -567,6 +567,12 @@ pub fn iteratorHasPendingCallback(selected: *iterator.Iterator) bool {
     return false;
 }
 
+fn iteratorCanResumeInCurrentRun(self: *Runtime, selected: *iterator.Iterator) bool {
+    if (iteratorHasPendingCallback(selected)) return true;
+    const task = self.currentNativeTask() orelse return false;
+    return task.sync_next_delivery;
+}
+
 pub fn startSortedTask(self: *Runtime, destination: u16, source: Value, callback: ?Value, reverse: bool, line: u32, column: u32) bool {
     const frame = self.top_frame orelse return self.engineFault();
     const call_ip = if (frame.ip == 0) return self.engineFault() else frame.ip - 1;
@@ -760,7 +766,7 @@ pub fn advanceSyncTask(self: *Runtime) bool {
                     return self.setIteratorStopIteration(selected, task.line, task.column);
                 },
                 .suspended => {
-                    if (iteratorHasPendingCallback(selected)) return self.continueSyncTaskAfterCallback(task);
+                    if (iteratorCanResumeInCurrentRun(self, selected)) return self.continueSyncTaskAfterCallback(task);
                     return self.pauseSyncTask(task);
                 },
                 .python_exception => |exception| {
@@ -794,7 +800,7 @@ pub fn advanceSyncTask(self: *Runtime) bool {
                         if (!self.prepareSyncSort(task)) return false;
                     },
                     .suspended => {
-                        if (iteratorHasPendingCallback(selected)) return self.continueSyncTaskAfterCallback(task);
+                        if (iteratorCanResumeInCurrentRun(self, selected)) return self.continueSyncTaskAfterCallback(task);
                         return self.pauseSyncTask(task);
                     },
                     .python_exception => |exception| {
