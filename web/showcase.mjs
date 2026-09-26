@@ -2,8 +2,8 @@ import { Peony } from './peony.mjs';
 
 const examples = {
   hello: `print("Hello, Peony!")\nfor number in range(1, 4):\n    print(f"Try {number}")\n`,
-  words: `from collections import Counter\n\nwords = "a little practice can go a long way".split()\nfor word, count in Counter(words).most_common():\n    print(f"{word}: {count}")\n`,
-  files: `from pathlib import Path\n\nnote = Path("/home/note.txt")\nnote.write_text("Today I learned something new.\\n")\nprint(note.read_text())\n`,
+  words: `from collections import Counter\n\nwords = "one small runtime can go a long way".split()\nfor word, count in Counter(words).most_common():\n    print(f"{word}: {count}")\n`,
+  files: `from pathlib import Path\n\nnote = Path("/home/note.txt")\nnote.write_text("Peony runs this file in its VFS.\\n")\nprint(note.read_text())\n`,
   input: `name = input("What is your name? ")\nprint(f"Nice to meet you, {name}.")\n`,
   patterns: `import re\n\nmessage = "Contact me at hello@example.com"\nmatch = re.search(r"[\\w.]+@[\\w.]+", message)\nprint(match.group() if match else "No address found")\n`,
 };

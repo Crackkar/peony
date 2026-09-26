@@ -192,7 +192,7 @@ class PeonySession {
   }
 
   async mount(files, options = {}) {
-    if (!files || typeof files !== 'object') throw new TypeError('mount expects a mapping of course paths to bytes');
+    if (!files || typeof files !== 'object') throw new TypeError('mount expects a mapping of /course paths to bytes');
     if (!options || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('mount options must be an object');
     for (const key of Reflect.ownKeys(options)) if (key !== 'root') throw new TypeError(`unsupported mount option: ${String(key)}`);
     const root = Object.hasOwn(options, 'root') ? options.root : '/course';

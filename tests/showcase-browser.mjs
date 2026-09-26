@@ -34,8 +34,8 @@ try {
 
   for (const [example, expected] of [
     ['hello', 'Try 3'],
-    ['words', 'little: 1'],
-    ['files', 'Today I learned something new.'],
+    ['words', 'one: 1'],
+    ['files', 'Peony runs this file in its VFS.'],
     ['patterns', 'hello@example.com'],
   ]) {
     await page.locator('#example-select').selectOption(example);

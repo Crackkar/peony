@@ -143,7 +143,7 @@ fn destroyContext(payload: ?*anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(state);
 }
 
-test "SSL teaching context preserves safe browser-facing invariants" {
+test "SSL compatibility context preserves safe host-facing invariants" {
     var context = ContextState{};
     try std.testing.expect(context.check_hostname);
     try std.testing.expectEqual(CERT_REQUIRED, context.verify_mode);

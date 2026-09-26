@@ -30,11 +30,14 @@ const samples = options.samples ?? profile.samples;
 const timeoutMs = options.timeoutMs ?? profile.timeoutMs;
 const python = options.python ?? process.env.PEONY_CPYTHON ?? 'python';
 const wasmPath = resolve(repositoryRoot, options.wasm ?? process.env.PEONY_COMPARE_WASM ?? 'zig-out/peony.wasm');
+const nativePath = resolve(repositoryRoot, options.native ?? process.env.PEONY_COMPARE_NATIVE ?? join('zig-out', process.platform === 'win32' ? 'peony.exe' : 'peony'));
 const pythonVersion = await identifyPython(python);
 const wasm = new Uint8Array(await readFile(wasmPath));
+const nativeBinary = new Uint8Array(await readFile(nativePath));
+const nativeVersion = await identifyNative(nativePath);
 const loadStarted = performance.now();
-const peony = await Peony.load(wasm);
-const peonyLoadMs = performance.now() - loadStarted;
+const peonyWasm = await Peony.load(wasm);
+const wasmLoadMs = performance.now() - loadStarted;
 const workspaceRoot = join(repositoryRoot, 'zig-out', 'compare-work');
 const runWorkspace = join(workspaceRoot, randomUUID());
 await mkdir(runWorkspace, { recursive: true });
@@ -65,31 +68,38 @@ try {
     progress(`[${index + 1}/${prepared.length}] ${item.id} (scale ${scale})`);
     const caseRoot = join(runWorkspace, item.id.replaceAll('/', '__'));
     const cpythonSamples = [];
-    const peonySamples = [];
+    const wasmSamples = [];
+    const nativeSamples = [];
     let expected = null;
 
     for (let repetition = 0; repetition < warmups + samples; repetition++) {
       const repetitionRoot = join(caseRoot, String(repetition));
       await prepareCaseDirectory(repetitionRoot, item);
       let cpython;
-      let peonyResult;
-      if (repetition % 2 === 0) {
-        cpython = await runCpython({ python, item, caseRoot: repetitionRoot, argv, timeoutMs });
-        peonyResult = await runPeony({ peony, item, argv });
-      } else {
-        peonyResult = await runPeony({ peony, item, argv });
-        cpython = await runCpython({ python, item, caseRoot: repetitionRoot, argv, timeoutMs });
+      let wasmResult;
+      let nativeResult;
+      const runners = [
+        () => runCpython({ python, item, caseRoot: repetitionRoot, argv, timeoutMs }).then(result => { cpython = result; }),
+        () => runPeonyWasm({ peony: peonyWasm, item, argv }).then(result => { wasmResult = result; }),
+        () => runPeonyNative({ nativePath, item, caseRoot: repetitionRoot, argv, timeoutMs }).then(result => { nativeResult = result; }),
+      ];
+      for (let offset = 0; offset < runners.length; offset++) {
+        await runners[(repetition + offset) % runners.length]();
       }
       assertCompleted(item.id, 'CPython', cpython);
-      assertCompleted(item.id, 'Peony', peonyResult);
-      assert.equal(peonyResult.stdout, cpython.stdout, mismatchMessage(item.id, 'stdout', cpython.stdout, peonyResult.stdout));
-      assert.equal(peonyResult.stderr, cpython.stderr, mismatchMessage(item.id, 'stderr', cpython.stderr, peonyResult.stderr));
+      assertCompleted(item.id, 'Peony WASM', wasmResult);
+      assertCompleted(item.id, 'Peony native', nativeResult);
+      assert.equal(wasmResult.stdout, cpython.stdout, mismatchMessage(item.id, 'Peony WASM stdout', cpython.stdout, wasmResult.stdout));
+      assert.equal(wasmResult.stderr, cpython.stderr, mismatchMessage(item.id, 'Peony WASM stderr', cpython.stderr, wasmResult.stderr));
+      assert.equal(nativeResult.stdout, cpython.stdout, mismatchMessage(item.id, 'Peony native stdout', cpython.stdout, nativeResult.stdout));
+      assert.equal(nativeResult.stderr, cpython.stderr, mismatchMessage(item.id, 'Peony native stderr', cpython.stderr, nativeResult.stderr));
       const visible = `${cpython.stdout}\0${cpython.stderr}`;
       if (expected === null) expected = visible;
       else assert.equal(visible, expected, `${item.id}: output changed between repetitions`);
       if (repetition >= warmups) {
         cpythonSamples.push(cpython);
-        peonySamples.push(peonyResult);
+        wasmSamples.push(wasmResult);
+        nativeSamples.push(nativeResult);
       }
     }
 
@@ -97,7 +107,8 @@ try {
     for (const fixture of item.fixtures) inputHash.update('\0').update(fixture.path).update('\0').update(fixture.bytes);
     inputHash.update('\0').update(JSON.stringify(argv));
     const cpythonTiming = timing(cpythonSamples.map(sample => sample.elapsedMs));
-    const peonyTiming = timing(peonySamples.map(sample => sample.elapsedMs));
+    const wasmTiming = timing(wasmSamples.map(sample => sample.elapsedMs));
+    const nativeTiming = timing(nativeSamples.map(sample => sample.elapsedMs));
     records.push({
       id: item.id,
       tags: item.tags,
@@ -110,18 +121,25 @@ try {
         stderrBytes: Buffer.byteLength(cpythonSamples[0].stderr),
       },
       cpython: cpythonTiming,
-      peony: {
-        ...peonyTiming,
-        medianInstructions: percentile(peonySamples.map(sample => sample.instructions), 0.5),
-        medianWork: percentile(peonySamples.map(sample => sample.work), 0.5),
-        peakSessionBytes: Math.max(...peonySamples.map(sample => sample.peakSessionBytes)),
+      wasm: {
+        ...wasmTiming,
+        medianInstructions: percentile(wasmSamples.map(sample => sample.instructions), 0.5),
+        medianWork: percentile(wasmSamples.map(sample => sample.work), 0.5),
+        peakSessionBytes: Math.max(...wasmSamples.map(sample => sample.peakSessionBytes)),
       },
-      peonyToCpython: peonyTiming.medianMs / cpythonTiming.medianMs,
+      native: {
+        ...nativeTiming,
+        medianInstructions: percentile(nativeSamples.map(sample => sample.instructions), 0.5),
+        medianWork: percentile(nativeSamples.map(sample => sample.work), 0.5),
+        peakSessionBytes: Math.max(...nativeSamples.map(sample => sample.peakSessionBytes)),
+      },
+      wasmToCpython: wasmTiming.medianMs / cpythonTiming.medianMs,
+      nativeToCpython: nativeTiming.medianMs / cpythonTiming.medianMs,
     });
   }
 
   const report = {
-    schema: 1,
+    schema: 2,
     corpus: {
       version: manifest.version,
       sha256: corpusHasher.digest('hex'),
@@ -138,15 +156,21 @@ try {
       wasmPath: relative(repositoryRoot, wasmPath).replaceAll(sep, '/'),
       wasmSha256: sha(wasm),
       wasmBytes: wasm.length,
-      peonyLoadMs,
+      wasmLoadMs,
+      nativePath: relative(repositoryRoot, nativePath).replaceAll(sep, '/'),
+      nativeSha256: sha(nativeBinary),
+      nativeBytes: nativeBinary.length,
+      nativeVersion,
     },
     summary: {
       compared: records.length,
       passed: records.length,
-      geometricMeanPeonyToCpython: geometricMean(records.map(record => record.peonyToCpython)),
+      geometricMeanWasmToCpython: geometricMean(records.map(record => record.wasmToCpython)),
+      geometricMeanNativeToCpython: geometricMean(records.map(record => record.nativeToCpython)),
       totalMedianMs: {
         cpython: sum(records.map(record => record.cpython.medianMs)),
-        peony: sum(records.map(record => record.peony.medianMs)),
+        wasm: sum(records.map(record => record.wasm.medianMs)),
+        native: sum(records.map(record => record.native.medianMs)),
       },
     },
     cases: records,
@@ -157,11 +181,11 @@ try {
   if (reportPath) await writeFile(reportPath, renderMarkdown(report));
   process.stdout.write(`${records.length}/${records.length} cases matched ${pythonVersion}` + (reportPath ? `; report: ${relative(repositoryRoot, reportPath).replaceAll(sep, '/')}` : '') + '\n');
   if (options.filter) {
-    for (const record of records) process.stdout.write(`${record.id}: CPython ${formatMs(record.cpython.medianMs)} ms, Peony ${formatMs(record.peony.medianMs)} ms, ${record.peonyToCpython.toFixed(2)}x\n`);
+    for (const record of records) process.stdout.write(`${record.id}: CPython ${formatMs(record.cpython.medianMs)} ms, Peony WASM ${formatMs(record.wasm.medianMs)} ms (${record.wasmToCpython.toFixed(2)}x), Peony native ${formatMs(record.native.medianMs)} ms (${record.nativeToCpython.toFixed(2)}x)\n`);
   }
 } finally {
   try {
-    await peony.terminate();
+    await peonyWasm.terminate();
   } finally {
     await rm(runWorkspace, { recursive: true, force: true });
     try {
@@ -205,7 +229,7 @@ async function runCpython({ python, item, caseRoot, argv, timeoutMs }) {
   };
 }
 
-async function runPeony({ peony, item, argv }) {
+async function runPeonyWasm({ peony, item, argv }) {
   const stdout = [];
   const stderr = [];
   const session = peony.createSession({
@@ -246,6 +270,52 @@ async function runPeony({ peony, item, argv }) {
   }
 }
 
+async function runPeonyNative({ nativePath, item, caseRoot, argv, timeoutMs }) {
+  const nativeRoot = `${caseRoot}__native`;
+  await mkdir(nativeRoot, { recursive: true });
+  const scriptPath = join(nativeRoot, '__corpus_case__.py');
+  const metricsPath = join(nativeRoot, '__peony_native_metrics__.json');
+  await writeFile(scriptPath, item.sourceBytes);
+  for (const fixture of item.fixtures) {
+    const fixturePath = join(nativeRoot, ...fixture.path.split('/'));
+    await mkdir(dirname(fixturePath), { recursive: true });
+    await writeFile(fixturePath, fixture.bytes);
+  }
+  const arguments_ = [
+    '--filename', item.file,
+    '--max-memory', String(256 * 1024 * 1024),
+    '--max-work', '2000000000',
+    '--quantum', '100000',
+    '--max-vfs', String(32 * 1024 * 1024),
+    '--max-file', String(16 * 1024 * 1024),
+    '--seed', 'peony-comparison-corpus-v1',
+    '--metrics', metricsPath,
+  ];
+  for (const fixture of item.fixtures) {
+    arguments_.push('--mount', join(nativeRoot, ...fixture.path.split('/')), `/home/${fixture.path}`);
+  }
+  arguments_.push(scriptPath, ...argv);
+  const { stdout, stderr } = await execFileAsync(nativePath, arguments_, {
+    cwd: nativeRoot,
+    encoding: 'utf8',
+    maxBuffer: 2 * 1024 * 1024,
+    timeout: timeoutMs,
+    windowsHide: true,
+  });
+  const metrics = JSON.parse(await readFile(metricsPath, 'utf8'));
+  if (metrics.schema !== 1) throw new Error(`${item.id}: unsupported native metrics schema`);
+  return {
+    status: metrics.status,
+    error: '',
+    stdout,
+    stderr,
+    elapsedMs: metrics.elapsed_ns / 1e6,
+    instructions: metrics.instructions,
+    work: metrics.work,
+    peakSessionBytes: metrics.peak_session_bytes,
+  };
+}
+
 function assertCompleted(id, engine, result) {
   assert.equal(result.status, 'completed', `${id}: ${engine} ${result.status}: ${result.error}`);
 }
@@ -275,7 +345,7 @@ function renderMarkdown(report) {
   const lines = [
     '# Peony comparison report',
     '',
-    `**${report.summary.passed}/${report.summary.compared} cases matched CPython exactly.** Every measured repetition completed on both engines with identical standard output and standard error.`,
+    `**${report.summary.passed}/${report.summary.compared} cases matched CPython exactly on Peony WASM and Peony native.** Every measured repetition completed on all three engines with identical standard output and standard error.`,
     '',
     '## Inputs',
     '',
@@ -284,19 +354,20 @@ function renderMarkdown(report) {
     `| Corpus | v${report.corpus.version}, \`${report.corpus.sha256}\` |`,
     `| Profile | ${report.corpus.profile}; scale ${scaleText}; ${report.corpus.warmups} ${warmupLabel}; ${report.corpus.samples} ${sampleLabel} |`,
     `| CPython | ${report.environment.cpython} via \`${report.environment.cpythonExecutable}\` |`,
-    `| Peony WASM | ${formatInteger(report.environment.wasmBytes)} bytes; \`${report.environment.wasmSha256}\` |`,
-    `| Host | ${report.environment.platform}; ${report.environment.node}; Worker load ${formatMs(report.environment.peonyLoadMs)} ms |`,
+    `| Peony WASM | \`${report.environment.wasmPath}\`; ${formatInteger(report.environment.wasmBytes)} bytes; \`${report.environment.wasmSha256}\` |`,
+    `| Peony native | \`${report.environment.nativePath}\`; ${formatInteger(report.environment.nativeBytes)} bytes; \`${report.environment.nativeSha256}\`; ${report.environment.nativeVersion} |`,
+    `| Host | ${report.environment.platform}; ${report.environment.node}; Worker load ${formatMs(report.environment.wasmLoadMs)} ms |`,
     '',
     '## Aggregate',
     '',
-    '| Measure | CPython | Peony |',
-    '|---|---:|---:|',
-    `| Sum of case medians | ${formatMs(report.summary.totalMedianMs.cpython)} ms | ${formatMs(report.summary.totalMedianMs.peony)} ms |`,
-    `| Geometric mean Peony/CPython ratio | 1.00x | ${report.summary.geometricMeanPeonyToCpython.toFixed(2)}x |`,
+    '| Measure | CPython | Peony WASM | Peony native |',
+    '|---|---:|---:|---:|',
+    `| Sum of case medians | ${formatMs(report.summary.totalMedianMs.cpython)} ms | ${formatMs(report.summary.totalMedianMs.wasm)} ms | ${formatMs(report.summary.totalMedianMs.native)} ms |`,
+    `| Geometric mean runtime/CPython ratio | 1.00x | ${report.summary.geometricMeanWasmToCpython.toFixed(2)}x | ${report.summary.geometricMeanNativeToCpython.toFixed(2)}x |`,
     '',
     '## Case measurements',
     '',
-    'Times are compile plus execution milliseconds. p95 uses the nearest-rank sample. Instructions, work, and peak session memory are Peony counters.',
+    'Times are median/p95 compile plus execution milliseconds; p95 uses the nearest-rank sample. Instructions and work are shown as WASM/native medians, followed by maximum peak session memory for each target.',
     '',
   ];
   const groups = [
@@ -306,10 +377,10 @@ function renderMarkdown(report) {
   ];
   for (const [heading, prefix] of groups) {
     lines.push(`### ${heading}`, '');
-    lines.push('| Case | CP med | CP p95 | Peony med | Peony p95 | Ratio | Instructions | Work | Peak MiB |');
+    lines.push('| Case | CP ms | WASM ms | W/CP | Native ms | N/CP | Instructions W/N | Work W/N | Peak MiB W/N |');
     lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|');
     for (const record of report.cases.filter(item => item.id.startsWith(prefix))) {
-      lines.push(`| \`${record.id.slice(prefix.length)}\` | ${formatMs(record.cpython.medianMs)} | ${formatMs(record.cpython.p95Ms)} | ${formatMs(record.peony.medianMs)} | ${formatMs(record.peony.p95Ms)} | ${record.peonyToCpython.toFixed(2)}x | ${formatInteger(record.peony.medianInstructions)} | ${formatInteger(record.peony.medianWork)} | ${(record.peony.peakSessionBytes / (1024 * 1024)).toFixed(2)} |`);
+      lines.push(`| \`${record.id.slice(prefix.length)}\` | ${formatPair(record.cpython)} | ${formatPair(record.wasm)} | ${record.wasmToCpython.toFixed(2)}x | ${formatPair(record.native)} | ${record.nativeToCpython.toFixed(2)}x | ${formatInteger(record.wasm.medianInstructions)}/${formatInteger(record.native.medianInstructions)} | ${formatInteger(record.wasm.medianWork)}/${formatInteger(record.native.medianWork)} | ${formatMiB(record.wasm.peakSessionBytes)}/${formatMiB(record.native.peakSessionBytes)} |`);
     }
     lines.push('');
   }
@@ -322,6 +393,9 @@ function formatMs(value) {
   if (value < 100) return value.toFixed(2);
   return value.toFixed(1);
 }
+
+function formatPair(timingValue) { return `${formatMs(timingValue.medianMs)}/${formatMs(timingValue.p95Ms)}`; }
+function formatMiB(bytes) { return (bytes / (1024 * 1024)).toFixed(2); }
 
 function formatInteger(value) { return Math.round(value).toLocaleString('en-US'); }
 
@@ -343,6 +417,14 @@ async function identifyPython(executable) {
   const { stdout, stderr } = await execFileAsync(executable, ['--version'], { encoding: 'utf8', windowsHide: true });
   const version = `${stdout}${stderr}`.trim();
   if (!/^Python 3\.12\.\d+$/.test(version)) throw new Error(`comparison requires CPython 3.12, found ${version}`);
+  return version;
+}
+
+async function identifyNative(executable) {
+  const { stdout, stderr } = await execFileAsync(executable, ['--version'], { encoding: 'utf8', windowsHide: true });
+  if (stderr !== '') throw new Error(`native Peony version check wrote to stderr: ${stderr}`);
+  const version = stdout.trim();
+  if (version !== 'Peony 0.1.0 (Python 3.12 subset)') throw new Error(`unexpected native Peony identity: ${version}`);
   return version;
 }
 
@@ -404,6 +486,7 @@ function parseArguments(arguments_) {
     else if (argument === '--timeout-ms') parsed.timeoutMs = positiveInteger(requiredValue(arguments_, ++index, argument), false);
     else if (argument === '--python') parsed.python = requiredValue(arguments_, ++index, argument);
     else if (argument === '--wasm') parsed.wasm = requiredValue(arguments_, ++index, argument);
+    else if (argument === '--native') parsed.native = requiredValue(arguments_, ++index, argument);
     else if (argument === '--json') parsed.jsonPath = requiredValue(arguments_, ++index, argument);
     else if (argument === '--report') parsed.reportPath = requiredValue(arguments_, ++index, argument);
     else if (argument === '--quiet') parsed.quiet = true;
@@ -431,9 +514,10 @@ function usage() {
     `  --filter TEXT       select by case id or tag\n` +
     `  --warmups N         override untimed repetitions\n` +
     `  --samples N         override measured repetitions\n` +
-    `  --timeout-ms N      CPython process timeout per run\n` +
+    `  --timeout-ms N      CPython/native process timeout per run\n` +
     `  --python PATH       CPython 3.12 executable\n` +
     `  --wasm PATH         shipping WASM artifact\n` +
+    `  --native PATH       shipping native Peony executable\n` +
     `  --json PATH         also write the JSON report to PATH\n` +
     `  --report PATH       write the Markdown report to PATH\n` +
     `  --list              list selected cases without running\n` +

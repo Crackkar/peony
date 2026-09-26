@@ -1,6 +1,6 @@
 # Embedding Peony in a page
 
-`web/peony.mjs` is the public JavaScript API. It is a dependency-free ES module that starts `web/peony.worker.mjs` and keeps the Zig WebAssembly instance inside that Worker. An embedding page supplies source text, lesson files, output/input callbacks, and optional browser services. The page receives structured results and copied file bytes. It never handles raw WASM pointers or performs interpreter work on its main thread.
+`web/peony.mjs` is the public JavaScript API. It is a dependency-free ES module that starts `web/peony.worker.mjs` and keeps the Zig WebAssembly instance inside that Worker. An embedding page supplies source text, mounted files, output/input callbacks, and optional browser services. The page receives structured results and copied file bytes. It never handles raw WASM pointers or performs runtime work on its main thread.
 
 The Worker and public module are resolved relative to `web/peony.mjs`; the WASM URL is supplied explicitly to `Peony.load(...)`. A static host must serve all three assets over HTTP(S) for browser use. The [showcase](../web/index.html) uses this same public API, so it is an executable example of the integration path. Node tests use the same facade with `worker_threads`.
 
@@ -25,7 +25,7 @@ try {
     '    counts = Counter(file.read().split())',
     'print(counts.most_common())',
   ].join('\n');
-  const result = await session.run(source, { filename: '/home/lesson.py' });
+  const result = await session.run(source, { filename: '/home/app.py' });
 
   if (result.status === 'error') {
     console.error(result.error.message, result.frames);
@@ -50,7 +50,7 @@ The public proxy uses versioned messages with request, session, and run IDs. It 
 
 ## Run lifecycle and results
 
-`session.run(source, { filename, argv })` accepts source as a JavaScript string and returns a Promise. Only one run may be active per session; an overlapping call rejects. The default filename is `<string>`. `argv` is an optional array of at most 256 strings without NUL, bounded to 64 KiB when encoded. Python sees `sys.argv` as `[filename, ...argv]`. The filename also appears in diagnostics and traceback frames, so a lesson host should pass the path it shows to the learner.
+`session.run(source, { filename, argv })` accepts source as a JavaScript string and returns a Promise. Only one run may be active per session; an overlapping call rejects. The default filename is `<string>`. `argv` is an optional array of at most 256 strings without NUL, bounded to 64 KiB when encoded. Python sees `sys.argv` as `[filename, ...argv]`. The filename also appears in diagnostics and traceback frames, so a host should pass the path shown to the user.
 
 Each public `run()` starts a fresh Python world: globals, imports, function objects, and module cache do not leak from the previous run. Files in `/course` and `/home` do persist between runs of the same public session, including empty `/home` directories; `/tmp` is cleared. The Worker implements this by replacing the raw runtime and restoring persistent VFS data. That snapshot is in memory, not durable storage. `session.reset()` discards Python state **and all VFS files**, while `session.destroy()` releases the session entirely. The raw `peony_reset` export has a different file lifetime; [WASM ABI](wasm-abi.md) documents it for adapter authors.
 
@@ -75,14 +75,14 @@ All file methods below are asynchronous Worker calls. Strings are UTF-8 encoded,
 
 | Call | Effect |
 |---|---|
-| `mount(files, { root = '/course' })` | Copy a mapping of path to string/bytes into read-only course storage. Relative names are placed below `root`; absolute `/course` names are accepted. |
+| `mount(files, { root = '/course' })` | Copy a mapping of path to string/bytes into read-only host storage. Relative names are placed below `root`; absolute `/course` names are accepted. |
 | `writeFile(path, content)` | Create or replace a writable `/home` or `/tmp` file from string/bytes. |
 | `readFile(path)` | Return file bytes as a new `Uint8Array`. |
 | `listFiles(path = '/')` | Return sorted full descendant file paths. |
 | `listDirectories(path = '/')` | Return sorted full descendant directory paths. |
 | `vfsMkdir(path)` | Create a writable directory and missing parents. |
 
-Paths are case-sensitive POSIX-like strings. The VFS rejects traversal above its root and writes to `/course`. The configured total-content and per-file limits apply to mounted and learner-written files. The Python `open()`, `pathlib`, and `os` APIs see the same VFS. A site that wants persistence across visits must read/write the relevant files and store them in its own database or server; Peony does not silently use IndexedDB or the host filesystem.
+Paths are case-sensitive POSIX-like strings. The VFS rejects traversal above its root and writes to `/course`. The configured total-content and per-file limits apply to mounted and program-written files. The Python `open()`, `pathlib`, and `os` APIs see the same VFS. A site that wants persistence across visits must read or write the relevant files and store them in its own database or server; Peony does not silently use IndexedDB or the host filesystem.
 
 ## Session options
 
@@ -103,8 +103,8 @@ The constructor validates numeric limits rather than coercing arbitrary values. 
 
 ## Host callbacks and browser policy
 
-`stdout(text)` and `stderr(text)` receive drained output chunks and may return Promises. `input(prompt)` receives a prompt and may return a string or `null` for EOF; a rejected callback enters Python as a host I/O error. Peony drains the prompt before awaiting input, so the learner sees it first. The optional `wallClock()`, `monotonicClock()`, and `sleep(seconds, signal)` callbacks back the admitted `time` functions. Their defaults use host clocks and timers; injected versions make lessons and tests deterministic. A sleep callback receives an `AbortSignal`.
+`stdout(text)` and `stderr(text)` receive drained output chunks and may return Promises. `input(prompt)` receives a prompt and may return a string or `null` for EOF; a rejected callback enters Python as a host I/O error. Peony drains the prompt before awaiting input, so it is visible first. The optional `wallClock()`, `monotonicClock()`, and `sleep(seconds, signal)` callbacks back the admitted `time` functions. Their defaults use host clocks and timers; injected versions make applications and tests deterministic. A sleep callback receives an `AbortSignal`.
 
-`fetch` supplies the transport for `urllib.request` and Peony's `requests` teaching API. `allowUrl(url)` can approve or reject a URL before transport. Peony admits HTTP(S) URLs only, sends `credentials: 'omit'`, rejects redirects by default, and reads response bodies under a streaming byte cap. Timeout and cancellation abort fetch and body reading. Browser CORS and TLS policies still apply. If the host allows redirects, its URL callback cannot inspect cross-origin redirect hops hidden by the browser. `ssl.SSLContext` values in learner code cannot replace the browser TLS implementation.
+`fetch` supplies the transport for `urllib.request` and Peony's compact `requests` API. `allowUrl(url)` can approve or reject a URL before transport. Peony admits HTTP(S) URLs only, sends `credentials: 'omit'`, rejects redirects by default, and reads response bodies under a streaming byte cap. Timeout and cancellation abort fetch and body reading. Browser CORS and TLS policies still apply. If the host allows redirects, its URL callback cannot inspect cross-origin redirect hops hidden by the browser. `ssl.SSLContext` values in Python code cannot replace the browser TLS implementation.
 
 The Python-facing APIs, including URL/form encoding, response objects, JSON decoding, argument errors, and exception classes, are implemented in Zig. Host callbacks cross versioned Worker messages; they are not function objects inside the WASM heap. The detailed native API is in [libraries](libraries.md), and the packet format is in [WASM ABI](wasm-abi.md).

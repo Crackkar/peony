@@ -218,7 +218,7 @@ class PeonySession {
   }
 
   mount(files, options = {}) {
-    if (files === null || typeof files !== 'object') throw new TypeError('mount expects a mapping of course paths to bytes');
+    if (files === null || typeof files !== 'object') throw new TypeError('mount expects a mapping of /course paths to bytes');
     if (options === null || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('mount options must be an object');
     for (const key of Reflect.ownKeys(options)) if (key !== 'root') throw new TypeError(`unsupported mount option: ${String(key)}`);
     const root = Object.hasOwn(options, 'root') ? options.root : '/course';
@@ -309,7 +309,7 @@ class PeonySession {
     if (result === STATUS.invalidHandle) throw new Error(`Peony VFS ${operation} used an invalid session`);
     if (result === STATUS.outOfMemory) throw new Error(`Peony VFS ${operation} exceeded its memory limit`);
     if (operation === 'read') throw new Error(`Peony file not found, invalid path, or permission denied: ${result}`);
-    if (operation === 'mount') throw new Error(`Peony course mount rejected: invalid path, duplicate, or permission denied (${result})`);
+    if (operation === 'mount') throw new Error(`Peony read-only mount rejected: invalid path, duplicate, or permission denied (${result})`);
     throw new Error(`Peony VFS ${operation} rejected: invalid path or permission denied (${result})`);
   }
 

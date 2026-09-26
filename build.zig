@@ -438,6 +438,29 @@ pub fn build(b: *std.Build) void {
     const wasm_step = b.step("wasm", "Build the stripped ReleaseFast browser WASM artifact");
     wasm_step.dependOn(&install_wasm.step);
 
+    const native_debug = b.option(bool, "native-debug", "Build the stripped Debug native executable") orelse false;
+    const native_optimize: std.builtin.OptimizeMode = if (native_debug) .Debug else .ReleaseFast;
+    const native_module = b.createModule(.{
+        .root_source_file = b.path("src/native.zig"),
+        .target = target,
+        .optimize = native_optimize,
+        .strip = true,
+    });
+    const shipping_runtime = createRuntimeModules(b, target, native_optimize);
+    const shipping_frontend = createFrontendModules(b, target, native_optimize);
+    const shipping_vm = createExecutionVmModule(b, target, native_optimize, shipping_runtime, shipping_frontend);
+    native_module.addImport("runtime_vm", shipping_vm);
+    addRuntimeImports(native_module, shipping_runtime);
+
+    const native = b.addExecutable(.{
+        .name = "peony",
+        .root_module = native_module,
+        .use_llvm = true,
+    });
+    const install_native = b.addInstallFile(native.getEmittedBin(), native.out_filename);
+    b.getInstallStep().dependOn(&install_native.step);
+    const native_step = b.step("native", "Build the stripped ReleaseFast native executable");
+    native_step.dependOn(&install_native.step);
 }
 
 const FrontendModules = struct {

@@ -31,7 +31,7 @@ The loop must serialize calls that mutate one session. In particular, a collecto
 | `peony_event_ptr`, `peony_event_len` | `(handle: u32) -> ptr/len: u32` | Return a borrowed request or flush event packet, or zero when no event is available. |
 | `peony_stdout_ptr`, `peony_stdout_len` | `(handle: u32) -> ptr/len: u32` | Return a borrowed view of buffered standard output, or zero when empty/invalid. |
 | `peony_stdout_consume` | `(handle, len: u32) -> status: u32` | Removes `len` bytes from the start of buffered output; rejects lengths beyond the buffer. |
-| `peony_vfs_mount` | `(handle, path_ptr, path_len, data_ptr, data_len: u32) -> status: u32` | Copies a course file into the session VFS as read-only content. Inputs must be live transfer slices. |
+| `peony_vfs_mount` | `(handle, path_ptr, path_len, data_ptr, data_len: u32) -> status: u32` | Copies host content below `/course` into the session VFS as read-only content. Inputs must be live transfer slices. |
 | `peony_vfs_write` | `(handle, path_ptr, path_len, data_ptr, data_len: u32) -> status: u32` | Copies or replaces a writable `/home` or `/tmp` file. |
 | `peony_vfs_read` | `(handle, path_ptr, path_len: u32) -> status: u32` | Selects a file's bytes for borrowing through `peony_vfs_data_ptr/len`. |
 | `peony_vfs_list` | `(handle, path_ptr, path_len: u32) -> status: u32` | Selects sorted, NUL-separated full file paths below a directory for borrowing through `peony_vfs_data_ptr/len`. |
@@ -138,7 +138,7 @@ The optional argv transfer is at most 64 KiB: a little-endian `u16` count (`0..2
 
 The compile-and-start exports return `OK` for a compiled program, `UNSUPPORTED` for recognized syntax outside the supported subset, and `PYTHON_EXCEPTION` for syntax or compilation-time Python errors. A runtime `LIMIT` is not a catchable Python exception.
 
-A call may fail before or after Python execution begins. Invalid handles and transfer slices are ABI errors (`INVALID_HANDLE` or `INVALID_ARGUMENT`); they do not create a Python traceback. Invalid VFS paths and permissions also report `INVALID_ARGUMENT` at the raw boundary, while a VFS content cap reports `OUT_OF_MEMORY`. An exception raised by an executing Python program reports `PYTHON_EXCEPTION` and has diagnostic views. An `INTERNAL_ERROR` signals an engine invariant problem and should not be presented as a learner exception. The Worker facade maps these raw results to its [public run result](embedding.md) or rejects a failed API operation.
+A call may fail before or after Python execution begins. Invalid handles and transfer slices are ABI errors (`INVALID_HANDLE` or `INVALID_ARGUMENT`); they do not create a Python traceback. Invalid VFS paths and permissions also report `INVALID_ARGUMENT` at the raw boundary, while a VFS content cap reports `OUT_OF_MEMORY`. An exception raised by an executing Python program reports `PYTHON_EXCEPTION` and has diagnostic views. An `INTERNAL_ERROR` signals an engine invariant problem and should not be presented as a Python exception. The Worker facade maps these raw results to its [public run result](embedding.md) or rejects a failed API operation.
 
 ## Ownership and handle lifetime
 
@@ -153,7 +153,7 @@ A call may fail before or after Python execution begins. Invalid handles and tra
 
 ## VFS and borrowed-view rules
 
-`peony_vfs_mount` copies a course file to read-only `/course`; `peony_vfs_write` copies or replaces content under writable `/home` or `/tmp`. Paths and data are live transfer slices at call time. The VFS normalizes POSIX-like paths, rejects traversal above root and NUL, and charges content against both total and per-file caps. `peony_vfs_mkdir` creates missing writable parents. The read/list/dirs functions place a result in one session-owned output view, returned by `peony_vfs_data_ptr/len`. A successful read returns the exact file bytes; `list` and `dirs` return sorted full paths separated by NUL bytes. Directory listing excludes the queried root itself. Copy the result before calling another VFS operation, a run step, reset, or destroy.
+`peony_vfs_mount` copies host content to read-only `/course`; `peony_vfs_write` copies or replaces content under writable `/home` or `/tmp`. Paths and data are live transfer slices at call time. The VFS normalizes POSIX-like paths, rejects traversal above root and NUL, and charges content against both total and per-file caps. `peony_vfs_mkdir` creates missing writable parents. The read/list/dirs functions place a result in one session-owned output view, returned by `peony_vfs_data_ptr/len`. A successful read returns the exact file bytes; `list` and `dirs` return sorted full paths separated by NUL bytes. Directory listing excludes the queried root itself. Copy the result before calling another VFS operation, a run step, reset, or destroy.
 
 The raw runtime retains `/home` and `/course` across `peony_reset` and compile-and-start; it clears `/tmp`. The public Worker adapter takes a file and `/home` directory snapshot when it replaces a raw runtime for a new run, then restores it. Public `session.reset()` intentionally discards the snapshot and starts empty. Adapters that use the raw ABI directly must choose and implement their own public persistence policy.
 

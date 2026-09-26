@@ -1,6 +1,6 @@
 # Native libraries
 
-Peony's importable utilities are Zig implementations compiled into `peony.wasm`. They create ordinary Python-visible modules, classes, functions, iterators, and exceptions in the same VM and heap used by learner code. A library call therefore participates in normal Python argument binding, GC, exception handling, and callback execution. It does not inject a hidden `.py` implementation or delegate its algorithm to JavaScript. The host supplies transport, clock, and timer services only where those operations genuinely require a browser facility.
+Peony's importable utilities are Zig implementations compiled into both the native executable and `peony.wasm`. They create ordinary Python-visible modules, classes, functions, iterators, and exceptions in the same VM and heap used by program code. A library call therefore participates in normal Python argument binding, GC, exception handling, and callback execution. It does not inject a hidden `.py` implementation or delegate its algorithm to JavaScript. The active adapter supplies transport, clock, timer, and input services where an operation must cross the runtime boundary.
 
 This page describes the admitted API, including the important boundary around each library. A familiar module name does **not** include its full CPython or third-party distribution. Unknown options and unavailable methods fail rather than silently approximate a wider API. The [language page](language.md) covers core values and builtins; the [embedding page](embedding.md) covers host services and session options.
 
@@ -9,9 +9,9 @@ This page describes the admitted API, including the important boundary around ea
 | Runtime metadata and numbers | `sys`, `math`, `random`, `statistics`, `time` |
 | Text and structured data | `json`, `csv`, `re` |
 | Files and object utilities | `pathlib`, `os`, `os.path`, `collections`, `copy` |
-| Browser-backed networking | `urllib.request`, `urllib.error`, `requests`, `requests.exceptions`, `ssl` |
+| Host-backed networking | `urllib.request`, `urllib.error`, `requests`, `requests.exceptions`, `ssl` |
 
-`urllib.error`, `requests.exceptions`, and `os.path` are supporting namespaces for their listed parent surfaces. All registered native names take precedence over a same-named VFS learner file on an import cache miss.
+`urllib.error`, `requests.exceptions`, and `os.path` are supporting namespaces for their listed parent surfaces. All registered native names take precedence over a same-named VFS user file on an import cache miss.
 
 ## Runtime metadata and numeric work
 
@@ -33,7 +33,7 @@ Integer bounds use rejection sampling so a large range need not be reduced with 
 
 `statistics` exposes `mean(data)`, `fmean(data, weights=None)`, `median(data)`, `mode(data)`, and `StatisticsError` (a `ValueError` subclass). Data is drawn once through the VM iterator protocol and is limited to Peony's int/bool/float numeric family. `mean` preserves large-integer precision where relevant, `fmean` uses a stable floating calculation, `median` materializes a bounded working collection, and `mode` resolves ties by encounter order. Other statistical functions are absent.
 
-`time.time()`, `time.monotonic()`, and `time.sleep(seconds)` use host-provided wall clock, monotonic clock, and timer services. Sleep validates a finite nonnegative duration and suspends; it does not busy-wait inside WASM. The host services are injectable for a lesson or test, and cancellation aborts a pending sleep. There is no approximation based on bytecode counts.
+`time.time()`, `time.monotonic()`, and `time.sleep(seconds)` use host-provided wall clock, monotonic clock, and timer services. Sleep validates a finite nonnegative duration and suspends; it does not busy-wait inside the engine. Browser host services are injectable, and cancellation aborts a pending browser sleep. The native adapter uses Zig's real and awake clocks and its cancellable timer. There is no approximation based on bytecode counts.
 
 ## Data, CSV, and patterns
 
@@ -47,7 +47,7 @@ The parser retains arbitrary integer tokens as Peony integers instead of passing
 
 `csv.reader`, `writer`, `DictReader`, and `DictWriter` are native objects. `csv.Error` represents dialect/record errors; admitted quoting constants are `QUOTE_MINIMAL`, `QUOTE_ALL`, and `QUOTE_NONNUMERIC`. The exposed parameters cover `delimiter`, `quotechar`, `lineterminator`, and those quoting modes. A reader recognizes doubled quotes, embedded delimiters, Unicode text, and records spanning multiple physical lines; its `line_num` counts physical input lines. `QUOTE_NONNUMERIC` converts unquoted numeric fields. A writer emits a completed row through the target's `write()` method.
 
-Dictionary variants handle ordered fieldnames, `restkey`/`restval`, `extrasaction` (`raise` or `ignore`), `writeheader`, `writerow`, and `writerows`. The source or sink may be a Peony file or a supported learner file-like object. Such callbacks use native continuations, so an iterator or `write()` that requests host input can resume without duplicating a row. For real text files, `open(path, newline="")` preserves line endings for the CSV reader. Dialect registration, arbitrary dialect classes, `QUOTE_NOTNULL`, and `QUOTE_STRINGS` are outside this subset.
+Dictionary variants handle ordered fieldnames, `restkey`/`restval`, `extrasaction` (`raise` or `ignore`), `writeheader`, `writerow`, and `writerows`. The source or sink may be a Peony file or a supported user file-like object. Such callbacks use native continuations, so an iterator or `write()` that requests host input can resume without duplicating a row. For text files, `open(path, newline="")` preserves line endings for the CSV reader. Dialect registration, arbitrary dialect classes, `QUOTE_NOTNULL`, and `QUOTE_STRINGS` are outside this subset.
 
 ### `re`
 
@@ -55,9 +55,9 @@ The regex engine is native Zig in `src/regex/`; it does not call JavaScript `Reg
 
 The module call shapes are `compile(pattern, flags=0)`; `search`/`match`/`fullmatch`/`findall`/`finditer(pattern, string, flags=0)`; `split(pattern, string, maxsplit=0, flags=0)`; `sub`/`subn(pattern, repl, string, count=0, flags=0)`; and `escape(pattern)`. Compiled Pattern matching/finding methods accept `string, pos=0, endpos=...` where applicable. Pattern `split` accepts `maxsplit`; Pattern `sub`/`subn` accept `count`. These forms preserve the distinction between a module call that compiles a pattern and a method on an already compiled Pattern.
 
-The grammar includes literals, `.`, `^`/`$`, character classes, ranges and negation, `\d`/`\D`, `\w`/`\W`, `\s`/`\S`, `\b`/`\B`, capture and named/noncapture groups, alternation, greedy and lazy `* + ?`, and bounded repetitions. Flags are `ASCII`/`A`, `IGNORECASE`/`I`, `MULTILINE`/`M`, `DOTALL`/`S`, and `UNICODE`/`U` for strings. Unicode string mode is the default; bytes classes are ASCII. Pattern backreferences, lookaround, conditional/atomic groups, locale mode, and unlisted inline-flag syntax are rejected with `re.error`. Replacement *templates* may refer to capture groups even though pattern backreferences are excluded. A callable replacement invokes learner Python through the VM, including suspension and errors. The engine charges scan work and bounds compiled program/capture growth rather than relying on host regex backtracking behavior.
+The grammar includes literals, `.`, `^`/`$`, character classes, ranges and negation, `\d`/`\D`, `\w`/`\W`, `\s`/`\S`, `\b`/`\B`, capture and named/noncapture groups, alternation, greedy and lazy `* + ?`, and bounded repetitions. Flags are `ASCII`/`A`, `IGNORECASE`/`I`, `MULTILINE`/`M`, `DOTALL`/`S`, and `UNICODE`/`U` for strings. Unicode string mode is the default; bytes classes are ASCII. Pattern backreferences, lookaround, conditional/atomic groups, locale mode, and unlisted inline-flag syntax are rejected with `re.error`. Replacement *templates* may refer to capture groups even though pattern backreferences are excluded. A callable replacement invokes Python through the VM, including suspension and errors. The engine charges scan work and bounds compiled program/capture growth rather than relying on host regex backtracking behavior.
 
-For example, `re.findall(r"[A-Za-z]+@[A-Za-z.]+", text)` can feed a `Counter` in a course exercise; both the scan and counts remain in native Peony values. The exact pattern subset above still applies if a learner tries a more advanced regex from CPython documentation.
+For example, `re.findall(r"[A-Za-z]+@[A-Za-z.]+", text)` can feed a `Counter`; both the scan and counts remain in native Peony values. The exact pattern subset above still applies when a program uses a more advanced regex from CPython documentation.
 
 ## Virtual paths and object utilities
 
@@ -75,7 +75,7 @@ For example, `re.findall(r"[A-Za-z]+@[A-Za-z.]+", text)` can feed a `Counter` in
 
 ### `copy`
 
-`copy.copy(x)` and `copy.deepcopy(x, memo=None)` operate on supported scalars, containers, and ordinary user instances. Immutable values may retain identity; a shallow mutable copy shares children. Deep copy tracks object identity in one memo, preserving cycles and shared references in the result graph. Supported instance `__copy__` and `__deepcopy__(memo)` hooks run as learner calls through the VM and may suspend. Live generators, open files, and other resource-bearing objects fail explicitly instead of silently aliasing external state. The pickle/reduce protocol is outside this subset.
+`copy.copy(x)` and `copy.deepcopy(x, memo=None)` operate on supported scalars, containers, and ordinary user instances. Immutable values may retain identity; a shallow mutable copy shares children. Deep copy tracks object identity in one memo, preserving cycles and shared references in the result graph. Supported instance `__copy__` and `__deepcopy__(memo)` hooks run as Python calls through the VM and may suspend. Live generators, open files, and other resource-bearing objects fail explicitly instead of silently aliasing external state. The pickle/reduce protocol is outside this subset.
 
 ## HTTP and browser policy
 
@@ -85,14 +85,16 @@ For example, `re.findall(r"[A-Za-z]+@[A-Za-z.]+", text)` can feed a `Counter` in
 
 ### `requests` and `requests.exceptions`
 
-This is a small teaching-compatible surface, not the full third-party Requests package. It exposes `get(url, params=None, *, headers=None, timeout=None)` and `post(url, data=None, json=None, *, headers=None, timeout=None, params=None)`. Data may be bytes, text, or a form mapping; `json` uses Peony's native serializer. Query and form encoding are native. A response exposes `status_code`, `ok` (status below 400), case-insensitive `headers`, `content` bytes, `text`, mutable `encoding`, `json()`, and `raise_for_status()`. Text encoding comes from an explicit setting, then a Content-Type charset, then UTF-8; UTF-8, ASCII, and Latin-1 aliases are supported. Unknown codecs raise `LookupError` rather than invoking a browser charset detector. `requests.exceptions` contains the admitted request, connection, timeout, and HTTP exception classes. Sessions, streamed responses, auth, proxies, adapters, and custom transports are excluded.
+This is a compact compatible surface, not the full third-party Requests package. It exposes `get(url, params=None, *, headers=None, timeout=None)` and `post(url, data=None, json=None, *, headers=None, timeout=None, params=None)`. Data may be bytes, text, or a form mapping; `json` uses Peony's native serializer. Query and form encoding are native. A response exposes `status_code`, `ok` (status below 400), case-insensitive `headers`, `content` bytes, `text`, mutable `encoding`, `json()`, and `raise_for_status()`. Text encoding comes from an explicit setting, then a Content-Type charset, then UTF-8; UTF-8, ASCII, and Latin-1 aliases are supported. Unknown codecs raise `LookupError` rather than invoking a host charset detector. `requests.exceptions` contains the admitted request, connection, timeout, and HTTP exception classes. Sessions, streamed responses, auth, proxies, adapters, and custom transports are excluded.
 
 ### `ssl` and the host boundary
 
-`ssl.SSLContext`, `create_default_context()`, `CERT_NONE`, `CERT_REQUIRED`, and mutable `check_hostname`/`verify_mode` provide the small API state used by a teaching `urlopen(..., context=...)` pattern. A context starts with hostname checking enabled and `CERT_REQUIRED`; setting `CERT_NONE` while hostname checking remains enabled is rejected. The context is a Peony object for argument validation; it cannot change browser TLS verification, certificate storage, CORS, or the network stack. It does not open sockets or perform TLS handshakes in WASM.
+`ssl.SSLContext`, `create_default_context()`, `CERT_NONE`, `CERT_REQUIRED`, and mutable `check_hostname`/`verify_mode` provide the small API state used by `urlopen(..., context=...)`. A context starts with hostname checking enabled and `CERT_REQUIRED`; setting `CERT_NONE` while hostname checking remains enabled is rejected. The context is a Peony object for argument validation; it cannot change host TLS verification, certificate storage, CORS, or the network stack. It does not itself open sockets or perform TLS handshakes.
 
-HTTP uses the embedding page's `fetch` (or an injected replacement) through the Worker. The adapter accepts only HTTP(S), sends `credentials: 'omit'`, rejects redirects unless the host opts in, applies an optional `allowUrl(url)` decision, and caps response bytes while reading the stream. A timeout or cancellation aborts fetch and body reading. The browser's own CORS and TLS rules remain in force. Following redirects does not make browser-hidden cross-origin hops visible to `allowUrl`. Host failures are mapped back into the documented Python/library exception families. Clock and sleep use the same suspended-host mechanism; details of the packet protocol are in [WASM ABI](wasm-abi.md).
+In a Worker, HTTP uses the embedding page's `fetch` or injected replacement. That adapter accepts only HTTP(S), sends `credentials: 'omit'`, rejects redirects unless the host opts in, applies an optional `allowUrl(url)` decision, and caps response bytes while reading the stream. A timeout or cancellation aborts fetch and body reading. Browser CORS and TLS rules remain in force, and browser-hidden redirect hops cannot be inspected by `allowUrl`.
+
+In the native executable, HTTP uses Zig's HTTP/TLS client. It accepts the same engine packets, rejects redirects, decompresses supported content encodings, caps the response below the packet ceiling, and enforces an explicit timeout with cancellable concurrent I/O. There is no browser CORS layer. Native TLS uses Zig's platform certificate bundle. Both adapters map host failures into the documented Python exception families; the Python-facing response construction is shared engine code.
 
 ## What this contract leaves out
 
-The supported import set does not include `sqlite3`, `socket`, `subprocess`, `threading`, `multiprocessing`, `asyncio`, `numpy`, `pandas`, a general XML stack, or access to the DOM. An API not listed on this page may produce an import/attribute error or an explicit unsupported-option error. For teaching material, choose examples against the named surface and treat the [language boundary](language.md) and browser policy as part of the same contract.
+The supported import set does not include `sqlite3`, `socket`, `subprocess`, `threading`, `multiprocessing`, `asyncio`, `numpy`, `pandas`, a general XML stack, or access to the DOM. An API not listed on this page may produce an import/attribute error or an explicit unsupported-option error. Programs should target the named surface and treat the [language boundary](language.md) and active host policy as part of the same contract.

@@ -1,12 +1,14 @@
 # Peony
 
-Peony is a Python learning environment that runs in the browser. A learner writes a small program, runs it, sees output or a source-located error, changes the program, and tries again. The code looks like introductory Python because it *is* interpreted as Python syntax and values. Peony implements a deliberately defined subset of Python 3.12, with the interpreter and user-facing libraries written in Zig and compiled to WebAssembly.
+Peony is a lean Python subset runtime written in Zig. It accepts Python 3.12 syntax, compiles it to Peony bytecode, and executes it in a purpose-built virtual machine. The same engine ships as a native command-line executable and as a WebAssembly module that always runs in a Web Worker.
 
-The central idea is to put a real, self-contained interpreter close to the editor. A lesson page does not need to send each run to a server, install Python on the learner's machine, or turn Python into JavaScript. Peony's WebAssembly instance lives in a **Web Worker**, so parsing and execution happen away from the page's main thread. The page remains responsible for interaction: showing text, collecting an answer to `input()`, and providing browser services such as `fetch` when a program requests them.
+The project takes a deliberately smaller surface seriously. Peony does not bundle CPython, translate Python into JavaScript, or fill missing behavior with Python implementation files. The parser, scope analysis, bytecode compiler, object model, garbage collector, virtual filesystem, regular-expression engine, and importable libraries are Zig code. A feature is either part of the documented contract and implemented by the runtime, or it is rejected clearly.
 
-## What running Peony feels like
+This makes Peony useful where a compact, controlled Python environment matters: browser applications, sandboxes, local tools, reproducible program runners, and systems that want Python-shaped code without carrying a general CPython installation. It has the shape of an early standalone runtime rather than a Python distribution. Native and browser execution are equal products around one engine.
 
-This program uses ordinary Python syntax and a familiar library object:
+## What runs
+
+The following program uses ordinary Python syntax and a familiar library object:
 
 ```python
 from collections import Counter
@@ -16,90 +18,100 @@ for word, count in Counter(words).most_common(2):
     print(f"{word}: {count}")
 ```
 
-It prints `red: 3` and `blue: 2`. The string, list, loop, tuple unpacking, f-string, `Counter`, and `print()` all run inside Peony. `Counter` is a native Zig object exposed through the normal Python import and call mechanisms. The program does not cross into JavaScript for every word, and Peony does not load a hidden Python implementation of `collections`.
+It prints `red: 3` and `blue: 2`. The string operations, list, loop, tuple unpacking, f-string, `Counter`, and `print()` all execute inside Peony. `Counter` is a Zig implementation exposed through normal Python import, call, hashing, iteration, and object protocols. There is no hidden `collections.py`, and the program does not cross into JavaScript for each item when running in a browser.
 
-That distinction matters as programs grow. A learner can use functions and closures, classes, exceptions, comprehensions, generators, formatted strings, lists, dictionaries, sets, and files within the supported language surface. The interpreter owns their meaning. A lesson author can mount a data file, let a student read it with `open()` or `pathlib.Path`, and inspect the resulting output. Python code remains the material the learner is studying; Zig provides the machinery underneath.
+Peony supports expressions, assignment, conditions, loops, functions, closures, generators, comprehensions, classes, exceptions, context managers, imports, formatted strings, structural matching within a defined subset, and the core Python collection types. Its native library set covers numeric work (`math`, `random`, `statistics`), data (`json`, `csv`), text patterns (`re`), virtual files (`pathlib`, `os.path`), containers (`collections`, `copy`), time, HTTP, and runtime metadata.
 
-The [showcase](web/index.html) demonstrates this loop with an editor, a few examples, an input prompt, output, a stop button, and error locations. It is a compact example of an embedding page, not a second implementation of the language.
+Compatibility is explicit. Source is UTF-8 and identifiers are currently ASCII. Async syntax, `yield from`, exception groups, complex numbers, dynamic `eval` and `exec`, custom metaclasses, unrestricted structural patterns, and unlisted library APIs are outside v0.1. Supported behavior aims to follow Python 3.12 where the distinction is observable: lexical scope, argument binding, ordered dictionaries, numeric key equality, iteration, exception unwinding, and `finally` are runtime semantics rather than approximations. The complete boundary lives in the [language contract](docs/language.md) and [library contract](docs/libraries.md).
 
-## A deliberate Python subset
+## Two hosts, one runtime
 
-Peony aims at the kinds of programs used in introductory courses: expressions, assignments, conditions, loops, functions, collection operations, imports, basic classes, exceptions, and everyday data processing. It follows Python 3.12 syntax where a feature is admitted. The goal is that a supported construct behaves like Python, including the details that shape what a learner understands: lexical scope, argument binding, dictionary order, numeric equality, iterator behavior, and `finally` during ordinary exception flow.
-
-The boundary is explicit. Source must be UTF-8, and identifiers are ASCII even though strings are Unicode. `match` supports literal, singleton, capture, wildcard, and OR patterns with guards; sequence, mapping, and class patterns are outside this version. Async syntax, `yield from`, exception groups, complex numbers, custom metaclasses, and dynamic `eval`/`exec` are excluded. Recognized unsupported syntax produces a compile diagnostic rather than executing with misleading semantics. An unavailable module raises a Python import error. This matters in a learning environment: a plausible but subtly wrong result can teach the wrong rule.
-
-Peony includes a purposeful collection of builtins and native library APIs. The library set covers numbers (`math`, `random`, `statistics`), data (`json`, `csv`), text patterns (`re`), files (`pathlib`, `os.path`), containers (`collections`, `copy`), and browser-backed services (`urllib.request`, a small `requests` teaching API, `time`, and an `ssl` compatibility object). `sys` exposes run metadata, arguments, streams, and the module cache. Each module admits specific names and options. Importing `requests`, for example, gives useful `get`, `post`, response, and exception behavior; it does not imply that the full third-party distribution is present. The [language surface](docs/language.md) and [native library surface](docs/libraries.md) list the precise admissions and exclusions.
-
-## From source text to a result
-
-When a learner presses Run, the page sends the source and run options through Peony's public JavaScript session API. The Worker owns the WebAssembly instance and passes the source into the Zig engine. Inside that engine, the front end tokenizes indentation, literals, operators, and names; parses a syntax tree; resolves scopes; and compiles register-oriented bytecode with source positions. Scope analysis happens before execution, so a name in a closure or a `global` declaration is resolved by the language rules rather than guessed during each lookup.
-
-The virtual machine executes that bytecode. A run has frames for function calls and exception handlers, registers for intermediate values, and a session heap for Python objects. The same VM handles user functions, generators, native library calls, and callbacks from native objects into learner code. A Python exception follows Python control flow; the engine can catch it in `except`, run `finally`, or report an unhandled traceback. A syntax failure stops at compilation and carries a source location. An ordinary successful run reports completion. These outcomes are returned as structured results, not scraped from printed text.
+Peony has one compiler, VM, object model, and library implementation. Host adapters provide process or browser facilities around it.
 
 ```text
-learner source
-    -> lexer and parser
-    -> scope analysis and bytecode compiler
-    -> VM frames, values, native libraries, virtual files
-    -> completion, Python error, cancellation, or work limit
+                         Python source
+                               |
+                 lexer -> parser -> scope analysis
+                               |
+                      register bytecode
+                               |
+                 VM + values + GC + libraries + VFS
+                         /                 \
+                native adapter          WASM ABI
+                stdio, clocks,          Worker pump
+                timers, HTTP            browser services
+                     |                       |
+               peony executable       web/peony.mjs
 ```
 
-On wasm32, a Python value fits in an eight-byte tagged word. Floats and small integers can live directly in that word; larger integers and compound objects live on the heap. The heap uses a nonmoving mark/sweep collector and tracks live roots from frames and native operations. A per-session allocator accounts for runtime memory, while a work budget charges both bytecode instructions and native work. These choices give the engine control over data layout, allocations, and host crossings without changing the Python surface the learner sees. They also keep implementation decisions inside Zig: the browser page is not asked to emulate Python objects.
+The native executable reads a script from the host filesystem, passes its remaining arguments through `sys.argv`, and connects Peony streams and host requests to operating-system services through Zig's cross-platform standard library. A normal invocation is:
 
-## Why execution stays in a Worker
+```text
+peony program.py first-argument "two words"
+```
 
-An infinite loop must not freeze the editor. Peony therefore runs bytecode in bounded quanta. At a quantum boundary, the Worker can drain output and yield to its event loop before resuming the VM. The page can still update, show an input form, or send a stop request. Resumable native operations charge work and check for cancellation. Some nested synchronous operations run until they finish or hit the shared work limit, so a quantum is a scheduling mechanism rather than a promise that every possible step takes equal time.
+Program output goes to process stdout and stderr. `input()` reads UTF-8 lines from stdin. `time` uses the host wall and monotonic clocks, and `sleep` uses the host timer rather than busy-waiting. HTTP(S) requests use Zig's native HTTP/TLS stack, enforce the Peony response limit and requested timeout, and reject redirects. Unhandled Python exceptions produce source-located terminal tracebacks and exit code 1; host, limit, and internal failures use exit code 2.
 
-The public `Peony.load(...)` facade always creates a module Worker. That Worker imports the internal JavaScript pump, compiles or instantiates `peony.wasm`, and owns its memory. Messages between the page and Worker identify the session and run. The page never receives a raw WebAssembly pointer, and there is no main-thread execution fallback. Internal tests can call the raw WASM ABI directly, but applications and the showcase use the Worker API.
+The runtime never grants Python code ambient filesystem access. The source file is read by the CLI, while files and importable Python modules used by the program remain in Peony's VFS. `--mount HOST_PATH VFS_PATH` copies a selected host file into `/home` or read-only `/course` before execution. Repeating the option assembles a complete isolated program environment without making every file on the machine visible. The [native CLI reference](docs/native-cli.md) specifies options, mounts, limits, metrics, host behavior, and exit statuses.
 
-Python's `input()` illustrates the boundary. To the program, `name = input("Name: ")` is a normal call that returns a string. The VM emits a host request and pauses the current operation. The Worker sends the prompt to the page; the page's `input` callback obtains a response; the Worker validates a matching response packet and resumes exactly that suspended run. The same pattern supports HTTP, clock reads, and sleep. Native operations that invoke a learner callback also preserve their place, so an `input()` inside such a callback does not force the library operation to start over.
+The browser distribution exposes a dependency-free JavaScript session API. `Peony.load(...)` creates a module Worker, and the Worker alone instantiates `peony.wasm`. Parsing, compilation, bytecode dispatch, native libraries, and garbage collection never fall back to the page's main thread. The page receives structured results and output callbacks while it remains responsive enough to render, accept input, or request a hard stop. The [browser embedding guide](docs/embedding.md) defines this API.
 
-Output follows the other direction. `print()` appends to buffers owned by the session. The Worker drains them at execution boundaries and when `flush=True` requests an immediate drain point. The page receives text chunks through `stdout` or `stderr` callbacks and decides how to display them. Thus the engine determines Python output order while the embedding page determines presentation.
+The [showcase](web/index.html) is a compact demonstration of the Worker distribution: editor, examples, input, output, cancellation, and source-located errors. It uses the public facade and has no private execution path.
 
-## Files that make sense in a lesson
+## From source to a terminal result
 
-Peony includes an in-memory virtual filesystem because beginner exercises often read a provided file or write a result. Python's file methods are synchronous from the learner's point of view. Keeping the files with the interpreter lets `readline()`, iteration, `csv.reader`, and `pathlib` use one consistent file model without a browser storage round-trip for each operation.
+The front end first tokenizes indentation, literals, operators, delimiters, and names. The parser constructs an AST for admitted Python syntax, and scope analysis fixes local, global, cell, and free-variable bindings before code generation. The compiler then emits fixed-width, register-oriented instructions together with constants, names, and source positions.
 
-The filesystem has three roots:
+The VM executes that code with frames for functions, generators, exception handlers, and suspended native operations. Direct slots serve locals and closure cells. Dynamic global namespaces retain ordered entries and validated per-code-object slot caches. Python exceptions are Python values that unwind through `except`, `finally`, and `with`; compilation diagnostics and engine invariant failures stay distinct from them.
 
-| Root | Meaning |
+```text
+source bytes
+    -> tokens and AST
+    -> scope graph and bytecode
+    -> frames, Python values, native tasks, VFS
+    -> completion, Python exception, cancellation, or work limit
+```
+
+Each run owns a session allocator and a nonmoving mark/sweep heap. Frames, globals, closures, exceptions, and native continuations publish explicit roots, allowing collection during operations that call back into Python or suspend for host work. Memory, virtual file content, host packet size, and combined bytecode/native work have separate bounds. The native executable and WASM adapter configure the same runtime limits rather than maintaining parallel policies.
+
+On wasm32, a Python value fits in an eight-byte tagged word. Floats, small integers, booleans, `None`, and internal sentinels can be immediate; big integers and compound objects use heap storage. The native target chooses the appropriate representation for its pointer width through the same Zig types. These details stay behind Python-visible protocols.
+
+## Host requests and scheduling
+
+Python-facing functions sometimes need facilities outside the VM. `input()` needs a line source, `time.time()` needs a clock, `time.sleep()` needs a timer, and `requests.get()` needs a transport. Peony represents those operations as versioned host packets. The program suspends at a precise continuation, the adapter performs the operation, and a reply with the matching kind and request ID resumes it. Argument handling, URL and form encoding, response objects, JSON decoding, exception mapping, and callbacks remain engine work.
+
+The Worker adapter maps packets to page callbacks, browser timers, and `fetch`. The native adapter maps the same packet semantics to stdio, Zig clocks, sleep, and the native HTTP client. This boundary allows each deployment to apply its real security model. Browser HTTP remains subject to CORS and browser TLS. Native HTTP uses the operating system network path and system trust roots. The small Python-visible `ssl` compatibility object validates supported call shapes but does not replace either host's TLS implementation.
+
+Execution is cooperative. The VM runs a bounded bytecode quantum, charges native algorithms for proportional work, and can return control between quanta. In a Worker this creates event-loop yield points and makes cancellation observable without putting execution on the main thread. In the native CLI the adapter immediately continues ordinary timeslices, while the shared work ceiling still bounds a run. Hard cancellation is an embedding control result and intentionally skips Python `finally`; an ordinary Python exception follows normal unwinding.
+
+## A virtual filesystem everywhere
+
+Peony gives programs the same POSIX-like virtual paths on every host:
+
+| Root | Role |
 |---|---|
-| `/course` | Read-only files mounted by the lesson host, such as a CSV or text fixture. |
-| `/home` | Files the learner can create and edit. |
-| `/tmp` | Scratch files cleared when a new run starts. |
+| `/course` | Read-only content supplied by the host. |
+| `/home` | Writable persistent content for a browser session, or writable mounted content for one native process. |
+| `/tmp` | Writable scratch content cleared when a new run begins. |
 
-For example, a lesson can mount `/course/points.csv`; learner code can then open it with `with open("/course/points.csv", newline="") as source:` and pass `source` to `csv.reader`. A learner can also write a note through `Path("/home/note.txt").write_text(...)` and read it in a later run. Each run gets fresh Python globals and imports, while `/course` and `/home` persist within the same public session. `session.reset()` clears the whole session, including files. A course site can save or restore file bytes through the JavaScript file API if it wants persistence across page visits; Peony itself does not silently write to IndexedDB or the host filesystem.
+Python `open()`, file iteration, `csv`, `pathlib`, `os.path`, package imports, and user module imports share this VFS. Paths are case-sensitive and cannot traverse into the host filesystem. File nodes retain identity across rename and unlink while a handle remains open. Imports search `/home`, `/course`, then `/tmp`, with registered Zig modules taking precedence on a cache miss.
 
-Paths use a case-sensitive POSIX-like convention on every host. They cannot escape the virtual roots into the laptop or server running the page. The [architecture guide](docs/architecture.md) explains how file nodes, open handles, imports, and run lifetimes fit together.
+In the browser API, `/course` and `/home` survive consecutive runs in the same public session; the page can copy bytes in or out if it wants durable storage. In the native CLI, explicit mounts initialize a single process-local VFS and changes are discarded when the process exits. This keeps execution reproducible and makes host filesystem authority visible in the command line.
 
-## Browser services have a narrow boundary
+## Native Zig libraries
 
-Some Python functions genuinely need the outside world. `requests.get(...)` needs an HTTP transport; `time.sleep(...)` needs a timer. Peony keeps the Python-facing behavior in Zig: argument binding, URL and form conversion, JSON parsing, response objects, and Python exceptions. The host supplies the actual `fetch`, clock, or timer operation through a callback. This is why a mock `fetch` can drive a deterministic lesson or test without changing the Python program.
+Importable utilities are compiled into both shipping artifacts. They create ordinary Peony modules, functions, classes, iterators, exceptions, and collection values and participate in the same GC, argument binder, work budget, and exception path as user code.
 
-HTTP is limited to HTTP(S), and browser security rules still apply. Requests omit credentials by default, redirects are rejected unless the host opts into following them, and response bodies are capped while being read. A course host can provide an `allowUrl` policy. The small `ssl` object exists for teaching patterns that pass a context to `urlopen`; changing it cannot alter browser certificate validation or CORS. These are boundaries between the interpreter and the browser, not differences in where Python syntax runs.
+Several subsystems are independent native engines rather than wrappers. `re` parses its admitted pattern grammar and executes an ordered Pike-style VM. `json` decodes directly into Peony values and preserves arbitrary integer tokens. Dictionaries use ordered entries and open-addressed perturbation probing. Sorting is stable and evaluates keys once. Random sampling uses bounded native algorithms rather than materializing huge ranges. These choices let Peony use Zig directly while preserving the documented Python interface.
 
-## Errors, stopping, and resource limits
+Familiar module names still describe a bounded contract. Peony's `requests` surface has `get`, `post`, response objects, and its documented exceptions; it does not imply the full third-party package. `collections` supplies `Counter` and `defaultdict`, not every CPython container. Unknown options fail clearly instead of being silently ignored.
 
-Peony distinguishes a Python error from an execution control outcome. A syntax error or unsupported feature carries a compile location. An unhandled runtime exception carries a message and traceback frames with filename, line, column, and source line. The showcase can use those frames to take the learner back to the relevant line. A completed run has no error. A run that reaches its configured combined work budget reports `limit`; the host can explain that the program exceeded its work allowance without pretending it was a catchable Python exception.
+## Verification across CPython, WASM, and native
 
-The stop button calls `session.cancel()`. Cancellation is a **hard stop**: the run resolves as `cancelled`, pending host work is aborted or ignored, and Python `finally` or context-manager exit code is not run. This is intentionally different from an ordinary Python exception unwinding through a `try` block. Sessions also expose instruction, work, memory, GC, and VFS counters for an embedding host that wants to explain or monitor a run. Memory and file budgets are configurable; the [embedding guide](docs/embedding.md) gives their defaults and exact API.
+The [`compare/`](compare/) corpus is one maintained set of 46 scalable Python programs covering core semantics, native libraries, virtual files and imports, and composed workloads. Every repetition runs identical source, arguments, and fixtures on CPython 3.12, Peony WASM through the public Worker facade, and the Peony native executable. A measurement is accepted only after stdout and stderr agree byte for byte across all three runtimes.
 
-## How the pieces fit on a page
+The durable [comparison report](compare/report.md) records artifact hashes, platform identity, compile-plus-execution medians and p95 values, target-specific ratios, instruction/work counters, and peak session memory. Smoke, standard, and stress profiles change scale and repetition count without splitting correctness from performance. This gives native and browser work one conformance baseline while still showing the cost of each real deployment path.
 
-A site imports `web/peony.mjs`, loads a WASM URL, creates a session with callbacks, and calls `run(source, { filename, argv })`. The returned status and frames are separate from streamed output. The session also exposes methods to mount course files, read or write learner files, inspect statistics, collect garbage while idle, reset, and destroy. Multiple sessions can belong to one loaded Worker, each with its own Python state and virtual files.
-
-```text
-page: editor, output, input, lesson files
-       |  public session calls and host callbacks
-       v
-Worker: WASM owner and execution pump
-       |  bounded bytecode runs and host packets
-       v
-Zig engine: compiler, VM, values, GC, libraries, VFS
-```
-
-This division lets a course change the editor, layout, input widget, or storage choice without rewriting interpreter semantics. It also lets Peony change an internal algorithm while keeping the learner's Python code and the host session API stable within the documented subset. The [embedding guide](docs/embedding.md) shows a small integration; the [architecture guide](docs/architecture.md) explains the engine; the [WASM ABI](docs/wasm-abi.md) records the lower-level Worker-to-engine contract. [Development checks](docs/development.md) describe the local verification paths.
-
-The [`compare/`](compare/) corpus runs the same 46 scalable learner programs on Peony and CPython 3.12. Every measured repetition first requires exact output agreement, then records compile-plus-run timing and Peony's instruction, work, and peak-memory counters. It covers isolated language behavior, native libraries, VFS imports and files, and composed data-processing workloads; its smoke, standard, and stress profiles provide one maintained input set for conformance comparison and performance work.
+The [architecture guide](docs/architecture.md) maps the source tree and internal ownership. [Development and verification](docs/development.md) records native, WASM, Worker, browser, cross-target, Unicode, and comparison checks. The [WASM ABI](docs/wasm-abi.md) specifies the lower-level Worker-to-engine contract.
 
 Peony is licensed under the [GNU Affero General Public License v3](LICENSE). We are not currently seeking contributions.
