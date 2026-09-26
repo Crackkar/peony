@@ -107,6 +107,7 @@ fn probe(dict: *Dict, key: Value, key_hash: u64, context: *anyopaque, equal: Equ
     if (dict.buckets.len == 0) return .{ .missing = 0 };
     const mask = dict.buckets.len - 1;
     var index = @as(usize, @truncate(key_hash)) & mask;
+    var perturb: usize = @truncate(key_hash);
     var first_deleted: ?usize = null;
     var visited: usize = 0;
     while (visited < dict.buckets.len) : (visited += 1) {
@@ -122,7 +123,8 @@ fn probe(dict: *Dict, key: Value, key_hash: u64, context: *anyopaque, equal: Equ
                 if (same) return .{ .found = .{ .entry = bucket, .bucket = index } };
             }
         }
-        index = (index + 1) & mask;
+        perturb >>= 5;
+        index = (index *% 5 +% perturb +% 1) & mask;
     }
     return if (first_deleted) |bucket| .{ .missing = bucket } else .failed;
 }
@@ -260,7 +262,9 @@ fn tryRebuild(heap: *gc.Heap, dict: *Dict, capacity: usize) !void {
     errdefer heap.allocator.free(buckets);
     @memset(buckets, empty_bucket);
     var live_count: usize = 0;
-    for (dict.entries.items) |entry| if (entry.alive) { live_count += 1; };
+    for (dict.entries.items) |entry| if (entry.alive) {
+        live_count += 1;
+    };
     const entries = try heap.allocator.alloc(Entry, live_count);
     var cursor: usize = 0;
     for (dict.entries.items) |entry| {
@@ -281,12 +285,14 @@ fn insertionBucket(buckets: []const usize, key_hash: u64) ?usize {
     if (buckets.len == 0) return null;
     const mask = buckets.len - 1;
     var index = @as(usize, @truncate(key_hash)) & mask;
+    var perturb: usize = @truncate(key_hash);
     var first_deleted: ?usize = null;
     for (0..buckets.len) |_| {
         const bucket = buckets[index];
         if (bucket == empty_bucket) return first_deleted orelse index;
         if (bucket == deleted_bucket and first_deleted == null) first_deleted = index;
-        index = (index + 1) & mask;
+        perturb >>= 5;
+        index = (index *% 5 +% perturb +% 1) & mask;
     }
     return first_deleted;
 }
