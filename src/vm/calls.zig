@@ -916,8 +916,8 @@ pub fn invokePythonSync(self: *Runtime, callable: Value, args: []const Value, de
         const position = active.code.positions[active.ip];
         const instruction = active.code.instructions[active.ip];
         active.ip += 1;
-        self.activateFrame(active);
-        if (!self.execute(instruction, position.line, position.column)) {
+        self.instruction_pointer = active.ip;
+        if (!self.execute(instruction, active.code, position.line, position.column)) {
             if (self.limit_reached) return null;
             if (!self.engine_failed and self.last_exception != null and self.unwindPythonExceptionUntil(caller)) continue;
             return null;

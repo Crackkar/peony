@@ -348,8 +348,8 @@ pub fn resumeGenerator(self: *Runtime, selected: *iterator.Iterator, line: u32, 
         const position = active.code.positions[active.ip];
         const instruction = active.code.instructions[active.ip];
         active.ip += 1;
-        self.activateFrame(active);
-        if (!self.execute(instruction, position.line, position.column)) {
+        self.instruction_pointer = active.ip;
+        if (!self.execute(instruction, active.code, position.line, position.column)) {
             if (!self.engine_failed and self.last_exception != null and self.unwindPythonExceptionUntil(caller)) continue;
             const failure: iterator.NextResult = if (self.engine_failed)
                 .{ .engine_error = .internal_invariant }

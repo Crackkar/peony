@@ -646,8 +646,8 @@ pub const Runtime = struct {
             if (executing_generator != null) self.resuming_generator = executing_generator;
             if (!self.chargeBytecode()) return .limit;
             frame.ip += 1;
-            self.activateFrame(frame);
-            if (!self.execute(instruction, current.line, current.column)) {
+            self.instruction_pointer = frame.ip;
+            if (!self.execute(instruction, frame.code, current.line, current.column)) {
                 if (self.limit_reached) {
                     if (self.sync_task) |task| if (!task.callback_in_progress) self.clearSyncTask();
                     return .limit;
@@ -1064,8 +1064,7 @@ pub const Runtime = struct {
         self.environment.shape_version +%= 1;
     }
 
-    pub fn execute(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
-        const code = self.activeCode() orelse return false;
+    pub fn execute(self: *Runtime, instruction: bytecode.Instruction, code: *Code, line: u32, column: u32) bool {
         const op = instruction.opcodeTag() orelse return self.engineFault();
         switch (op) {
             .load_const => {
