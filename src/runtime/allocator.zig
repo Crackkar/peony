@@ -7,6 +7,7 @@ pub const SessionAllocator = struct {
     peak_bytes: usize = 0,
     before_alloc_context: ?*anyopaque = null,
     before_alloc_fn: ?*const fn (*anyopaque, usize) void = null,
+    before_alloc_threshold: ?*const usize = null,
 
     const vtable = std.mem.Allocator.VTable{
         .alloc = alloc,
@@ -40,16 +41,19 @@ pub const SessionAllocator = struct {
         self: *SessionAllocator,
         context: *anyopaque,
         hook: *const fn (*anyopaque, usize) void,
+        threshold: *const usize,
     ) void {
         std.debug.assert(self.before_alloc_context == null or self.before_alloc_context == context);
         self.before_alloc_context = context;
         self.before_alloc_fn = hook;
+        self.before_alloc_threshold = threshold;
     }
 
     pub fn clearBeforeAllocHook(self: *SessionAllocator, context: *anyopaque) void {
         if (self.before_alloc_context == context) {
             self.before_alloc_context = null;
             self.before_alloc_fn = null;
+            self.before_alloc_threshold = null;
         }
     }
 
@@ -118,6 +122,9 @@ pub const SessionAllocator = struct {
     }
 
     fn beforeAllocation(self: *SessionAllocator, requested: usize) void {
+        const threshold = self.before_alloc_threshold orelse return;
+        const projected = std.math.add(usize, self.live_bytes, requested) catch std.math.maxInt(usize);
+        if (projected <= threshold.*) return;
         if (self.before_alloc_fn) |hook| {
             if (self.before_alloc_context) |context| hook(context, requested);
         }

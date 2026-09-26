@@ -34,7 +34,7 @@ pub const Heap = struct {
         self.allocator = session.allocator();
         self.collection_threshold = config.initial_threshold;
         self.threshold_growth_floor = config.threshold_growth_floor;
-        session.setBeforeAllocHook(self, beforeAllocation);
+        session.setBeforeAllocHook(self, beforeAllocation, &self.collection_threshold);
     }
 
     pub fn createObject(self: *Heap, comptime T: type, kind: *const Kind) std.mem.Allocator.Error!*T {
@@ -114,9 +114,6 @@ pub const Heap = struct {
         const self: *Heap = @ptrCast(@alignCast(context));
         if (self.collecting) return;
         const session = self.session orelse return;
-        const projected = std.math.add(usize, session.live_bytes, requested) catch std.math.maxInt(usize);
-        if (projected <= self.collection_threshold) return;
-
         _ = self.collect();
         self.collection_threshold = growThreshold(
             self.collection_threshold,
