@@ -58,12 +58,15 @@ pub fn open(
     }
 
     const normalized = vfs_module.normalizePath(heap.allocator, path) catch |err| return .{ .python_exception = pathException(err) };
-    const exists = fs.existsNormalized(normalized);
-    const existing = if (exists) fs.readNormalized(normalized) else error.NotFound;
-    if (exists and fs.isDirectoryNormalized(normalized)) {
-        heap.allocator.free(normalized);
-        return .{ .python_exception = pathException(error.IsDirectory) };
-    }
+    var node: ?*vfs_module.FileNode = fs.fileNodeNormalized(normalized) catch |err| switch (err) {
+        error.NotFound => null,
+        else => {
+            heap.allocator.free(normalized);
+            return .{ .python_exception = pathException(err) };
+        },
+    };
+    const exists = node != null;
+    const existing_len = if (node) |selected| selected.bytes.len else 0;
     if (mode.exclusive and exists) {
         heap.allocator.free(normalized);
         return pythonError(*File, .file_exists_error, "file already exists");
@@ -85,7 +88,7 @@ pub fn open(
         };
     }
 
-    const node = fs.fileNodeNormalized(normalized) catch |err| {
+    if (node == null) node = fs.fileNodeNormalized(normalized) catch |err| {
         heap.allocator.free(normalized);
         return .{ .python_exception = pathException(err) };
     };
@@ -102,15 +105,15 @@ pub fn open(
     object.* = .{
         .header = object.header,
         .fs = fs,
-        .node = node,
+        .node = node.?,
         .path = normalized,
         .mode_text = owned_mode,
         .mode = mode,
         .universal_newlines = newline == null,
         .recognize_newlines = newline == null or (newline != null and newline.?.len == 0),
-        .cursor = if (mode.append) (existing catch @as([]const u8, &.{})).len else 0,
+        .cursor = if (mode.append) existing_len else 0,
     };
-    fs.retainFile(node);
+    fs.retainFile(node.?);
     return .{ .value = object };
 }
 
@@ -119,6 +122,19 @@ pub fn readBuffer(heap: *Heap, fs: *vfs_module.Vfs, file: *File, size: ?i64, lin
     if (!file.mode.readable) return pythonError([]u8, .os_error, "file not open for reading");
     const contents = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const limit: ?usize = if (size) |selected| if (selected < 0) null else std.math.cast(usize, selected) orelse return pythonError([]u8, .overflow_error, "read length is too large") else null;
+    if (!line_mode and file.cursor <= contents.len and (file.mode.binary or limit == null)) {
+        const end = if (file.mode.binary and limit != null)
+            @min(contents.len, file.cursor +| limit.?)
+        else
+            contents.len;
+        const direct = contents[file.cursor..end];
+        if (file.mode.binary or (!file.universal_newlines or std.mem.indexOfScalar(u8, direct, '\r') == null)) {
+            if (!file.mode.binary and !std.unicode.utf8ValidateSlice(direct)) return pythonError([]u8, .unicode_decode_error, "invalid UTF-8 data in file");
+            const result = heap.allocator.dupe(u8, direct) catch return pythonError([]u8, .memory_error, "session memory limit exceeded");
+            file.cursor = end;
+            return .{ .value = result };
+        }
+    }
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(heap.allocator);
     var cursor = file.cursor;
@@ -167,12 +183,14 @@ pub fn writeBuffer(heap: *Heap, fs: *vfs_module.Vfs, file: *File, bytes: []const
     const end = std.math.add(usize, position, bytes.len) catch return pythonError(usize, .memory_error, "session memory limit exceeded");
     const new_len = @max(old.len, end);
     const replacement = heap.allocator.alloc(u8, new_len) catch return pythonError(usize, .memory_error, "session memory limit exceeded");
-    defer if (replacement.len != 0) heap.allocator.free(replacement);
     if (old.len != 0) @memcpy(replacement[0..old.len], old);
     if (position > old.len) @memset(replacement[old.len..position], 0);
     @memcpy(replacement[position..end], bytes);
     if (end < old.len) @memcpy(replacement[end..], old[end..]);
-    fs.writeNode(file.node, replacement, .replace) catch |err| return .{ .python_exception = pathException(err) };
+    fs.replaceNodeOwned(file.node, replacement) catch |err| {
+        if (replacement.len != 0) heap.allocator.free(replacement);
+        return .{ .python_exception = pathException(err) };
+    };
     file.cursor = end;
     return .{ .value = if (file.mode.binary) bytes.len else std.unicode.utf8CountCodepoints(bytes) catch bytes.len };
 }
@@ -200,11 +218,13 @@ pub fn truncate(heap: *Heap, fs: *vfs_module.Vfs, file: *File, requested: ?i64) 
     const target = if (requested) |selected| if (selected < 0) return pythonError(usize, .value_error, "negative size value") else std.math.cast(usize, selected) orelse return pythonError(usize, .overflow_error, "file size is too large") else file.cursor;
     const old = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const replacement = heap.allocator.alloc(u8, target) catch return pythonError(usize, .memory_error, "session memory limit exceeded");
-    defer if (replacement.len != 0) heap.allocator.free(replacement);
     const copied = @min(old.len, target);
     if (copied != 0) @memcpy(replacement[0..copied], old[0..copied]);
     if (target > copied) @memset(replacement[copied..], 0);
-    fs.writeNode(file.node, replacement, .replace) catch |err| return .{ .python_exception = pathException(err) };
+    fs.replaceNodeOwned(file.node, replacement) catch |err| {
+        if (replacement.len != 0) heap.allocator.free(replacement);
+        return .{ .python_exception = pathException(err) };
+    };
     return .{ .value = target };
 }
 

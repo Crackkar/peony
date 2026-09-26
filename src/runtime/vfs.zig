@@ -153,12 +153,22 @@ pub const Vfs = struct {
         const new_total = std.math.add(usize, self.total_bytes - old_len, new_len) catch return error.TooLarge;
         if (new_total > self.max_total_bytes) return error.TooLarge;
         const replacement = if (new_len == 0) @as([]u8, &.{}) else self.allocator.alloc(u8, new_len) catch return error.OutOfMemory;
+        errdefer if (replacement.len != 0) self.allocator.free(replacement);
         if (mode == .append) {
             @memcpy(replacement[0..old_len], node.bytes);
             @memcpy(replacement[old_len..], bytes);
         } else if (bytes.len != 0) {
             @memcpy(replacement, bytes);
         }
+        try self.replaceNodeOwned(node, replacement);
+    }
+
+    /// On success the VFS takes ownership of `replacement` without copying it.
+    pub fn replaceNodeOwned(self: *Vfs, node: *FileNode, replacement: []u8) Error!void {
+        if (node.read_only) return error.PermissionDenied;
+        if (replacement.len > self.max_file_bytes) return error.TooLarge;
+        const new_total = std.math.add(usize, self.total_bytes - node.bytes.len, replacement.len) catch return error.TooLarge;
+        if (new_total > self.max_total_bytes) return error.TooLarge;
         if (node.bytes.len != 0) self.allocator.free(node.bytes);
         node.bytes = replacement;
         self.total_bytes = new_total;

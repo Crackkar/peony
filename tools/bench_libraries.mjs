@@ -72,6 +72,12 @@ const workloads = [
     expected: `${pathText.length * 30}\n`,
   },
   {
+    name: 'file-read-write',
+    files: { '/course/text.txt': pathText },
+    source: 'total = 0\nfor unused in range(100):\n    with open("/course/text.txt") as source:\n        total += len(source.read())\nchunk = "abcdefghij\\n" * 10\nwith open("/home/output.txt", "w") as output:\n    for unused in range(200): output.write(chunk)\nwith open("/home/output.txt") as output:\n    written = len(output.read())\nprint(total, written)\n',
+    expected: `${pathText.length * 100} 22000\n`,
+  },
+  {
     name: 'deepcopy-alias-cycle',
     files: {},
     source: 'import copy\nchild = [1, 2, 3]\nsource = [child, child]\nsource.append(source)\ncount = 0\nfor unused in range(100):\n    result = copy.deepcopy(source)\n    count += result[0] is result[1] and result[2] is result\nprint(count)\n',
