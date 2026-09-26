@@ -803,18 +803,19 @@ pub fn sliceSequence(self: *Runtime, destination: u16, container: Value, values:
         },
         .engine_error => return self.engineFault(),
     };
-    var output: std.ArrayList(Value) = .empty;
-    defer output.deinit(self.heap.allocator);
+    const output = self.heap.allocator.alloc(Value, slice.outputLength(indices)) catch {
+        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+        return false;
+    };
     var index_value = indices.start;
+    var output_index: usize = 0;
     while (if (indices.step > 0) index_value < indices.stop else index_value > indices.stop) {
-        output.append(self.heap.allocator, values[@intCast(index_value)]) catch {
-            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
-            return false;
-        };
+        output[output_index] = values[@intCast(index_value)];
+        output_index += 1;
         index_value = std.math.add(i128, index_value, indices.step) catch break;
     }
     _ = container;
-    if (is_tuple) return switch (sequence.createTuple(&self.heap, output.items)) {
+    if (is_tuple) return switch (sequence.createTupleOwned(&self.heap, output)) {
         .value => |tuple| blk: {
             self.setRegister(destination, Value.object(&tuple.header));
             break :blk true;
@@ -825,7 +826,7 @@ pub fn sliceSequence(self: *Runtime, destination: u16, container: Value, values:
         },
         .engine_error => self.engineFault(),
     };
-    return switch (sequence.createList(&self.heap, output.items)) {
+    return switch (sequence.createListOwned(&self.heap, output)) {
         .value => |list| blk: {
             self.setRegister(destination, Value.object(&list.header));
             break :blk true;

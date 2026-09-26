@@ -187,14 +187,41 @@ pub fn sliceNormalized(heap: *gc.Heap, value: *Str, indices: slice_utils.Bounded
     roots.push(heap, value, null);
     defer roots.pop();
 
+    if (slice_utils.outputLength(indices) == 0) return create(heap, "");
+    if (indices.step == 1) {
+        const byte_start = byteOffset(value.data, @intCast(indices.start));
+        const byte_stop = byteOffset(value.data, @intCast(indices.stop));
+        const data = heap.allocator.dupe(u8, value.data[byte_start..byte_stop]) catch return memoryError();
+        return createOwned(heap, data);
+    }
+
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(heap.allocator);
-    var index_value = indices.start;
-    while (if (indices.step > 0) index_value < indices.stop else index_value > indices.stop) {
-        const byte_start = byteOffset(value.data, @intCast(index_value));
-        const byte_end = byteOffset(value.data, @intCast(index_value + 1));
-        output.appendSlice(heap.allocator, value.data[byte_start..byte_end]) catch return memoryError();
-        index_value = std.math.add(i128, index_value, indices.step) catch break;
+    output.ensureTotalCapacity(heap.allocator, value.data.len) catch return memoryError();
+    if (indices.step > 0) {
+        var index_value = indices.start;
+        var byte_start = byteOffset(value.data, @intCast(index_value));
+        while (index_value < indices.stop) {
+            const byte_end = nextOffset(value.data, byte_start);
+            output.appendSliceAssumeCapacity(value.data[byte_start..byte_end]);
+            const next_index = index_value + indices.step;
+            if (next_index >= indices.stop) break;
+            byte_start = byte_end;
+            index_value += 1;
+            while (index_value < next_index) : (index_value += 1) byte_start = nextOffset(value.data, byte_start);
+        }
+    } else {
+        var index_value = indices.start;
+        var byte_end = byteOffset(value.data, @intCast(index_value + 1));
+        while (index_value > indices.stop) {
+            const byte_start = previousOffset(value.data, byte_end);
+            output.appendSliceAssumeCapacity(value.data[byte_start..byte_end]);
+            const next_index = index_value + indices.step;
+            if (next_index <= indices.stop) break;
+            byte_end = byte_start;
+            index_value -= 1;
+            while (index_value > next_index) : (index_value -= 1) byte_end = previousOffset(value.data, byte_end);
+        }
     }
     return finishBuffer(heap, &output);
 }

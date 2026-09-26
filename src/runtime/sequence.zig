@@ -60,6 +60,28 @@ pub fn createTuple(heap: *gc.Heap, values: []const Value) TupleResult {
     return .{ .value = tuple };
 }
 
+/// Takes ownership of an allocator-owned, exactly sized value slice.
+pub fn createListOwned(heap: *gc.Heap, owned: []Value) ListResult {
+    const list = heap.createObject(List, &list_kind) catch {
+        if (owned.len != 0) heap.allocator.free(owned);
+        return memoryError(*List);
+    };
+    const header = list.header;
+    list.* = .{ .header = header, .items = .{ .items = owned, .capacity = owned.len } };
+    return .{ .value = list };
+}
+
+/// Takes ownership of an allocator-owned, exactly sized value slice.
+pub fn createTupleOwned(heap: *gc.Heap, owned: []Value) TupleResult {
+    const tuple = heap.createObject(Tuple, &tuple_kind) catch {
+        if (owned.len != 0) heap.allocator.free(owned);
+        return memoryError(*Tuple);
+    };
+    const header = tuple.header;
+    tuple.* = .{ .header = header, .items = owned };
+    return .{ .value = tuple };
+}
+
 pub fn append(heap: *gc.Heap, list: *List, value: Value) exceptions.Result(void) {
     list.items.append(heap.allocator, value) catch return memoryError(void);
     list.version +%= 1;

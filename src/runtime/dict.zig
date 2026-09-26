@@ -44,6 +44,11 @@ pub const EqualityFn = *const fn (*anyopaque, Value, Value) ?bool;
 pub const Lookup = union(enum) { found: usize, missing, failed };
 pub const GetResult = union(enum) { value: Value, missing, failed };
 pub const IterResult = union(enum) { item: Value, done, python_exception: exceptions.PythonException };
+const Probe = union(enum) {
+    found: struct { entry: usize, bucket: usize },
+    missing: usize,
+    failed,
+};
 
 const empty_bucket = std.math.maxInt(usize);
 const deleted_bucket = std.math.maxInt(usize) - 1;
@@ -91,24 +96,35 @@ pub fn createIterator(heap: *gc.Heap, owner: *Dict, kind: ViewKind) exceptions.R
 }
 
 pub fn lookup(dict: *Dict, key: Value, key_hash: u64, context: *anyopaque, equal: EqualityFn) Lookup {
-    if (dict.buckets.len == 0) return .missing;
+    return switch (probe(dict, key, key_hash, context, equal)) {
+        .found => |found| .{ .found = found.entry },
+        .missing => .missing,
+        .failed => .failed,
+    };
+}
+
+fn probe(dict: *Dict, key: Value, key_hash: u64, context: *anyopaque, equal: EqualityFn) Probe {
+    if (dict.buckets.len == 0) return .{ .missing = 0 };
     const mask = dict.buckets.len - 1;
     var index = @as(usize, @truncate(key_hash)) & mask;
+    var first_deleted: ?usize = null;
     var visited: usize = 0;
     while (visited < dict.buckets.len) : (visited += 1) {
         const bucket = dict.buckets[index];
-        if (bucket == empty_bucket) return .missing;
-        if (bucket != deleted_bucket) {
+        if (bucket == empty_bucket) return .{ .missing = first_deleted orelse index };
+        if (bucket == deleted_bucket) {
+            if (first_deleted == null) first_deleted = index;
+        } else {
             if (bucket >= dict.entries.items.len) return .failed;
             const entry = dict.entries.items[bucket];
             if (entry.alive and entry.hash == key_hash) {
                 const same = equal(context, entry.key, key) orelse return .failed;
-                if (same) return .{ .found = bucket };
+                if (same) return .{ .found = .{ .entry = bucket, .bucket = index } };
             }
         }
         index = (index + 1) & mask;
     }
-    return .missing;
+    return if (first_deleted) |bucket| .{ .missing = bucket } else .failed;
 }
 
 pub fn get(dict: *Dict, key: Value, key_hash: u64, context: *anyopaque, equal: EqualityFn) GetResult {
@@ -124,24 +140,31 @@ pub fn set(heap: *gc.Heap, dict: *Dict, key: Value, value: Value, key_hash: u64,
     roots.push(heap, &dict.header, key.asObject());
     roots.addValue(value);
     defer roots.pop();
-    const found = lookup(dict, key, key_hash, context, equal);
+    const found = probe(dict, key, key_hash, context, equal);
+    var insertion_bucket: ?usize = null;
     switch (found) {
         .failed => return .{ .engine_error = .internal_invariant },
-        .found => |entry_index| {
-            if (!dict.is_set) dict.entries.items[entry_index].value = value;
+        .found => |location| {
+            if (!dict.is_set) dict.entries.items[location.entry].value = value;
             return .{ .value = {} };
         },
-        .missing => {},
+        .missing => |bucket| insertion_bucket = bucket,
     }
+    var rebuilt = false;
     if (dict.buckets.len == 0 or (dict.size + dict.tombstones + 1) * 10 >= dict.buckets.len * 7) {
         const desired = if (dict.buckets.len == 0) 8 else dict.buckets.len * 2;
         tryRebuild(heap, dict, desired) catch return memoryError(void);
+        rebuilt = true;
     } else if (dict.tombstones > 8 and dict.tombstones > dict.size) {
         tryRebuild(heap, dict, dict.buckets.len) catch return memoryError(void);
+        rebuilt = true;
     }
     dict.entries.append(heap.allocator, .{ .key = key, .value = value, .hash = key_hash }) catch return memoryError(void);
     const entry_index = dict.entries.items.len - 1;
-    const bucket = insertionBucket(dict.buckets, key_hash) orelse return .{ .engine_error = .internal_invariant };
+    const bucket = if (rebuilt)
+        insertionBucket(dict.buckets, key_hash) orelse return .{ .engine_error = .internal_invariant }
+    else
+        insertion_bucket orelse return .{ .engine_error = .internal_invariant };
     if (dict.buckets[bucket] == deleted_bucket) dict.tombstones -= 1;
     dict.buckets[bucket] = entry_index;
     dict.size += 1;
@@ -150,17 +173,16 @@ pub fn set(heap: *gc.Heap, dict: *Dict, key: Value, value: Value, key_hash: u64,
 }
 
 pub fn delete(dict: *Dict, key: Value, key_hash: u64, context: *anyopaque, equal: EqualityFn) Lookup {
-    switch (lookup(dict, key, key_hash, context, equal)) {
+    switch (probe(dict, key, key_hash, context, equal)) {
         .missing => return .missing,
         .failed => return .failed,
-        .found => |entry_index| {
-            const bucket = findBucketForIndex(dict, entry_index) orelse return .failed;
-            dict.buckets[bucket] = deleted_bucket;
-            dict.entries.items[entry_index].alive = false;
+        .found => |location| {
+            dict.buckets[location.bucket] = deleted_bucket;
+            dict.entries.items[location.entry].alive = false;
             dict.size -= 1;
             dict.tombstones += 1;
             dict.version +%= 1;
-            return .{ .found = entry_index };
+            return .{ .found = location.entry };
         },
     }
 }
@@ -267,12 +289,6 @@ fn insertionBucket(buckets: []const usize, key_hash: u64) ?usize {
         index = (index + 1) & mask;
     }
     return first_deleted;
-}
-
-fn findBucketForIndex(dict: *Dict, entry_index: usize) ?usize {
-    if (dict.buckets.len == 0) return null;
-    for (dict.buckets, 0..) |bucket, index| if (bucket == entry_index) return index;
-    return null;
 }
 
 fn traceDict(header: *gc.Header, tracer: *gc.Tracer) void {

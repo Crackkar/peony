@@ -7,7 +7,8 @@ import { performance } from 'node:perf_hooks';
 import { brotliCompressSync, constants as zlibConstants } from 'node:zlib';
 import { Peony } from '../web/peony.mjs';
 
-const wasm = new Uint8Array(await readFile(new URL('../zig-out/peony.wasm', import.meta.url)));
+const wasmPath = process.env.PEONY_BENCH_WASM ?? new URL('../zig-out/peony.wasm', import.meta.url);
+const wasm = new Uint8Array(await readFile(wasmPath));
 const started = performance.now();
 const peony = await Peony.load(wasm);
 const instantiateMs = performance.now() - started;
@@ -22,6 +23,30 @@ const json = JSON.stringify({ rows: Array.from({ length: 4000 }, (_, index) => (
 const pathText = 'abcdefghij\n'.repeat(1500);
 
 const workloads = [
+  {
+    name: 'vm-smallint-loop',
+    files: {},
+    source: 'def calculate():\n    total = 0\n    for i in range(200000):\n        total += (i * 3 + 7) // 2\n    return total\nprint(calculate())\n',
+    expected: '30000500000\n',
+  },
+  {
+    name: 'dict-build-lookup',
+    files: {},
+    source: 'def calculate():\n    values = {}\n    for i in range(30000): values[i] = i * 2\n    total = 0\n    for i in range(30000): total += values[i]\n    return len(values), total\nprint(*calculate())\n',
+    expected: '30000 899970000\n',
+  },
+  {
+    name: 'list-build-iterate',
+    files: {},
+    source: 'def calculate():\n    values = []\n    for i in range(100000): values.append(i)\n    total = 0\n    for value in values: total += value\n    return len(values), total\nprint(*calculate())\n',
+    expected: '100000 4999950000\n',
+  },
+  {
+    name: 'slice-strides',
+    files: {},
+    source: 'text = "éabc" * 1000\ndata = b"abcd" * 1000\nvalues = list(range(4000))\nfor unused in range(10):\n    text_forward = text[1:-1:2]\n    text_reverse = text[::-3]\n    data_forward = data[1:-1:2]\n    data_reverse = data[::-3]\n    list_forward = values[1:-1:2]\n    list_reverse = values[::-3]\nprint(len(text_forward), len(text_reverse), len(data_forward), len(data_reverse), len(list_forward), len(list_reverse))\n',
+    expected: '1999 1334 1999 1334 1999 1334\n',
+  },
   {
     name: 'counter-word-frequency',
     files: { '/course/words.txt': words },
@@ -64,21 +89,22 @@ const records = [];
 for (const workload of workloads.filter(item => !filter || item.name === filter)) {
   process.stderr.write(`PEONY_BENCH_START ${workload.name}\n`);
   const samples = [];
-  let peakLinearBytes = peony.exports.memory.buffer.byteLength;
+  let peakSessionBytes = 0;
   for (let repetition = 0; repetition < warmups + repetitions; repetition++) {
     const output = [];
     const session = peony.createSession({ stdout: text => output.push(text), quantum: 50_000, maxInstructions: 50_000_000 });
     try {
-      session.mount(workload.files);
+      await session.mount(workload.files);
       const start = performance.now();
       const result = await session.run(workload.source, { filename: `${workload.name}.py` });
       const elapsedMs = performance.now() - start;
       if (result.status !== 'completed') throw new Error(`${workload.name}: ${result.status}: ${result.error?.message ?? ''}`);
       if (output.join('') !== workload.expected) throw new Error(`${workload.name}: output ${JSON.stringify(output.join(''))}`);
-      peakLinearBytes = Math.max(peakLinearBytes, peony.exports.memory.buffer.byteLength);
+      const stats = await session.stats();
+      peakSessionBytes = Math.max(peakSessionBytes, stats.peakSessionBytes);
       if (repetition >= warmups) samples.push({ elapsedMs, ...result.counters });
     } finally {
-      session.destroy();
+      await session.destroy();
     }
   }
   const input = JSON.stringify({ source: workload.source, files: workload.files });
@@ -92,7 +118,7 @@ for (const workload of workloads.filter(item => !filter || item.name === filter)
     p95RunMsIncludingCompile: percentile(samples.map(item => item.elapsedMs), 0.95),
     medianInstructions: percentile(samples.map(item => item.instructions), 0.5),
     medianWork: percentile(samples.map(item => item.work), 0.5),
-    peakLinearBytes,
+    peakSessionBytes,
   });
 }
 const compressed = brotliCompressSync(wasm, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11 } });

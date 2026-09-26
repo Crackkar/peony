@@ -460,9 +460,10 @@ pub fn build(b: *std.Build) void {
     json_choice_step.dependOn(&json_choice_run.step);
 
     const wasm_debug = b.option(bool, "wasm-debug", "Build stripped Debug WASM for local integration") orelse false;
-    const wasm_optimize: std.builtin.OptimizeMode = if (wasm_debug) .Debug else .ReleaseSmall;
+    const wasm_optimize: std.builtin.OptimizeMode = if (wasm_debug) .Debug else .ReleaseFast;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}),
         .os_tag = .freestanding,
     });
     const wasm_module = b.createModule(.{
@@ -489,7 +490,7 @@ pub fn build(b: *std.Build) void {
 
     const install_wasm = b.addInstallFile(wasm.getEmittedBin(), "peony.wasm");
     b.getInstallStep().dependOn(&install_wasm.step);
-    const wasm_step = b.step("wasm", "Build the stripped ReleaseSmall browser WASM artifact");
+    const wasm_step = b.step("wasm", "Build the stripped ReleaseFast browser WASM artifact");
     wasm_step.dependOn(&install_wasm.step);
 
     addProbe(b, wasm_target, "bigint", "peony_probe_bigint");

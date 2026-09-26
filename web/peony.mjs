@@ -136,6 +136,9 @@ class PeonySession {
     this.ready = null;
     this.running = false;
     this.runId = 0;
+    this.runPosted = false;
+    this.cancelRequested = false;
+    this.cancelSent = false;
     this.destroyed = false;
     this.activeHost = new Map();
   }
@@ -152,11 +155,20 @@ class PeonySession {
     if (typeof source !== 'string') throw new TypeError('run source must be a string');
     this.running = true;
     const run = ++this.runId;
+    this.runPosted = false;
+    this.cancelRequested = false;
+    this.cancelSent = false;
     try {
       await this.ready;
-      return await this.module.request(this.id, 'run', { source, options }, run);
+      const request = this.module.request(this.id, 'run', { source, options }, run);
+      this.runPosted = true;
+      if (this.cancelRequested) this.sendCancel(run);
+      return await request;
     } finally {
       this.running = false;
+      this.runPosted = false;
+      this.cancelRequested = false;
+      this.cancelSent = false;
       this.abortHost();
     }
   }
@@ -164,7 +176,14 @@ class PeonySession {
   cancel() {
     if (!this.running || this.destroyed || this.module.closed) return;
     this.abortHost(false);
-    void this.module.request(this.id, 'cancel', {}, this.runId).catch(() => {});
+    this.cancelRequested = true;
+    if (this.runPosted) this.sendCancel(this.runId);
+  }
+
+  sendCancel(run) {
+    if (this.cancelSent) return;
+    this.cancelSent = true;
+    void this.module.request(this.id, 'cancel', {}, run).catch(() => {});
   }
 
   async reset() {

@@ -77,6 +77,15 @@ pub fn normalizeI64(length: i64, start: ?i64, stop: ?i64, step: i64) BoundedIndi
     };
 }
 
+pub fn outputLength(indices: BoundedIndices) usize {
+    if (indices.step > 0) {
+        if (indices.start >= indices.stop) return 0;
+        return @intCast(1 + @divFloor(indices.stop - indices.start - 1, indices.step));
+    }
+    if (indices.start <= indices.stop) return 0;
+    return @intCast(1 + @divFloor(indices.start - indices.stop - 1, -indices.step));
+}
+
 fn clampI64(value: i64, length: i128, minimum: i128, maximum: i128) i128 {
     var normalized: i128 = value;
     if (normalized < 0) normalized += length;

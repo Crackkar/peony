@@ -83,15 +83,19 @@ pub fn sliceNormalized(heap: *gc.Heap, value: *Bytes, indices: slice_utils.Bound
     roots.push(heap, value);
     defer roots.pop();
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(heap.allocator);
+    const output = heap.allocator.alloc(u8, slice_utils.outputLength(indices)) catch return memoryError();
+    if (indices.step == 1) {
+        @memcpy(output, value.data[@intCast(indices.start)..@intCast(indices.stop)]);
+        return createOwned(heap, output);
+    }
     var index_value = indices.start;
+    var output_index: usize = 0;
     while (if (indices.step > 0) index_value < indices.stop else index_value > indices.stop) {
-        output.append(heap.allocator, value.data[@intCast(index_value)]) catch return memoryError();
+        output[output_index] = value.data[@intCast(index_value)];
+        output_index += 1;
         index_value = std.math.add(i128, index_value, indices.step) catch break;
     }
-    const data = output.toOwnedSlice(heap.allocator) catch return memoryError();
-    return createOwned(heap, data);
+    return createOwned(heap, output);
 }
 
 pub fn equal(left: *const Bytes, right: *const Bytes) bool {

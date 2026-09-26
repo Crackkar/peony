@@ -6,9 +6,9 @@ This page records repeatable commands and the ownership of each check. The [arch
 
 ## Toolchain and outputs
 
-Use Zig `0.16.0`. The normal native test build uses Debug optimization and a stripped test executable. `zig build wasm` builds the shipping `wasm32-freestanding` binary with LLVM, `ReleaseSmall`, a single-threaded runtime, and stripped debug information. It installs **directly** at `zig-out/peony.wasm`; there is no `bin/` nesting. The optional `-Dwasm-debug=true` selects a stripped Debug WASM for local integration work. Build output and the repository-local `.zig-cache/` are ignored by Git.
+Use Zig `0.16.0`. The normal native test build uses Debug optimization and a stripped test executable. `zig build wasm` builds the shipping `wasm32-freestanding` binary with LLVM, `ReleaseFast`, WebAssembly SIMD enabled, a single-threaded runtime, and stripped debug information. Runtime throughput is the release artifact's optimization target; feature-size probes remain `ReleaseSmall` so their measurements stay comparable. The shipping artifact installs **directly** at `zig-out/peony.wasm`; there is no `bin/` nesting. The optional `-Dwasm-debug=true` selects a stripped Debug WASM with the same SIMD target for local integration work. Build output and the repository-local `.zig-cache/` are ignored by Git.
 
-During an ordinary edit loop, run the narrowest meaningful native or Node check for the behavior being changed. Build the shipping WASM when the change crosses the raw ABI, Worker, browser, or release-artifact boundary. The full command sequence below is the integration gate, not a requirement to rebuild ReleaseSmall after every line edit. This keeps Zig cache and disk pressure proportional to the current risk.
+During an ordinary edit loop, run the narrowest meaningful native or Node check for the behavior being changed. Build the shipping WASM when the change crosses the raw ABI, Worker, browser, or release-artifact boundary. The full command sequence below is the integration gate, not a requirement to rebuild ReleaseFast after every line edit. This keeps Zig cache and disk pressure proportional to the current risk.
 
 ```powershell
 zig version
