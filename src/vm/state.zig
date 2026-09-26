@@ -121,7 +121,10 @@ pub const PendingInput = struct {
     column: u32,
 };
 
-pub const SyncTaskOperation = enum { materialize, sorted, list_sort, next_value };
+pub const SyncTaskOperation = enum {
+    materialize, sorted, list_sort, next_value,
+    builtin_all, builtin_any, builtin_min, builtin_max, builtin_sum, builtin_bytes,
+};
 pub const SyncTaskPhase = enum { collect, keys, order };
 pub const SyncCallbackResult = union(enum) { value: Value, suspended, failed };
 

@@ -23,7 +23,7 @@ test('shipping WASM native registry owns names ahead of VFS and retains first-cl
   const peony = await load();
   const output = [];
   const session = peony.createSession({ stdout: (text) => output.push(text), quantum: 1 });
-  assert.equal(session.writeFile('/home/math.py', "print('wrong VFS math')\n"), undefined);
+  await session.writeFile('/home/math.py', "print('wrong VFS math')\n");
   const result = await session.run([
     'import math',
     'from math import sqrt',

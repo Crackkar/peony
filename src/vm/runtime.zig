@@ -395,6 +395,7 @@ pub const Runtime = struct {
     pub const setException = control.setException;
     pub const currentFilename = control.currentFilename;
     pub const prepareExceptionDiagnostics = control.prepareExceptionDiagnostics;
+    pub const prepareCompileDiagnostic = control.prepareCompileDiagnostic;
 
     pub fn init(self: *Runtime, backing: std.mem.Allocator, max_bytes: usize) std.mem.Allocator.Error!void {
         const vfs_limit = @min(8 * 1024 * 1024, @max(@as(usize, 1024), max_bytes / 2));
@@ -566,10 +567,12 @@ pub const Runtime = struct {
             },
             .syntax_error => |diagnostic| {
                 self.setStaticError(diagnostic.message);
+                self.prepareCompileDiagnostic(source, filename, diagnostic.line, diagnostic.column);
                 return .{ .syntax_error = diagnostic };
             },
             .unsupported => |diagnostic| {
                 self.setStaticError(diagnostic.message);
+                self.prepareCompileDiagnostic(source, filename, diagnostic.line, diagnostic.column);
                 return .{ .unsupported = diagnostic };
             },
             .python_exception => |exception| {

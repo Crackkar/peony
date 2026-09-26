@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Peony — Python practice</title>
+  <link rel="stylesheet" href="./showcase.css">
+  <script type="module" src="./showcase.mjs"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand" aria-label="Peony">
+        <span class="brand-mark" aria-hidden="true">✳</span>
+        <span class="brand-name">Peony</span>
+      </div>
+      <p class="header-note">A quiet place to practice Python.</p>
+      <span class="runtime-status" id="runtime-status" role="status" aria-live="polite">Loading</span>
+    </header>
+
+    <main class="workspace" aria-label="Python workspace">
+      <section class="panel editor-panel" aria-labelledby="editor-title">
+        <div class="panel-head">
+          <div>
+            <h1 id="editor-title">Editor</h1>
+            <span class="panel-subtitle">main.py</span>
+          </div>
+          <div class="editor-actions">
+            <label class="visually-hidden" for="example-select">Load an example</label>
+            <select id="example-select" title="Load an example">
+              <option value="">Examples</option>
+              <option value="hello">Hello</option>
+              <option value="words">Word counts</option>
+              <option value="files">Files</option>
+              <option value="input">Input</option>
+              <option value="patterns">Patterns</option>
+            </select>
+            <button class="button button-primary" id="run-button" type="button" disabled>Run <span class="button-arrow" aria-hidden="true">▶</span></button>
+            <button class="button button-secondary" id="stop-button" type="button" disabled>Stop</button>
+          </div>
+        </div>
+        <div class="editor-surface">
+          <pre class="line-numbers" id="line-numbers" aria-hidden="true">1</pre>
+          <textarea id="editor" aria-label="Python code" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off"></textarea>
+        </div>
+        <div class="panel-foot"><span>Tab inserts four spaces</span><span>Ctrl/⌘ + Enter to run</span></div>
+      </section>
+
+      <section class="panel output-panel" aria-labelledby="output-title">
+        <div class="panel-head output-head">
+          <div>
+            <h2 id="output-title">Output</h2>
+            <span class="panel-subtitle" id="run-detail">Ready when you are</span>
+          </div>
+          <button class="button button-quiet" id="clear-button" type="button">Clear</button>
+        </div>
+        <div class="output-body">
+          <pre id="output" aria-label="Program output" aria-live="polite"></pre>
+          <div class="empty-output" id="empty-output">Run your code to see the result here.</div>
+          <div class="error-card" id="error-card" hidden>
+            <div class="error-heading">Something went wrong</div>
+            <pre id="error-message"></pre>
+            <button type="button" class="error-location" id="error-location" hidden></button>
+          </div>
+        </div>
+        <form class="input-bar" id="input-form" hidden>
+          <label for="input-value" id="input-label">Input</label>
+          <input id="input-value" autocomplete="off" spellcheck="false">
+          <button class="button button-primary" type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <footer class="app-footer"><span>Python 3.12 learning subset</span><span>Runs in your browser</span></footer>
+  </div>
+</body>
+</html>

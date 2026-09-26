@@ -29,6 +29,7 @@ fn executePrimitiveClassCall(
         .bool_type => .bool_constructor,
         .int_type => .int_constructor,
         .str_type => .str_constructor,
+        .bytes_type => .bytes_constructor,
         .float_type => .float_constructor,
         .list_type => .list,
         .tuple_type => .tuple,
@@ -106,7 +107,7 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
     call_root_frame.push(&self.heap.roots);
     for (&call_roots) |*root| call_root_frame.add(root);
     var call_roots_active = true;
-    defer if (call_roots_active) call_root_frame.pop();
+    defer if (call_roots_active) call_root_frame.detach();
 
     var keyword_capacity = count;
     for (code.call_arguments[start..][0..count]) |argument| {

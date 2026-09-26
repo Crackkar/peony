@@ -1176,13 +1176,28 @@ pub fn attributeNative(receiver: Value, name: []const u8) ?functions.Native {
     if (string.fromHeader(header) != null) {
         if (std.mem.eql(u8, name, "format")) return .str_format;
         if (std.mem.eql(u8, name, "find")) return .str_find;
+        if (std.mem.eql(u8, name, "rfind")) return .str_rfind;
         if (std.mem.eql(u8, name, "index")) return .str_index;
+        if (std.mem.eql(u8, name, "rindex")) return .str_rindex;
         if (std.mem.eql(u8, name, "split")) return .str_split;
+        if (std.mem.eql(u8, name, "rsplit")) return .str_rsplit;
+        if (std.mem.eql(u8, name, "splitlines")) return .str_splitlines;
         if (std.mem.eql(u8, name, "join")) return .str_join;
         if (std.mem.eql(u8, name, "strip")) return .str_strip;
+        if (std.mem.eql(u8, name, "lstrip")) return .str_lstrip;
+        if (std.mem.eql(u8, name, "rstrip")) return .str_rstrip;
         if (std.mem.eql(u8, name, "upper")) return .str_upper;
         if (std.mem.eql(u8, name, "lower")) return .str_lower;
+        if (std.mem.eql(u8, name, "title")) return .str_title;
+        if (std.mem.eql(u8, name, "capitalize")) return .str_capitalize;
+        if (std.mem.eql(u8, name, "isdigit")) return .str_isdigit;
+        if (std.mem.eql(u8, name, "isdecimal")) return .str_isdecimal;
+        if (std.mem.eql(u8, name, "isalpha")) return .str_isalpha;
+        if (std.mem.eql(u8, name, "isalnum")) return .str_isalnum;
+        if (std.mem.eql(u8, name, "isspace")) return .str_isspace;
         if (std.mem.eql(u8, name, "replace")) return .str_replace;
+        if (std.mem.eql(u8, name, "removeprefix")) return .str_removeprefix;
+        if (std.mem.eql(u8, name, "removesuffix")) return .str_removesuffix;
         if (std.mem.eql(u8, name, "count")) return .str_count;
         if (std.mem.eql(u8, name, "startswith")) return .str_startswith;
         if (std.mem.eql(u8, name, "endswith")) return .str_endswith;

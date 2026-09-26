@@ -46,6 +46,27 @@ pub const RootFrame = struct {
         }
         self.* = .{};
     }
+
+    /// A call may start a resumable task whose root frame outlives the call's
+    /// temporary frame. Remove the temporary frame without disturbing the task.
+    pub fn detach(self: *RootFrame) void {
+        const stack = self.stack orelse unreachable;
+        if (stack.top_frame == self) return self.pop();
+        var above = stack.top_frame orelse unreachable;
+        while (above.previous) |previous| : (above = previous) {
+            if (previous != self) continue;
+            above.previous = self.previous;
+            var root = self.roots;
+            while (root) |slot| {
+                const next = slot.previous;
+                slot.previous = null;
+                root = next;
+            }
+            self.* = .{};
+            return;
+        }
+        unreachable;
+    }
 };
 
 pub const Root = struct {

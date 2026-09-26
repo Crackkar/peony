@@ -84,11 +84,9 @@ test('Peony starts each run in a fresh Python world and reports structured excep
   assert.match(error.error.message, /value/);
   assert.equal(error.frames[0].filename, 'fresh.py');
   assert.equal(chunks.join(''), '42\n');
-  const firstHandle = session.handle;
   const firstStart = chunks.length;
   assert.equal((await session.run('print(hash("per-run-seed"))\n')).status, 'completed');
   const firstHash = chunks.slice(firstStart).join('');
-  assert.notEqual(session.handle, firstHandle, 'each run receives a newly created raw session');
   const secondStart = chunks.length;
   assert.equal((await session.run('print(hash("per-run-seed"))\n')).status, 'completed');
   assert.notEqual(chunks.slice(secondStart).join(''), firstHash, 'each fresh run receives a new per-session hash seed');
@@ -134,22 +132,33 @@ test('Peony rejects overlapping runs and hard-cancels pending input without fina
   const output = [];
   let resolveInput;
   let inputCalled = false;
+  let signalInputStarted;
+  const inputStarted = new Promise(resolve => { signalInputStarted = resolve; });
   const session = peony.createSession({
     stdout: (chunk) => output.push(chunk),
     input: () => {
       inputCalled = true;
+      signalInputStarted();
       return new Promise((resolve) => { resolveInput = resolve; });
     },
   });
   const running = session.run('try:\n    input("stop: ")\nfinally:\n    print("must not run")\n');
-  for (let index = 0; index < 100 && !inputCalled; index += 1) await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(inputCalled, true);
-  await assert.rejects(session.run('print("overlap")\n'), /already running/i);
-  session.cancel();
-  const result = await running;
-  assert.equal(result.status, 'cancelled');
-  assert.equal(output.join(''), 'stop: ');
-  assert.equal(resolveInput instanceof Function, true);
+  let timeout;
+  try {
+    await Promise.race([inputStarted, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('input callback did not start')), 5_000); })]);
+    assert.equal(inputCalled, true);
+    await assert.rejects(session.run('print("overlap")\n'), /already running/i);
+    session.cancel();
+    const result = await running;
+    assert.equal(result.status, 'cancelled');
+    assert.equal(output.join(''), 'stop: ');
+    assert.equal(resolveInput instanceof Function, true);
+  } finally {
+    clearTimeout(timeout);
+    session.cancel();
+    await peony.terminate();
+    await running.catch(() => {});
+  }
 });
 
 test('Peony reset aborts a pending run and restores a clean session', async () => {

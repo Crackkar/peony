@@ -235,6 +235,40 @@ export fn peony_work_count(handle: u32) u64 {
     return slot.runtime.workCount();
 }
 
+export fn peony_session_live_bytes(handle: u32) u64 {
+    const slot = sessionSlot(handle) orelse return 0;
+    return slot.runtime.session_allocator.live_bytes;
+}
+
+export fn peony_session_peak_bytes(handle: u32) u64 {
+    const slot = sessionSlot(handle) orelse return 0;
+    return slot.runtime.session_allocator.peak_bytes;
+}
+
+export fn peony_gc_object_count(handle: u32) u64 {
+    const slot = sessionSlot(handle) orelse return 0;
+    return slot.runtime.heap.object_count;
+}
+
+export fn peony_gc_collection_count(handle: u32) u64 {
+    const slot = sessionSlot(handle) orelse return 0;
+    return slot.runtime.heap.collection_count;
+}
+
+export fn peony_vfs_total_bytes(handle: u32) u64 {
+    const slot = sessionSlot(handle) orelse return 0;
+    return slot.runtime.vfs.total_bytes;
+}
+
+/// The caller must serialize this with VM work. The runtime's permanent roots
+/// remain registered while the collector traces the session heap.
+export fn peony_collect_garbage(handle: u32) u32 {
+    const slot = sessionSlot(handle) orelse return status(Status.invalid_handle);
+    if (slot.runtime.heap.collecting) return status(Status.invalid_argument);
+    _ = slot.runtime.heap.collect();
+    return status(Status.ok);
+}
+
 export fn peony_stdout_ptr(handle: u32) u32 {
     const slot = sessionSlot(handle) orelse return 0;
     const bytes = slot.runtime.stdout();

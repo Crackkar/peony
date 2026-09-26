@@ -52,6 +52,8 @@ const truncateUtf8 = @import("text.zig").truncateUtf8;
 const trimInputEnding = @import("runtime.zig").trimInputEnding;
 const trimFloatZeros = @import("text.zig").trimFloatZeros;
 const roundDecimalTieEven = @import("text.zig").roundDecimalTieEven;
+const builtin_tail = @import("builtin_tail.zig");
+const text_ops = @import("text.zig");
 
 pub fn executeNativeCall(
     self: *Runtime,
@@ -155,6 +157,7 @@ pub fn executeOtherNativeCall(
     line: u32,
     column: u32,
 ) bool {
+    if (builtin_tail.isTailNative(native)) return builtin_tail.execute(self, destination, native, positional, keywords, line, column);
     switch (native) {
         .isinstance_builtin => {
             if (positional.len != 2 or keywords.len != 0) return self.nativeArity(line, column);
@@ -631,10 +634,19 @@ pub fn executeOtherNativeCall(
                 else => return self.engineFault(),
             }
         },
-        .str_find, .str_index, .str_split, .str_join, .str_strip, .str_upper, .str_lower, .str_replace, .str_count, .str_startswith, .str_endswith, .str_encode, .str_format => {
+        .str_find, .str_index, .str_split, .str_join, .str_strip, .str_upper, .str_lower, .str_replace, .str_count, .str_startswith, .str_endswith, .str_encode, .str_format,
+        .str_lstrip, .str_rstrip, .str_rsplit, .str_splitlines, .str_rfind, .str_rindex, .str_title, .str_capitalize,
+        .str_isdigit, .str_isdecimal, .str_isalpha, .str_isalnum, .str_isspace, .str_removeprefix, .str_removesuffix,
+        => {
             const header = bound_self.asObject() orelse return self.engineFault();
             const text = string.fromHeader(header) orelse return self.engineFault();
             if (native == .str_format) return self.executeStrFormat(destination, text, positional, keywords, line, column);
+            switch (native) {
+                .str_lstrip, .str_rstrip, .str_rsplit, .str_splitlines, .str_rfind, .str_rindex, .str_title, .str_capitalize,
+                .str_isdigit, .str_isdecimal, .str_isalpha, .str_isalnum, .str_isspace, .str_removeprefix, .str_removesuffix,
+                => return text_ops.executeStringTailNative(self, destination, native, text, positional, keywords, line, column),
+                else => {},
+            }
             return self.executeStringNative(destination, native, text, positional, keywords, line, column);
         },
         .bytes_split, .bytes_find, .bytes_decode => {
@@ -1824,6 +1836,7 @@ pub fn joinStringResult(self: *Runtime, destination: u16, separator: *string.Str
 }
 
 pub fn builtinNative(name: []const u8) ?functions.Native {
+    if (builtin_tail.nativeByName(name)) |native| return native;
     if (std.mem.eql(u8, name, "bool")) return .bool_constructor;
     if (std.mem.eql(u8, name, "open")) return .open;
     if (std.mem.eql(u8, name, "str")) return .str_constructor;

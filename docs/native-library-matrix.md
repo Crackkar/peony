@@ -1,6 +1,6 @@
 # Native library conformance map
 
-Every library implementation in this map is Zig code compiled into `peony.wasm`. Python text in the linked tests is learner source. The native tests run through the one VM/Value/GC graph; the WASM and ESM tests instantiate the shipping artifact. The contract and excluded APIs are in the project plan §19; this file points reviewers to the executable checks for each admitted surface.
+This is the **Commit 21 native-library snapshot**. Every library implementation in this map is Zig code compiled into `peony.wasm`. Python text in the linked tests is learner source. The native tests run through the one VM/Value/GC graph; the C21 raw-WASM and ESM tests exercised the shipping artifact. Commit 22 makes the public ESM path Worker-only and adds Worker/showcase coverage while retaining raw-WASM ABI tests internally. The contract and excluded APIs are in the project plan §19; this file points reviewers to the executable checks for each admitted surface.
 
 | §19 surface | Exact admitted names and parameters | Native checks | Shipping WASM / host checks |
 |---|---|---|---|

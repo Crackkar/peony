@@ -15,20 +15,20 @@ test('Peony session mounts, reads, writes and lists copied file bytes', async ()
   const peony = await loadPeony();
   const session = peony.createSession();
   const mounted = new TextEncoder().encode('course text');
-  session.mount({ '/course/lesson.txt': mounted }, { root: '/course' });
-  session.mount({ 'unit/part.txt': 'nested course text' }, { root: '/course' });
+  await session.mount({ '/course/lesson.txt': mounted }, { root: '/course' });
+  await session.mount({ 'unit/part.txt': 'nested course text' }, { root: '/course' });
   mounted.fill(0);
-  assert.equal(new TextDecoder().decode(session.readFile('/course/lesson.txt')), 'course text');
-  assert.equal(new TextDecoder().decode(session.readFile('/course/unit/part.txt')), 'nested course text');
-  session.writeFile('/home/note.txt', new TextEncoder().encode('learner data'));
-  const read = session.readFile('/home/note.txt');
+  assert.equal(new TextDecoder().decode(await session.readFile('/course/lesson.txt')), 'course text');
+  assert.equal(new TextDecoder().decode(await session.readFile('/course/unit/part.txt')), 'nested course text');
+  await session.writeFile('/home/note.txt', new TextEncoder().encode('learner data'));
+  const read = await session.readFile('/home/note.txt');
   assert.equal(new TextDecoder().decode(read), 'learner data');
   read.fill(0);
-  assert.equal(new TextDecoder().decode(session.readFile('/home/note.txt')), 'learner data');
-  assert.deepEqual(session.listFiles('/home'), ['/home/note.txt']);
-  assert.throws(() => session.writeFile('/course/lesson.txt', new Uint8Array([1])), /read.only|permission/i);
-  assert.throws(() => session.readFile('/../../escape'), /path|traversal|invalid/i);
-  session.destroy();
+  assert.equal(new TextDecoder().decode(await session.readFile('/home/note.txt')), 'learner data');
+  assert.deepEqual(await session.listFiles('/home'), ['/home/note.txt']);
+  await assert.rejects(session.writeFile('/course/lesson.txt', new Uint8Array([1])), /read.only|permission/i);
+  await assert.rejects(session.readFile('/../../escape'), /path|traversal|invalid/i);
+  await session.destroy();
 });
 
 test('ESM VFS file APIs reject non-string paths without coercion', async () => {
@@ -39,11 +39,11 @@ test('ESM VFS file APIs reject non-string paths without coercion', async () => {
     assert.throws(() => session.readFile(null), TypeError);
     assert.throws(() => session.listFiles(null), TypeError);
     const symbolPaths = { [Symbol('path')]: 'x' };
-    assert.throws(() => session.mount(symbolPaths), TypeError);
-    assert.throws(() => session.mount({ '/course/file.txt': 'x' }, { root: null }), TypeError);
-    assert.deepEqual(session.listFiles('/home'), []);
+    await assert.rejects(session.mount(symbolPaths), TypeError);
+    await assert.rejects(session.mount({ '/course/file.txt': 'x' }, { root: null }), TypeError);
+    assert.deepEqual(await session.listFiles('/home'), []);
   } finally {
-    session.destroy();
+    await session.destroy();
   }
 });
 
@@ -51,12 +51,12 @@ test('session VFS and per-file byte limits are configurable', async () => {
   const peony = await loadPeony();
   assert.throws(() => peony.createSession({ maxVfsBytes: 64, maxFileBytes: 65 }), RangeError);
   const session = peony.createSession({ maxVfsBytes: 128, maxFileBytes: 64 });
-  session.writeFile('/home/first.bin', new Uint8Array(64));
-  session.writeFile('/home/second.bin', new Uint8Array(64));
-  assert.throws(() => session.writeFile('/home/third.bin', new Uint8Array(1)), /memory|limit|large/i);
-  assert.throws(() => session.writeFile('/home/oversized.bin', new Uint8Array(65)), /memory|limit|large/i);
-  assert.equal(session.readFile('/home/first.bin').length, 64);
-  session.destroy();
+  await session.writeFile('/home/first.bin', new Uint8Array(64));
+  await session.writeFile('/home/second.bin', new Uint8Array(64));
+  await assert.rejects(session.writeFile('/home/third.bin', new Uint8Array(1)), /memory|limit|large/i);
+  await assert.rejects(session.writeFile('/home/oversized.bin', new Uint8Array(65)), /memory|limit|large/i);
+  assert.equal((await session.readFile('/home/first.bin')).length, 64);
+  await session.destroy();
 });
 
 test('file modes, encoding, binary writes and text seek cookies follow Python', async () => {
@@ -105,7 +105,7 @@ test('file modes, encoding, binary writes and text seek cookies follow Python', 
   const result = await session.run(source);
   assert.equal(result.status, 'completed', result.error?.message);
   assert.equal(output.join(''), "\nabc\nabcd\naXcd\nα\nβ\nβ\nmode error\nencoding error\nbinary type error\n");
-  session.destroy();
+  await session.destroy();
 });
 
 test('persistent VFS snapshot does not need a second session copy of file contents', async () => {
@@ -117,23 +117,23 @@ test('persistent VFS snapshot does not need a second session copy of file conten
     maxVfsBytes: 500_000,
     maxFileBytes: 450_000,
   });
-  session.writeFile('/home/bulk.bin', new Uint8Array(400_000).fill(0x61));
+  await session.writeFile('/home/bulk.bin', new Uint8Array(400_000).fill(0x61));
   let result = await session.run('print(\"first\")\n');
   assert.equal(result.status, 'completed');
   result = await session.run('print(\"second\")\n');
   assert.equal(result.status, 'completed', result.error?.message);
-  const copied = session.readFile('/home/bulk.bin');
+  const copied = await session.readFile('/home/bulk.bin');
   assert.equal(copied.length, 400_000);
   assert.equal(copied[0], 0x61);
   assert.equal(output.join(''), 'first\nsecond\n');
-  session.destroy();
+  await session.destroy();
 });
 
 test('ESM fresh runs retain course and home but clear temporary files and reset does too', async () => {
   const peony = await loadPeony();
   const output = [];
   const session = peony.createSession({ stdout: (chunk) => output.push(chunk) });
-  session.mount({ '/course/lesson.txt': new TextEncoder().encode('course') });
+  await session.mount({ '/course/lesson.txt': new TextEncoder().encode('course') });
   let result = await session.run([
     'with open("/home/notes.txt", "w") as file:',
     '    file.write("home")',
@@ -142,7 +142,6 @@ test('ESM fresh runs retain course and home but clear temporary files and reset 
     '',
   ].join('\n'));
   assert.equal(result.status, 'completed');
-  const previousHandle = session.handle;
 
   result = await session.run([
     'print(open("/course/lesson.txt").read())',
@@ -154,13 +153,12 @@ test('ESM fresh runs retain course and home but clear temporary files and reset 
     '',
   ].join('\n'));
   assert.equal(result.status, 'completed');
-  assert.notEqual(session.handle, previousHandle);
   assert.equal(output.join(''), 'course\nhome\ntmp cleared\n');
 
-  session.writeFile('/tmp/reset.txt', new TextEncoder().encode('tmp'));
+  await session.writeFile('/tmp/reset.txt', new TextEncoder().encode('tmp'));
   await session.reset();
-  assert.equal(new TextDecoder().decode(session.readFile('/home/notes.txt')), 'home');
-  assert.equal(new TextDecoder().decode(session.readFile('/course/lesson.txt')), 'course');
-  assert.throws(() => session.readFile('/tmp/reset.txt'), /not found|missing/i);
-  session.destroy();
+  assert.equal(new TextDecoder().decode(await session.readFile('/home/notes.txt')), 'home');
+  assert.equal(new TextDecoder().decode(await session.readFile('/course/lesson.txt')), 'course');
+  await assert.rejects(session.readFile('/tmp/reset.txt'), /not found|missing/i);
+  await session.destroy();
 });

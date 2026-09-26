@@ -11,6 +11,7 @@ const dict_module = @import("runtime_dict");
 const exceptions = @import("runtime_exception");
 const iterator = @import("runtime_iterator");
 const binder = @import("runtime_binder");
+const functions = @import("runtime_function");
 const format_rules = @import("runtime_format_rules");
 const file_module = @import("runtime_file");
 const class_module = @import("runtime_class");
@@ -47,6 +48,226 @@ const dictKeysEqual = @import("operations.zig").dictKeysEqual;
 const DictEqualityContext = @import("operations.zig").DictEqualityContext;
 const mroContains = @import("objects.zig").mroContains;
 const trimInputEnding = @import("runtime.zig").trimInputEnding;
+
+pub fn executeStringTailNative(
+    self: *Runtime,
+    destination: u16,
+    native: functions.Native,
+    text: *string.Str,
+    positional: []const Value,
+    keywords: []const binder.Keyword,
+    line: u32,
+    column: u32,
+) bool {
+    switch (native) {
+        .str_lstrip, .str_rstrip => {
+            if (keywords.len != 0) return self.nativeTypeError(line, column, "string method does not accept keyword arguments");
+            if (positional.len > 1) return self.nativeArity(line, column);
+            const chars = if (positional.len == 0 or positional[0].tag() == .none)
+                null
+            else
+                self.valueString(positional[0]) orelse return self.nativeTypeError(line, column, "strip characters must be a string or None");
+            if (!chargeStringWork(self, text)) return false;
+            const result = if (native == .str_lstrip) string.lstrip(&self.heap, text, chars) else string.rstrip(&self.heap, text, chars);
+            return self.storeStringResult(destination, result, line, column);
+        },
+        .str_rsplit => {
+            if (positional.len > 2) return self.nativeArity(line, column);
+            var separator_value = if (positional.len >= 1) positional[0] else Value.noneValue();
+            var maxsplit_value = if (positional.len >= 2) positional[1] else Value.fromSmallInt(-1).?;
+            var saw_separator = positional.len >= 1;
+            var saw_maxsplit = positional.len >= 2;
+            for (keywords) |keyword| {
+                if (std.mem.eql(u8, keyword.name, "sep")) {
+                    if (saw_separator) return self.nativeTypeError(line, column, "multiple values for argument 'sep'");
+                    separator_value = keyword.value;
+                    saw_separator = true;
+                } else if (std.mem.eql(u8, keyword.name, "maxsplit")) {
+                    if (saw_maxsplit) return self.nativeTypeError(line, column, "multiple values for argument 'maxsplit'");
+                    maxsplit_value = keyword.value;
+                    saw_maxsplit = true;
+                } else return self.nativeTypeError(line, column, "rsplit received an unexpected keyword argument");
+            }
+            const max_splits = stringSplitLimit(self, maxsplit_value, line, column) orelse return false;
+            if (!chargeStringWork(self, text)) return false;
+            if (separator_value.tag() == .none) {
+                return storeStringParts(self, destination, text, string.rsplitWhitespace(text, max_splits.value), true, line, column);
+            }
+            const separator = self.valueString(separator_value) orelse return self.nativeTypeError(line, column, "separator must be a string or None");
+            const split = string.rsplit(text, separator, max_splits.value);
+            const parts = switch (split) {
+                .value => |value| value,
+                .python_exception => |exception| {
+                    self.setException(exception, line, column, null);
+                    return false;
+                },
+                .engine_error => return self.engineFault(),
+            };
+            return storeStringParts(self, destination, text, parts, true, line, column);
+        },
+        .str_splitlines => {
+            if (positional.len > 1) return self.nativeArity(line, column);
+            var keep_ends_value = if (positional.len == 1) positional[0] else Value.falseValue();
+            var supplied = positional.len == 1;
+            for (keywords) |keyword| {
+                if (!std.mem.eql(u8, keyword.name, "keepends")) return self.nativeTypeError(line, column, "splitlines received an unexpected keyword argument");
+                if (supplied) return self.nativeTypeError(line, column, "multiple values for argument 'keepends'");
+                keep_ends_value = keyword.value;
+                supplied = true;
+            }
+            const keep_ends = self.valueTruthy(keep_ends_value, line, column) orelse return false;
+            if (!chargeStringWork(self, text)) return false;
+            return storeStringParts(self, destination, text, string.splitlines(text, keep_ends), false, line, column);
+        },
+        .str_rfind, .str_rindex => {
+            if (keywords.len != 0) return self.nativeTypeError(line, column, "string method does not accept keyword arguments");
+            if (positional.len < 1 or positional.len > 3) return self.nativeArity(line, column);
+            const needle = self.valueString(positional[0]) orelse return self.nativeTypeError(line, column, "substring must be a string");
+            const start = if (positional.len >= 2) stringSearchBound(self, positional[1], line, column) orelse return false else 0;
+            const stop = if (positional.len >= 3 and positional[2].tag() != .none)
+                stringSearchBound(self, positional[2], line, column) orelse return false
+            else
+                null;
+            if (!chargeStringWork(self, text)) return false;
+            const found = string.rfind(text, needle, start, stop);
+            if (native == .str_rindex and found == null) {
+                self.setException(.{ .kind = .value_error, .message = "substring not found" }, line, column, null);
+                return false;
+            }
+            const result: i64 = if (found) |index| std.math.cast(i64, index) orelse return self.nativeTypeError(line, column, "string is too large to search") else -1;
+            return self.setSmallInt(destination, result, line, column);
+        },
+        .str_title, .str_capitalize => {
+            if (keywords.len != 0 or positional.len != 0) return self.nativeArity(line, column);
+            if (!chargeStringWork(self, text)) return false;
+            const result = if (native == .str_title) string.title(&self.heap, text) else string.capitalize(&self.heap, text);
+            return self.storeStringResult(destination, result, line, column);
+        },
+        .str_isdigit, .str_isdecimal, .str_isalpha, .str_isalnum, .str_isspace => {
+            if (keywords.len != 0 or positional.len != 0) return self.nativeArity(line, column);
+            if (!chargeStringWork(self, text)) return false;
+            const yes = switch (native) {
+                .str_isdigit => string.isDigit(text),
+                .str_isdecimal => string.isDecimal(text),
+                .str_isalpha => string.isAlpha(text),
+                .str_isalnum => string.isAlnum(text),
+                .str_isspace => string.isSpace(text),
+                else => unreachable,
+            };
+            self.setRegister(destination, if (yes) Value.trueValue() else Value.falseValue());
+            return true;
+        },
+        .str_removeprefix, .str_removesuffix => {
+            if (keywords.len != 0) return self.nativeTypeError(line, column, "string method does not accept keyword arguments");
+            if (positional.len != 1) return self.nativeArity(line, column);
+            const affix = self.valueString(positional[0]) orelse return self.nativeTypeError(line, column, "prefix or suffix must be a string");
+            if (!chargeStringWork(self, text)) return false;
+            const result = if (native == .str_removeprefix)
+                string.removePrefix(&self.heap, text, affix)
+            else
+                string.removeSuffix(&self.heap, text, affix);
+            return self.storeStringResult(destination, result, line, column);
+        },
+        else => return self.engineFault(),
+    }
+}
+
+const SplitLimit = struct { value: ?usize };
+
+fn chargeStringWork(self: *Runtime, text: *const string.Str) bool {
+    return self.chargeBulkWork(@intCast(@max(text.data.len, 1)));
+}
+
+fn stringSplitLimit(self: *Runtime, value: Value, line: u32, column: u32) ?SplitLimit {
+    if (!number.isIntegerValue(value)) {
+        self.setException(.{ .kind = .type_error, .message = "maxsplit must be an integer" }, line, column, null);
+        return null;
+    }
+    if (number.toInt(i128, value)) |integer| {
+        if (integer < 0) return .{ .value = null };
+        return .{ .value = std.math.cast(usize, integer) orelse std.math.maxInt(usize) };
+    }
+    return switch (number.compare(value, Value.fromSmallInt(0).?)) {
+        .value => |order| .{ .value = if (order == .greater) std.math.maxInt(usize) else null },
+        .python_exception => |exception| blk: {
+            self.setException(exception, line, column, null);
+            break :blk null;
+        },
+        .engine_error => blk: {
+            _ = self.engineFault();
+            break :blk null;
+        },
+    };
+}
+
+fn stringSearchBound(self: *Runtime, value: Value, line: u32, column: u32) ?i128 {
+    if (!number.isIntegerValue(value)) {
+        self.setException(.{ .kind = .type_error, .message = "slice indices must be integers or None" }, line, column, null);
+        return null;
+    }
+    if (number.toInt(i128, value)) |integer| return integer;
+    return switch (number.compare(value, Value.fromSmallInt(0).?)) {
+        .value => |order| if (order == .greater) std.math.maxInt(i128) else std.math.minInt(i128),
+        .python_exception => |exception| blk: {
+            self.setException(exception, line, column, null);
+            break :blk null;
+        },
+        .engine_error => blk: {
+            _ = self.engineFault();
+            break :blk null;
+        },
+    };
+}
+
+fn storeStringParts(
+    self: *Runtime,
+    destination: u16,
+    text: *string.Str,
+    iterator_value: string.SplitIterator,
+    reverse_output: bool,
+    line: u32,
+    column: u32,
+) bool {
+    var counter = iterator_value;
+    var count: usize = 0;
+    while (counter.next() != null) count += 1;
+    const values = self.heap.allocator.alloc(Value, count) catch {
+        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+        return false;
+    };
+    defer self.heap.allocator.free(values);
+    const roots = self.heap.allocator.alloc(gc.Root, count) catch {
+        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+        return false;
+    };
+    defer self.heap.allocator.free(roots);
+    @memset(roots, .{ .object = null });
+    var frame = gc.RootFrame{};
+    frame.push(&self.heap.roots);
+    var text_root = gc.Root{ .object = &text.header };
+    frame.add(&text_root);
+    for (roots) |*root| frame.add(root);
+    defer frame.pop();
+
+    var part_index: usize = 0;
+    var parts = iterator_value;
+    while (parts.next()) |part| {
+        const created = string.create(&self.heap, part);
+        const object = switch (created) {
+            .value => |value| value,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+        const output_index = if (reverse_output) count - part_index - 1 else part_index;
+        values[output_index] = Value.object(&object.header);
+        roots[output_index].object = &object.header;
+        part_index += 1;
+    }
+    return self.storeListResult(destination, sequence.createList(&self.heap, values), line, column);
+}
 
 pub fn executeFormatValue(self: *Runtime, destination: u16, value: Value, spec: []const u8, conversion: u8, line: u32, column: u32) bool {
     const rendered = self.makeFormattedText(value, spec, conversion, line, column) orelse return false;

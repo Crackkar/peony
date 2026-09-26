@@ -953,6 +953,25 @@ pub fn currentFilename(self: *const Runtime) []const u8 {
     return "<module>";
 }
 
+/// Preserve the compiler's source position before the host releases its input
+/// transfer block. The public traceback shape is shared with runtime errors.
+pub fn prepareCompileDiagnostic(self: *Runtime, source: []const u8, filename: []const u8, line: usize, column: usize) void {
+    const allocator = self.heap.allocator;
+    const source_line = sourceLine(source, std.math.cast(u32, line) orelse std.math.maxInt(u32));
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(allocator);
+    json.appendSlice(allocator, "[{\"filename\":") catch return;
+    appendJsonString(allocator, &json, filename) catch return;
+    json.appendSlice(allocator, ",\"name\":\"<module>\",\"line\":") catch return;
+    appendJsonNumber(allocator, &json, std.math.cast(u32, line) orelse std.math.maxInt(u32)) catch return;
+    json.appendSlice(allocator, ",\"column\":") catch return;
+    appendJsonNumber(allocator, &json, std.math.cast(u32, column) orelse std.math.maxInt(u32)) catch return;
+    json.appendSlice(allocator, ",\"source_line\":") catch return;
+    appendJsonString(allocator, &json, source_line) catch return;
+    json.appendSlice(allocator, "}]") catch return;
+    self.traceback_json_owned = json.toOwnedSlice(allocator) catch return;
+}
+
 pub fn prepareExceptionDiagnostics(self: *Runtime) void {
     if (self.traceback_json_owned != null) return;
     const instance = self.active_exception orelse return;

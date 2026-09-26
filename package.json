@@ -1,0 +1,11 @@
+{
+  "name": "peony-development",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:showcase": "node tests/showcase-browser.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

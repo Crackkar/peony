@@ -11,6 +11,7 @@ const functions = @import("runtime_function");
 const binder = @import("runtime_binder");
 const class_module = @import("runtime_class");
 const native_types = @import("../stdlib/types.zig");
+const builtin_tail = @import("builtin_tail.zig");
 
 const Runtime = @import("runtime.zig").Runtime;
 const state = @import("state.zig");
@@ -761,6 +762,7 @@ pub fn advanceSyncTask(self: *Runtime) bool {
                 .engine_error => return self.engineFault(),
             }
         }
+        if (builtin_tail.isTailTask(task.operation)) return builtin_tail.advanceTask(self, task, &remaining);
         const target = task.target orelse return self.engineFault();
         switch (task.phase) {
             .collect => {

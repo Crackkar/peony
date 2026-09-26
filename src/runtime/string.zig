@@ -21,8 +21,15 @@ pub const SplitIterator = struct {
     position: usize = 0,
     finished: bool = false,
     whitespace: bool = false,
+    reverse: bool = false,
+    max_splits: ?usize = null,
+    split_count: usize = 0,
+    lines: bool = false,
+    keep_ends: bool = false,
 
     pub fn next(self: *SplitIterator) ?[]const u8 {
+        if (self.lines) return self.nextLine();
+        if (self.reverse) return self.nextReverse();
         if (self.whitespace) {
             while (self.position < self.source.len and unicode.hasProperty(codepointAt(self.source, self.position), .whitespace)) {
                 self.position = nextOffset(self.source, self.position);
@@ -45,6 +52,69 @@ pub const SplitIterator = struct {
         const item = self.source[self.position..];
         self.position = self.source.len;
         return item;
+    }
+
+    fn nextReverse(self: *SplitIterator) ?[]const u8 {
+        if (self.finished) return null;
+        if (self.whitespace) {
+            var end = self.position;
+            while (end > 0) {
+                const previous = previousOffset(self.source, end);
+                if (!unicode.hasProperty(codepointAt(self.source, previous), .whitespace)) break;
+                end = previous;
+            }
+            if (end == 0) {
+                self.finished = true;
+                self.position = 0;
+                return null;
+            }
+            if (self.max_splits) |limit| if (self.split_count >= limit) {
+                self.finished = true;
+                self.position = 0;
+                return self.source[0..end];
+            };
+            var start = end;
+            while (start > 0) {
+                const previous = previousOffset(self.source, start);
+                if (unicode.hasProperty(codepointAt(self.source, previous), .whitespace)) break;
+                start = previous;
+            }
+            self.position = start;
+            self.split_count += 1;
+            return self.source[start..end];
+        }
+        if (self.max_splits) |limit| if (self.split_count >= limit) {
+            self.finished = true;
+            const item = self.source[0..self.position];
+            self.position = 0;
+            return item;
+        };
+        if (std.mem.lastIndexOf(u8, self.source[0..self.position], self.separator)) |found| {
+            const item = self.source[found + self.separator.len .. self.position];
+            self.position = found;
+            self.split_count += 1;
+            return item;
+        }
+        self.finished = true;
+        const item = self.source[0..self.position];
+        self.position = 0;
+        return item;
+    }
+
+    fn nextLine(self: *SplitIterator) ?[]const u8 {
+        if (self.position >= self.source.len) return null;
+        const start = self.position;
+        var cursor = start;
+        while (cursor < self.source.len) {
+            const ending = lineEndingLength(self.source, cursor);
+            if (ending != 0) {
+                self.position = cursor + ending;
+                return self.source[start .. if (self.keep_ends) self.position else cursor];
+            }
+            cursor = nextOffset(self.source, cursor);
+        }
+        self.position = self.source.len;
+        return self.source[start..];
     }
 };
 
@@ -157,6 +227,18 @@ pub fn find(value: *const Str, needle: []const u8) ?usize {
     return std.unicode.utf8CountCodepoints(value.data[0..byte_index]) catch unreachable;
 }
 
+pub fn rfind(value: *const Str, needle: []const u8, start: i128, stop: ?i128) ?usize {
+    const codepoint_count: i128 = @intCast(std.unicode.utf8CountCodepoints(value.data) catch unreachable);
+    if (start > codepoint_count) return null;
+    const normalized_start = normalizeSearchBound(start, codepoint_count);
+    const normalized_stop = normalizeSearchBound(stop orelse codepoint_count, codepoint_count);
+    if (normalized_start > normalized_stop) return null;
+    const byte_start = byteOffset(value.data, @intCast(normalized_start));
+    const byte_stop = byteOffset(value.data, @intCast(normalized_stop));
+    const relative = std.mem.lastIndexOf(u8, value.data[byte_start..byte_stop], needle) orelse return null;
+    return std.unicode.utf8CountCodepoints(value.data[0 .. byte_start + relative]) catch unreachable;
+}
+
 pub fn startsWith(value: *const Str, prefix: []const u8) bool {
     return std.mem.startsWith(u8, value.data, prefix);
 }
@@ -172,6 +254,37 @@ pub fn split(value: *Str, separator: []const u8) SplitResult {
 
 pub fn splitWhitespace(value: *Str) SplitIterator {
     return .{ .source = value.data, .separator = "", .whitespace = true };
+}
+
+pub fn rsplit(value: *Str, separator: []const u8, max_splits: ?usize) SplitResult {
+    if (separator.len == 0) return pythonError(SplitIterator, .value_error, "empty separator");
+    return .{ .value = .{
+        .source = value.data,
+        .separator = separator,
+        .position = value.data.len,
+        .reverse = true,
+        .max_splits = max_splits,
+    } };
+}
+
+pub fn rsplitWhitespace(value: *Str, max_splits: ?usize) SplitIterator {
+    return .{
+        .source = value.data,
+        .separator = "",
+        .position = value.data.len,
+        .whitespace = true,
+        .reverse = true,
+        .max_splits = max_splits,
+    };
+}
+
+pub fn splitlines(value: *Str, keep_ends: bool) SplitIterator {
+    return .{
+        .source = value.data,
+        .separator = "",
+        .lines = true,
+        .keep_ends = keep_ends,
+    };
 }
 
 pub fn join(heap: *gc.Heap, separator: []const u8, parts: []const []const u8) StringResult {
@@ -212,6 +325,35 @@ pub fn strip(heap: *gc.Heap, value: *Str, strip_chars: ?[]const u8) StringResult
         end = previous;
     }
     return create(heap, value.data[start..end]);
+}
+
+pub fn lstrip(heap: *gc.Heap, value: *Str, strip_chars: ?[]const u8) StringResult {
+    var roots = RootScope{};
+    roots.push(heap, value, null);
+    defer roots.pop();
+
+    var start: usize = 0;
+    while (start < value.data.len) {
+        const cp = codepointAt(value.data, start);
+        if (!isStripChar(cp, strip_chars)) break;
+        start = nextOffset(value.data, start);
+    }
+    return create(heap, value.data[start..]);
+}
+
+pub fn rstrip(heap: *gc.Heap, value: *Str, strip_chars: ?[]const u8) StringResult {
+    var roots = RootScope{};
+    roots.push(heap, value, null);
+    defer roots.pop();
+
+    var end = value.data.len;
+    while (end > 0) {
+        const previous = previousOffset(value.data, end);
+        const cp = codepointAt(value.data, previous);
+        if (!isStripChar(cp, strip_chars)) break;
+        end = previous;
+    }
+    return create(heap, value.data[0..end]);
 }
 
 pub fn replace(
@@ -471,6 +613,23 @@ fn containsCodepoint(value: []const u8, target: u21) bool {
         offset = nextOffset(value, offset);
     }
     return false;
+}
+
+fn normalizeSearchBound(value: i128, length_value: i128) i128 {
+    const adjusted = if (value < 0) value + length_value else value;
+    return @min(@max(adjusted, 0), length_value);
+}
+
+fn lineEndingLength(value: []const u8, offset: usize) usize {
+    const cp = codepointAt(value, offset);
+    if (cp == '\r') {
+        const next = nextOffset(value, offset);
+        if (next < value.len and value[next] == '\n') return 2;
+        return 1;
+    }
+    if (cp == '\n' or cp == 0x0b or cp == 0x0c or (cp >= 0x1c and cp <= 0x1e)) return 1;
+    if (cp == 0x85 or cp == 0x2028 or cp == 0x2029) return nextOffset(value, offset) - offset;
+    return 0;
 }
 
 fn byteOffset(value: []const u8, codepoint_index: usize) usize {

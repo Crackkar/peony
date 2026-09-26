@@ -6,13 +6,22 @@ Peony v0.1 is pinned to Zig `0.16.0`. The shipping build targets `wasm32-freesta
 zig version
 zig build test
 zig build wasm
-node --test --test-concurrency=1 tests/*.test.mjs
-node tools/size_report.mjs
+node --test --test-concurrency=1 --test-skip-pattern "size report" tests/*.test.mjs
 ```
 
-`zig build wasm` installs `zig-out/peony.wasm`. Build output and compiler caches stay ignored. The sequential Node suite exercises the shipping artifact directly through WebAssembly, including packet/config validation, resumable `input()`, flush boundaries, instruction/work limits, cancellation, traceback views, stale handles, and per-session isolation. `tests/web-session.test.mjs` also exercises the direct ESM facade, URL/Response/byte loading, fresh runs, host callbacks, pending-input reset, and browser-task yielding.
+`zig build wasm` installs `zig-out/peony.wasm`. Build output and compiler caches stay ignored. Raw-WASM Node tests verify the internal ABI; public session tests exercise the Worker-only ESM facade. Browser execution always compiles and runs WASM in the Worker. The C22 showcase uses a local static server and Playwright headless to check real editor, input, error and cancellation flows.
 
-The size report uses Node's built-in Brotli encoder at quality 11. It builds the shipping artifact and separate artifacts that add one `std.math.big.int.Managed` multiplication, a `std.json.Stringify` call, or a generated Unicode-15.0.0 classification/case-mapping table. Each probe is compared with the shipping baseline. The Unicode prototype generator requires Python whose `unicodedata` version is exactly 15.0.0; it writes the generated input and probe roots under the ignored `.zig-cache/size-probes/` directory. Probe artifacts install directly under `zig-out/`.
+To view and check the showcase after building WASM:
+
+```powershell
+npm ci
+node tools/serve_showcase.mjs
+npm run test:showcase
+```
+
+The browser check uses an installed Chrome by default; set `PEONY_BROWSER_CHANNEL=msedge` to use Edge. `playwright-core` is a development dependency and does not ship in the static showcase.
+
+For later release qualification, `node tools/size_report.mjs` uses Node's built-in Brotli encoder at quality 11. It builds the shipping artifact and separate bigint, JSON and Unicode probes. The Unicode generator reads pinned official Unicode 15 source inputs and verifies the checked-in table; it requires no Python file or local `unicodedata` version. Probe inputs stay under ignored `.zig-cache/size-probes/`, and artifacts install directly under `zig-out/`.
 
 The VM owner and opcode dispatcher live in `src/vm/runtime.zig`. Shared frame, environment, try-block, and synchronous-task state with its GC tracing lives in `src/vm/state.zig`. Execution helpers are grouped by ownership: `control.zig` for frame/control transfer and exceptions, `calls.zig` for binding and invocation, `builtins.zig` for native methods, `iteration.zig` for iterators and sorting, `text.zig` for formatting/output, `objects.zig` for attributes and collection access, `operations.zig` for operators and value semantics, and `modules.zig` for module environments and imports. `Runtime` remains the single stable session object; domain methods are linked through its typed alias table, while the bytecode dispatcher stays centralized.
 
@@ -40,4 +49,4 @@ After builds finish at a commit gate, check the repo-local cache with:
 node tools/cache_report.mjs --check --json
 ```
 
-The read-only check exits with status 1 above 512 MiB. Zig's content-addressed cache can still grow as source changes; this threshold is a maintenance trigger, not a per-build allocation limit. If it is exceeded, stop all Zig builds and coordinate manual deletion of this repository's ignored `.zig-cache` folder, then rebuild. The shared Zig global cache is outside this repository and is not part of this cleanup. Do not remove the cache during an active build.
+The read-only check exits with status 1 above 512 MiB. Zig's content-addressed cache can grow as source changes; the threshold is a maintenance signal, not a per-build allocation limit or a reason to interrupt an active sprint. Never remove the cache during an active build. The shared Zig global cache is outside this repository.

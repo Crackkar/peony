@@ -1296,6 +1296,10 @@ const Parser = struct {
     }
 
     fn parseComprehension(self: *Parser, result: NodeId, opening: usize, kind: u32, closing_text: []const u8) ParseError!NodeId {
+        return self.parseComprehensionBody(result, opening, kind, closing_text, true);
+    }
+
+    fn parseComprehensionBody(self: *Parser, result: NodeId, opening: usize, kind: u32, closing_text: []const u8, consume_closing: bool) ParseError!NodeId {
         var children: std.ArrayList(NodeId) = .empty;
         while (self.atText("for")) {
             const for_token = self.advance();
@@ -1314,8 +1318,9 @@ const Parser = struct {
             try children.append(self.allocator, clause);
         }
         try children.append(self.allocator, result);
-        const closing = try self.expectText(closing_text, if (kind == ast_module.comprehension_flags.list) "expected ']' after comprehension" else if (kind == ast_module.comprehension_flags.dict or kind == ast_module.comprehension_flags.set) "expected '}' after comprehension" else "expected ')' after generator expression");
-        return self.addNode(.comprehension_expression, .{ .start = opening, .end = closing.end }, "", kind, children.items);
+        if (!self.atText(closing_text)) return self.failAtCurrent(if (kind == ast_module.comprehension_flags.list) "expected ']' after comprehension" else if (kind == ast_module.comprehension_flags.dict or kind == ast_module.comprehension_flags.set) "expected '}' after comprehension" else "expected ')' after generator expression");
+        const end = if (consume_closing) self.advance().end else self.current().start;
+        return self.addNode(.comprehension_expression, .{ .start = opening, .end = end }, "", kind, children.items);
     }
 
     fn parseComprehensionTarget(self: *Parser) ParseError!NodeId {
@@ -1357,7 +1362,12 @@ const Parser = struct {
             } else {
                 if (saw_explicit_keyword) return self.failAtCurrent("positional argument follows keyword argument");
                 argument = try self.parseExpression(0);
-                if (self.atText("for")) return self.failUnsupported(.later_commit, "generator expressions are not parsed in this commit");
+                if (self.atText("for")) {
+                    if (arguments.items.len != 0) return self.failAtCurrent("generator expression must be parenthesized");
+                    argument = try self.parseComprehensionBody(argument, self.node(argument).span.start, ast_module.comprehension_flags.generator, ")", false);
+                    try arguments.append(self.allocator, argument);
+                    return arguments.toOwnedSlice(self.allocator);
+                }
             }
             try arguments.append(self.allocator, argument);
             if (!self.atText(",")) break;

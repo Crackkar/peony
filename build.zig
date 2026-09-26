@@ -24,6 +24,12 @@ const abi_exports = [_][]const u8{
     "peony_event_len",
     "peony_instruction_count",
     "peony_work_count",
+    "peony_session_live_bytes",
+    "peony_session_peak_bytes",
+    "peony_gc_object_count",
+    "peony_gc_collection_count",
+    "peony_vfs_total_bytes",
+    "peony_collect_garbage",
     "peony_stdout_ptr",
     "peony_stdout_len",
     "peony_stdout_consume",
@@ -338,6 +344,22 @@ pub fn build(b: *std.Build) void {
     });
     library_collections_module.addImport("runtime_vm", runtime_vm_module);
     library_collections_module.addImport("runtime_host", native_runtime.host);
+    const builtin_tail_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/builtin_tail.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    builtin_tail_module.addImport("runtime_vm", runtime_vm_module);
+    builtin_tail_module.addImport("runtime_exception", native_runtime.exception);
+    const string_tail_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/string_tail.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    string_tail_module.addImport("runtime_vm", runtime_vm_module);
+    string_tail_module.addImport("runtime_number", native_runtime.number);
+    string_tail_module.addImport("runtime_string", native_runtime.string);
+    string_tail_module.addImport("runtime_exception", native_runtime.exception);
     const unit_test_root = b.createModule(.{
         .root_source_file = b.path("tests/unit/root.zig"),
         .target = target,
@@ -375,6 +397,8 @@ pub fn build(b: *std.Build) void {
     unit_test_root.addImport("library_data_tests", library_data_module);
     unit_test_root.addImport("library_vfs_tests", library_vfs_module);
     unit_test_root.addImport("library_collections_tests", library_collections_module);
+    unit_test_root.addImport("builtin_tail_tests", builtin_tail_module);
+    unit_test_root.addImport("string_tail_tests", string_tail_module);
     const unit_tests = b.addTest(.{ .root_module = unit_test_root });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run native Peony unit tests");
@@ -435,6 +459,8 @@ pub fn build(b: *std.Build) void {
     const json_choice_step = b.step("bench-json-choice", "Compare native Value JSON paths with std.json DOM conversion");
     json_choice_step.dependOn(&json_choice_run.step);
 
+    const wasm_debug = b.option(bool, "wasm-debug", "Build stripped Debug WASM for local integration") orelse false;
+    const wasm_optimize: std.builtin.OptimizeMode = if (wasm_debug) .Debug else .ReleaseSmall;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -442,13 +468,13 @@ pub fn build(b: *std.Build) void {
     const wasm_module = b.createModule(.{
         .root_source_file = b.path("src/wasm.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = wasm_optimize,
         .single_threaded = true,
         .strip = true,
     });
-    const wasm_runtime = createRuntimeModules(b, wasm_target, .ReleaseSmall);
-    const wasm_frontend = createFrontendModules(b, wasm_target, .ReleaseSmall);
-    const wasm_vm = createExecutionVmModule(b, wasm_target, .ReleaseSmall, wasm_runtime, wasm_frontend);
+    const wasm_runtime = createRuntimeModules(b, wasm_target, wasm_optimize);
+    const wasm_frontend = createFrontendModules(b, wasm_target, wasm_optimize);
+    const wasm_vm = createExecutionVmModule(b, wasm_target, wasm_optimize, wasm_runtime, wasm_frontend);
     wasm_module.addImport("runtime_vm", wasm_vm);
     addRuntimeImports(wasm_module, wasm_runtime);
     wasm_module.export_symbol_names = abi_exports[0..];

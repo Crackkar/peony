@@ -26,6 +26,12 @@ pub fn create(heap: *gc.Heap, input: []const u8) BytesResult {
     return createOwned(heap, data);
 }
 
+pub fn zeroes(heap: *gc.Heap, count: usize) BytesResult {
+    const data = heap.allocator.alloc(u8, count) catch return memoryError();
+    @memset(data, 0);
+    return createOwned(heap, data);
+}
+
 pub fn repeat(heap: *gc.Heap, source: *const Bytes, count: usize) BytesResult {
     const total = std.math.mul(usize, source.data.len, count) catch return memoryError();
     const data = heap.allocator.alloc(u8, total) catch return memoryError();

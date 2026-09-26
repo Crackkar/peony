@@ -28,6 +28,30 @@ const library_numeric_tests = @import("library_numeric_tests");
 const library_data_tests = @import("library_data_tests");
 const library_vfs_tests = @import("library_vfs_tests");
 const library_collections_tests = @import("library_collections_tests");
+const builtin_tail_tests = @import("builtin_tail_tests");
+const string_tail_tests = @import("string_tail_tests");
+
+test "builtin numeric and text tail" {
+    try builtin_tail_tests.testNumericAndTextBuiltins();
+}
+test "builtin iterable reductions and short circuit" {
+    try builtin_tail_tests.testIterableReductionsAndShortCircuit();
+}
+test "bytes constructor forms and errors" {
+    try builtin_tail_tests.testBytesConstructorFormsAndErrors();
+}
+test "builtin tail errors and resumable work" {
+    try builtin_tail_tests.testBuiltinErrorsAndResumableWork();
+}
+test "string tail runtime primitives" {
+    try string_tail_tests.testStringTailRuntimePrimitives();
+}
+test "string tail VM methods" {
+    try string_tail_tests.testStringTailVmMethods();
+}
+test "string tail errors and memory cap" {
+    try string_tail_tests.testStringTailErrorsAndMemoryCap();
+}
 
 test "math contract" {
     try library_numeric_tests.testMathContract();
