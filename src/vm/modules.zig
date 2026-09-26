@@ -138,10 +138,12 @@ pub fn storeAnnotationEntry(self: *Runtime, mapping: *dict_module.Dict, name: []
 }
 
 pub fn executeDeleteGlobal(self: *Runtime, name: []const u8, line: u32, column: u32) bool {
-    for (self.environment.entries.items, 0..) |entry, index| {
+    const environment = self.currentEnvironmentObject();
+    for (environment.entries.items, 0..) |entry, index| {
         if (!std.mem.eql(u8, entry.name, name)) continue;
         self.heap.allocator.free(entry.name);
-        _ = self.environment.entries.orderedRemove(index);
+        _ = environment.entries.orderedRemove(index);
+        environment.shape_version +%= 1;
         return true;
     }
     self.setException(.{ .kind = .name_error, .message = "name is not defined" }, line, column, name);
@@ -152,6 +154,12 @@ pub fn globalValue(self: *const Runtime, name: []const u8) ?Value {
     const environment = self.currentEnvironmentObject();
     for (environment.entries.items) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
     return null;
+}
+
+pub fn cachedGlobalValue(self: *Runtime, code: *Code, name_index: u32) ?Value {
+    const environment = self.currentEnvironmentObject();
+    const index = resolveGlobalIndex(code, environment, name_index) orelse return null;
+    return environment.entries.items[index].value;
 }
 
 pub fn currentEnvironment(self: *const Runtime) *gc.Header {
@@ -187,6 +195,7 @@ pub fn environmentStore(self: *Runtime, environment_header: *gc.Header, name: []
         self.heap.allocator.free(owned_name);
         return false;
     };
+    environment.shape_version +%= 1;
     return true;
 }
 
@@ -197,6 +206,7 @@ pub fn createEnvironment(self: *Runtime, line: u32, column: u32) ?*Environment {
     };
     environment.entries = .empty;
     environment.module_owner = null;
+    environment.shape_version = 1;
     return environment;
 }
 
@@ -447,6 +457,7 @@ pub fn startImportedModule(self: *Runtime, name: []const u8, destination: u16, l
                 const environment: *Environment = @ptrCast(@alignCast(cached.environment));
                 for (environment.entries.items) |entry| self.heap.allocator.free(@constCast(entry.name));
                 environment.entries.clearRetainingCapacity();
+                environment.shape_version +%= 1;
                 return false;
             }
             cached.initialized = true;
@@ -803,5 +814,50 @@ pub fn storeGlobal(self: *Runtime, name: []const u8, value: Value) bool {
         self.heap.allocator.free(owned_name);
         return false;
     };
+    environment.shape_version +%= 1;
     return true;
+}
+
+pub fn storeCachedGlobal(self: *Runtime, code: *Code, name_index: u32, value: Value) bool {
+    const environment = self.currentEnvironmentObject();
+    if (resolveGlobalIndex(code, environment, name_index)) |index| {
+        environment.entries.items[index].value = value;
+        return true;
+    }
+    if (name_index >= code.names.len or !self.storeGlobal(code.names[name_index], value)) return false;
+    const index = environment.entries.items.len - 1;
+    const cache = &code.global_caches[name_index];
+    cache.* = .{
+        .environment_address = @intFromPtr(environment),
+        .shape_version = environment.shape_version,
+        .entry_index = @intCast(index),
+    };
+    return true;
+}
+
+fn resolveGlobalIndex(code: *Code, environment: *Environment, name_index: u32) ?usize {
+    const name_position: usize = @intCast(name_index);
+    if (name_position >= code.names.len or name_position >= code.global_caches.len) return null;
+    const name = code.names[name_position];
+    const cache = &code.global_caches[name_position];
+    if (cache.environment_address == @intFromPtr(environment) and cache.shape_version == environment.shape_version) {
+        if (cache.entry_index != std.math.maxInt(u32)) {
+            const cached_index: usize = @intCast(cache.entry_index);
+            if (cached_index < environment.entries.items.len and std.mem.eql(u8, environment.entries.items[cached_index].name, name)) return cached_index;
+        }
+    }
+    for (environment.entries.items, 0..) |entry, index| {
+        if (!std.mem.eql(u8, entry.name, name)) continue;
+        cache.* = .{
+            .environment_address = @intFromPtr(environment),
+            .shape_version = environment.shape_version,
+            .entry_index = @intCast(index),
+        };
+        return index;
+    }
+    cache.* = .{
+        .environment_address = @intFromPtr(environment),
+        .shape_version = environment.shape_version,
+    };
+    return null;
 }

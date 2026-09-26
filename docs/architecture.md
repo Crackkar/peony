@@ -41,6 +41,8 @@ The front end lives in `src/frontend/`. `lexer.zig` validates UTF-8, handles ind
 
 Scope resolution also fixes the storage slot for every local, cell, and free variable. Their load and store instructions carry that slot directly, so the dispatcher indexes the frame or closure cell without repeating a name lookup. Names remain in the code object for diagnostics, argument binding, class namespaces, globals, and other operations whose Python semantics are name based.
 
+Global namespaces retain ordered name/value entries because imports, module attributes, deletion, and class fallback remain dynamic. Each code object keeps a small inline cache from its interned names to validated namespace slots. A cache entry is accepted only for the same environment address and structural version; inserting, deleting, or clearing a name advances that version. Existing-name assignments keep the shape stable. Hot global loads and stores therefore become direct indexed access while namespace mutation preserves Python's name-based behavior.
+
 The compiled language includes ordinary expressions and control flow, functions and generators, class creation, imports, exceptions, context managers, comprehensions, and the documented `match` subset. The front end is a subset compiler: syntax outside the [language surface](language.md) is rejected rather than passed through to an unavailable CPython runtime.
 
 ## The VM and Python control flow

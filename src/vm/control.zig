@@ -371,10 +371,12 @@ pub fn clearExceptionTarget(self: *Runtime, frame: *Frame, block: TryBlock) void
             } else self.engine_failed = true;
         },
         3 => {
-            for (self.environment.entries.items, 0..) |entry, global_index| {
+            const environment = self.currentEnvironmentObject();
+            for (environment.entries.items, 0..) |entry, global_index| {
                 if (!std.mem.eql(u8, entry.name, name)) continue;
                 self.heap.allocator.free(entry.name);
-                _ = self.environment.entries.orderedRemove(global_index);
+                _ = environment.entries.orderedRemove(global_index);
+                environment.shape_version +%= 1;
                 return;
             }
         },

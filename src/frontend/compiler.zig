@@ -342,6 +342,8 @@ const Compiler = struct {
         self.code.try_sites = try self.try_sites.toOwnedSlice(self.allocator);
         self.code.nested_codes = try self.nested_codes.toOwnedSlice(self.allocator);
         self.code.positions = try self.positions.toOwnedSlice(self.allocator);
+        self.code.global_caches = try self.allocator.alloc(bytecode.GlobalCache, self.code.names.len);
+        @memset(self.code.global_caches, .{});
         return self.code;
     }
 

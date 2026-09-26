@@ -602,6 +602,7 @@ pub fn executeDeleteAttribute(self: *Runtime, instruction: bytecode.Instruction,
             if (!std.mem.eql(u8, entry.name, name)) continue;
             self.heap.allocator.free(entry.name);
             _ = environment.entries.orderedRemove(index);
+            environment.shape_version +%= 1;
             return true;
         }
         return self.nativeAttributeError(line, column, "module has no such attribute");

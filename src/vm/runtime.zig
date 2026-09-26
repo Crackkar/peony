@@ -364,6 +364,7 @@ pub const Runtime = struct {
     pub const storeAnnotationEntry = modules.storeAnnotationEntry;
     pub const executeDeleteGlobal = modules.executeDeleteGlobal;
     pub const globalValue = modules.globalValue;
+    pub const cachedGlobalValue = modules.cachedGlobalValue;
     pub const currentEnvironment = modules.currentEnvironment;
     pub const currentEnvironmentObject = modules.currentEnvironmentObject;
     pub const environmentLookup = modules.environmentLookup;
@@ -388,6 +389,7 @@ pub const Runtime = struct {
     pub const executeImportMember = modules.executeImportMember;
     pub const executeImportStar = modules.executeImportStar;
     pub const storeGlobal = modules.storeGlobal;
+    pub const storeCachedGlobal = modules.storeCachedGlobal;
 
     pub const executeMaterializeDstar = calls.executeMaterializeDstar;
     pub const mappingHasStringKey = calls.mappingHasStringKey;
@@ -441,6 +443,7 @@ pub const Runtime = struct {
         };
         environment.entries = .empty;
         environment.module_owner = null;
+        environment.shape_version = 1;
         self.environment = environment;
         self.environment_root.object = &environment.header;
         self.environment_frame.push(&self.heap.roots);
@@ -1058,6 +1061,7 @@ pub const Runtime = struct {
         self.environment.entries.deinit(self.heap.allocator);
         self.environment.entries = .empty;
         self.environment.module_owner = null;
+        self.environment.shape_version +%= 1;
     }
 
     pub fn execute(self: *Runtime, instruction: bytecode.Instruction, line: u32, column: u32) bool {
@@ -1155,8 +1159,9 @@ pub const Runtime = struct {
             },
             .load_global => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
-                const name = self.codeName(instruction.index32()) orelse return self.engineFault();
-                if (self.globalValue(name)) |value| {
+                const name_index = instruction.index32();
+                const name = self.codeName(name_index) orelse return self.engineFault();
+                if (self.cachedGlobalValue(code, name_index)) |value| {
                     self.setRegister(instruction.a(), value);
                 } else if (std.mem.eql(u8, name, "object") or std.mem.eql(u8, name, "type")) {
                     if (!self.ensureBuiltinClasses(line, column)) return false;
@@ -1184,8 +1189,7 @@ pub const Runtime = struct {
             },
             .store_global => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
-                const name = self.codeName(instruction.index32()) orelse return self.engineFault();
-                if (!self.storeGlobal(name, self.registers[instruction.a()])) {
+                if (!self.storeCachedGlobal(code, instruction.index32(), self.registers[instruction.a()])) {
                     self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
                     return false;
                 }

@@ -38,6 +38,7 @@ pub const Environment = struct {
     header: gc.Header align(8),
     entries: std.ArrayList(GlobalEntry) = .empty,
     module_owner: ?*gc.Header = null,
+    shape_version: u64 = 1,
 };
 
 pub const TestContextManager = struct {

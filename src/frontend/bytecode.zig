@@ -287,11 +287,18 @@ pub const code_flags = struct {
     pub const generator: u32 = 1 << 2;
 };
 
+pub const GlobalCache = struct {
+    environment_address: usize = 0,
+    shape_version: u64 = 0,
+    entry_index: u32 = std.math.maxInt(u32),
+};
+
 pub const Code = struct {
     allocator: std.mem.Allocator,
     instructions: []Instruction = &.{},
     constants: []runtime_value.Value = &.{},
     names: []const []const u8 = &.{},
+    global_caches: []GlobalCache = &.{},
     local_names: []const []const u8 = &.{},
     cell_names: []const []const u8 = &.{},
     free_names: []const []const u8 = &.{},
@@ -332,6 +339,7 @@ pub const Code = struct {
         self.allocator.free(self.instructions);
         self.allocator.free(self.constants);
         self.allocator.free(self.names);
+        self.allocator.free(self.global_caches);
         self.allocator.free(self.local_names);
         self.allocator.free(self.cell_names);
         self.allocator.free(self.free_names);
