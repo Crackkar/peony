@@ -97,27 +97,26 @@ pub const Decoder = struct {
         try sink.emit(.{ .float = literal });
     }
 
-    fn decodeString(self: *Decoder) !std.ArrayList(u8) {
+    fn decodeString(self: *Decoder, output: *std.ArrayList(u8)) !void {
         if (!self.take('"')) return self.fail("expecting string");
         const token_start = self.cursor;
-        var output: std.ArrayList(u8) = .empty;
-        errdefer output.deinit(self.allocator);
         while (self.cursor < self.input.len) {
+            const run_start = self.cursor;
+            while (self.cursor < self.input.len) {
+                const byte = self.input[self.cursor];
+                if (byte < 0x20 or byte == '"' or byte == '\\') break;
+                self.cursor += 1;
+            }
             if (self.cursor - token_start > self.options.token_limit) return self.failAt(token_start, "JSON token exceeds maximum length");
+            if (self.cursor != run_start) try output.appendSlice(self.allocator, self.input[run_start..self.cursor]);
+            if (self.cursor >= self.input.len) return self.fail("unterminated string");
             const byte = self.input[self.cursor];
             if (byte == '"') {
                 self.cursor += 1;
-                return output;
+                return;
             }
             if (byte < 0x20) return self.fail("invalid control character in string");
-            if (byte != '\\') {
-                const width = std.unicode.utf8ByteSequenceLength(byte) catch return self.fail("invalid UTF-8 in string");
-                const end = std.math.add(usize, self.cursor, width) catch return self.fail("invalid UTF-8 in string");
-                if (end > self.input.len) return self.fail("invalid UTF-8 in string");
-                try output.appendSlice(self.allocator, self.input[self.cursor..end]);
-                self.cursor = end;
-                continue;
-            }
+            std.debug.assert(byte == '\\');
             self.cursor += 1;
             if (self.cursor >= self.input.len) return self.fail("unterminated escape sequence");
             const escaped = self.input[self.cursor];
@@ -369,9 +368,8 @@ pub const DecodeCursor = struct {
     }
 
     fn readString(self: *DecodeCursor) ![]const u8 {
-        self.string_buffer.deinit(self.parser.allocator);
-        self.string_buffer = .empty;
-        self.string_buffer = try self.parser.decodeString();
+        self.string_buffer.clearRetainingCapacity();
+        try self.parser.decodeString(&self.string_buffer);
         return self.string_buffer.items;
     }
 
@@ -558,9 +556,19 @@ pub const Encoder = struct {
     fn writeString(self: *Encoder, text: []const u8) !void {
         if (text.len > self.options.token_limit) return error.TokenTooLong;
         if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+        const minimum = std.math.add(usize, text.len, 2) catch return error.OutOfMemory;
+        try self.output.ensureUnusedCapacity(self.allocator, minimum);
         try self.output.append(self.allocator, '"');
         var cursor: usize = 0;
         while (cursor < text.len) {
+            const run_start = cursor;
+            while (cursor < text.len) {
+                const candidate = text[cursor];
+                if (candidate < 0x20 or candidate == '"' or candidate == '\\' or (self.options.ensure_ascii and candidate >= 0x80)) break;
+                cursor += 1;
+            }
+            if (cursor != run_start) try self.output.appendSlice(self.allocator, text[run_start..cursor]);
+            if (cursor == text.len) break;
             const byte = text[cursor];
             switch (byte) {
                 '"' => try self.output.appendSlice(self.allocator, "\\\""),
@@ -571,7 +579,7 @@ pub const Encoder = struct {
                 '\r' => try self.output.appendSlice(self.allocator, "\\r"),
                 '\t' => try self.output.appendSlice(self.allocator, "\\t"),
                 0x00...0x07, 0x0b, 0x0e...0x1f => try self.appendHexEscape(byte),
-                0x20...0x21, 0x23...0x5b, 0x5d...0x7f => try self.output.append(self.allocator, byte),
+                0x20...0x21, 0x23...0x5b, 0x5d...0x7f => unreachable,
                 else => {
                     const width = std.unicode.utf8ByteSequenceLength(byte) catch return error.InvalidUtf8;
                     const end = cursor + width;

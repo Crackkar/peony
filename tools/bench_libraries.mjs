@@ -20,6 +20,7 @@ if (!Number.isInteger(warmups) || warmups < 0 || !Number.isInteger(repetitions) 
 const words = Array.from({ length: 8000 }, (_, index) => ['red', 'blue', 'green', 'gold', 'black', 'white', 'pink', 'gray'][index % 8]).join(' ');
 const csv = Array.from({ length: 4000 }, (_, index) => `${index},${index % 17}\n`).join('');
 const json = JSON.stringify({ rows: Array.from({ length: 4000 }, (_, index) => ({ id: index, value: index % 17, text: 'é' })) });
+const jsonStrings = JSON.stringify(Array.from({ length: 2000 }, (_, index) => `row-${index}-${'abcdefghij'.repeat(20)}é`));
 const pathText = 'abcdefghij\n'.repeat(1500);
 
 const workloads = [
@@ -64,6 +65,12 @@ const workloads = [
     files: { '/course/rows.json': json },
     source: 'import json\nwith open("/course/rows.json") as f: data = json.load(f)\nencoded = json.dumps(data, ensure_ascii=False, sort_keys=True)\nprint(len(data["rows"]), len(encoded) > 100000)\n',
     expected: '4000 True\n',
+  },
+  {
+    name: 'json-string-throughput',
+    files: { '/course/strings.json': jsonStrings },
+    source: 'import json\nwith open("/course/strings.json") as source: data = json.load(source)\nencoded = json.dumps(data, ensure_ascii=False)\nprint(len(data), len(encoded))\n',
+    expected: `2000 ${Array.from(jsonStrings).length + 1999}\n`,
   },
   {
     name: 'path-vfs-read',
