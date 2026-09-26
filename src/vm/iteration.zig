@@ -535,7 +535,10 @@ pub fn invokeSyncTaskCallback(self: *Runtime, callable: Value, args: []const Val
 pub fn clearSyncTask(self: *Runtime) void {
     if (self.sync_task) |*task| self.releaseSyncCallbackDepth(task);
     if (self.sync_root_frame.stack != null) self.sync_root_frame.pop();
-    if (self.sync_task) |task| if (task.order.len != 0) self.heap.allocator.free(task.order);
+    if (self.sync_task) |task| {
+        if (task.order.len != 0) self.heap.allocator.free(task.order);
+        if (task.sort_scratch.len != 0) self.heap.allocator.free(task.sort_scratch);
+    }
     self.sync_roots = @splat(.{ .object = null });
     self.sync_task = null;
     self.suspended_exception_frame = null;
@@ -680,17 +683,22 @@ pub fn prepareSyncSort(self: *Runtime, task: *SyncTask) bool {
         self.sync_roots[3].object = &keys.header;
         task.phase = .keys;
         task.index = 0;
-        task.position = 0;
     } else {
         task.phase = .order;
-        task.index = 1;
-        task.position = 1;
+        task.index = 0;
     }
     task.order = self.heap.allocator.alloc(usize, snapshot.items.items.len) catch {
         self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, task.line, task.column, null);
         return false;
     };
+    task.sort_scratch = self.heap.allocator.alloc(usize, snapshot.items.items.len) catch {
+        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, task.line, task.column, null);
+        return false;
+    };
     for (task.order, 0..) |*entry, index| entry.* = index;
+    task.sort_width = 1;
+    task.sort_run_start = 0;
+    task.sort_merging = false;
     return true;
 }
 
@@ -801,9 +809,10 @@ pub fn advanceSyncTask(self: *Runtime) bool {
                 const keys = task.keys orelse return self.engineFault();
                 if (task.index >= snapshot.items.items.len) {
                     task.phase = .order;
-                    task.index = 1;
-                    task.position = 1;
-                    task.sort_item_started = false;
+                    task.index = 0;
+                    task.sort_width = 1;
+                    task.sort_run_start = 0;
+                    task.sort_merging = false;
                     continue;
                 }
                 if (!self.chargeSynchronousWork(task.line, task.column)) return false;
@@ -833,31 +842,41 @@ pub fn advanceSyncTask(self: *Runtime) bool {
             },
             .order => {
                 const snapshot = task.snapshot orelse return self.engineFault();
-                if (task.index >= task.order.len) return self.finishSyncSort(task);
-                if (!self.chargeSynchronousWork(task.line, task.column)) return false;
-                remaining -= 1;
-                if (!task.sort_item_started) {
-                    task.selected_index = task.order[task.index];
-                    task.position = task.index;
-                    task.sort_item_started = true;
+                if (task.order.len < 2) return self.finishSyncSort(task);
+                if (!task.sort_merging) {
+                    if (task.sort_run_start >= task.order.len) {
+                        std.mem.swap([]usize, &task.order, &task.sort_scratch);
+                        if (task.sort_width >= task.order.len - task.sort_width) return self.finishSyncSort(task);
+                        task.sort_width *= 2;
+                        task.sort_run_start = 0;
+                        continue;
+                    }
+                    task.sort_left = task.sort_run_start;
+                    task.sort_mid = @min(task.sort_run_start + task.sort_width, task.order.len);
+                    task.sort_right = task.sort_mid;
+                    task.sort_end = @min(task.sort_mid + task.sort_width, task.order.len);
+                    task.sort_output = task.sort_run_start;
+                    task.sort_merging = true;
                 }
-                if (task.position == 0) {
-                    task.order[0] = task.selected_index;
-                    task.index += 1;
-                    task.sort_item_started = false;
+                if (task.sort_output >= task.sort_end) {
+                    task.sort_run_start = task.sort_end;
+                    task.sort_merging = false;
                     continue;
                 }
+                if (!self.chargeSynchronousWork(task.line, task.column)) return false;
+                remaining -= 1;
                 const left_items = if (task.keys) |keys| keys.items.items else snapshot.items.items;
-                const order = self.sortOrder(left_items[task.selected_index], left_items[task.order[task.position - 1]], task.line, task.column) orelse return false;
-                const precedes = if (task.reverse) order == .gt else order == .lt;
-                if (precedes) {
-                    task.order[task.position] = task.order[task.position - 1];
-                    task.position -= 1;
-                } else {
-                    task.order[task.position] = task.selected_index;
-                    task.index += 1;
-                    task.sort_item_started = false;
-                }
+                const take_left = if (task.sort_left >= task.sort_mid)
+                    false
+                else if (task.sort_right >= task.sort_end)
+                    true
+                else blk: {
+                    const order = self.sortOrder(left_items[task.order[task.sort_left]], left_items[task.order[task.sort_right]], task.line, task.column) orelse return false;
+                    break :blk if (task.reverse) order != .lt else order != .gt;
+                };
+                task.sort_scratch[task.sort_output] = if (take_left) task.order[task.sort_left] else task.order[task.sort_right];
+                if (take_left) task.sort_left += 1 else task.sort_right += 1;
+                task.sort_output += 1;
             },
         }
         if (self.output_event_pending or self.pending_input != null) return self.pauseSyncTask(task);

@@ -79,7 +79,7 @@ pub const Frame = struct {
     local_cells: []?*functions.Cell = &.{},
     free_cells: []?*functions.Cell = &.{},
     class_namespace: ?*class_module.Class = null,
-    roots: []gc.Root = &. {},
+    roots: []gc.Root = &.{},
     root_frame: gc.RootFrame = .{},
     try_blocks: std.ArrayList(TryBlock) = .empty,
     pending_values: []Value = &.{},
@@ -122,8 +122,16 @@ pub const PendingInput = struct {
 };
 
 pub const SyncTaskOperation = enum {
-    materialize, sorted, list_sort, next_value,
-    builtin_all, builtin_any, builtin_min, builtin_max, builtin_sum, builtin_bytes,
+    materialize,
+    sorted,
+    list_sort,
+    next_value,
+    builtin_all,
+    builtin_any,
+    builtin_min,
+    builtin_max,
+    builtin_sum,
+    builtin_bytes,
 };
 pub const SyncTaskPhase = enum { collect, keys, order };
 pub const SyncCallbackResult = union(enum) { value: Value, suspended, failed };
@@ -144,10 +152,17 @@ pub const SyncTask = struct {
     snapshot: ?*sequence.List = null,
     keys: ?*sequence.List = null,
     order: []usize = &.{},
+    sort_scratch: []usize = &.{},
+    sort_width: usize = 1,
+    sort_run_start: usize = 0,
+    sort_left: usize = 0,
+    sort_mid: usize = 0,
+    sort_right: usize = 0,
+    sort_end: usize = 0,
+    sort_output: usize = 0,
+    sort_merging: bool = false,
     index: usize = 0,
     position: usize = 0,
-    selected_index: usize = 0,
-    sort_item_started: bool = false,
     original_version: u64 = 0,
     original_length: usize = 0,
     callback_in_progress: bool = false,

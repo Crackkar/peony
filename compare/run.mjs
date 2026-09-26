@@ -153,9 +153,12 @@ try {
   };
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
   if (options.jsonPath) await writeFile(resolve(options.jsonPath), serialized);
-  const reportPath = resolve(options.reportPath ?? join(root, 'report.md'));
-  await writeFile(reportPath, renderMarkdown(report));
-  process.stdout.write(`${records.length}/${records.length} cases matched ${pythonVersion}; report: ${relative(repositoryRoot, reportPath).replaceAll(sep, '/')}\n`);
+  const reportPath = options.reportPath ? resolve(options.reportPath) : options.filter ? null : join(root, 'report.md');
+  if (reportPath) await writeFile(reportPath, renderMarkdown(report));
+  process.stdout.write(`${records.length}/${records.length} cases matched ${pythonVersion}` + (reportPath ? `; report: ${relative(repositoryRoot, reportPath).replaceAll(sep, '/')}` : '') + '\n');
+  if (options.filter) {
+    for (const record of records) process.stdout.write(`${record.id}: CPython ${formatMs(record.cpython.medianMs)} ms, Peony ${formatMs(record.peony.medianMs)} ms, ${record.peonyToCpython.toFixed(2)}x\n`);
+  }
 } finally {
   try {
     await peony.terminate();

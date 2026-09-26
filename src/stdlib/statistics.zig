@@ -401,21 +401,7 @@ fn finishFmean(payload: *TaskPayload) types.TaskStep {
 }
 
 fn finishMedian(self: anytype, payload: *TaskPayload) types.TaskStep {
-    var index: usize = 1;
-    while (index < payload.values.items.len) : (index += 1) {
-        var cursor = index;
-        while (cursor != 0) {
-            const comparison = number.compare(payload.values.items[cursor], payload.values.items[cursor - 1]);
-            const order = switch (comparison) {
-                .value => |value| value,
-                .python_exception => |exception| return .{ .raise = exception },
-                .engine_error => return runtimeTaskError("numeric comparison failed"),
-            };
-            if (order != .less) break;
-            std.mem.swap(Value, &payload.values.items[cursor], &payload.values.items[cursor - 1]);
-            cursor -= 1;
-        }
-    }
+    if (sortMedianValues(payload)) |failure| return failure;
     const middle = payload.values.items.len / 2;
     if (payload.values.items.len % 2 == 1) return .{ .complete = payload.values.items[middle] };
     var pair_sum: Value = undefined;
@@ -423,6 +409,49 @@ fn finishMedian(self: anytype, payload: *TaskPayload) types.TaskStep {
     var result: f64 = undefined;
     if (captureFloat(number.trueDivide(&self.heap, pair_sum, Value.fromSmallInt(2).?), &result)) |failure| return failure;
     return .{ .complete = Value.fromFloat(result) };
+}
+
+fn sortMedianValues(payload: *TaskPayload) ?types.TaskStep {
+    const length = payload.values.items.len;
+    if (length < 2) return null;
+    const scratch = payload.allocator.alloc(Value, length) catch return memoryTaskError();
+    defer payload.allocator.free(scratch);
+    var source: []Value = payload.values.items;
+    var destination: []Value = scratch;
+    var width: usize = 1;
+    while (width < length) {
+        var run_start: usize = 0;
+        while (run_start < length) {
+            const middle = @min(run_start + width, length);
+            const end = @min(middle + width, length);
+            var left = run_start;
+            var right = middle;
+            var output = run_start;
+            while (output < end) : (output += 1) {
+                const take_left = if (left >= middle)
+                    false
+                else if (right >= end)
+                    true
+                else blk: {
+                    const comparison = number.compare(source[left], source[right]);
+                    const order = switch (comparison) {
+                        .value => |value| value,
+                        .python_exception => |exception| return .{ .raise = exception },
+                        .engine_error => return runtimeTaskError("numeric comparison failed"),
+                    };
+                    break :blk order != .greater;
+                };
+                destination[output] = if (take_left) source[left] else source[right];
+                if (take_left) left += 1 else right += 1;
+            }
+            run_start = end;
+        }
+        std.mem.swap([]Value, &source, &destination);
+        if (width >= length - width) break;
+        width *= 2;
+    }
+    if (source.ptr != payload.values.items.ptr) @memcpy(payload.values.items, source);
+    return null;
 }
 
 fn finishMode(comptime Runtime: type, self: *Runtime, task: *types.Task, payload: *TaskPayload) types.TaskStep {

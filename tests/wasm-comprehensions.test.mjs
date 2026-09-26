@@ -223,7 +223,7 @@ test('WASM lambdas, walrus, lazy map and filter, stable keyed sorting and list.i
     assert.equal(api.peony_run(handle, 0), status.pythonException);
     assert.match(errorText(api, handle), /ValueError/);
 
-    assert.equal(compile(api, handle, 'values=list(range(1500))\nvalues.reverse()\nvalues.sort()\n'), status.ok);
+    assert.equal(compile(api, handle, 'values=list(range(10000))\nvalues.reverse()\nvalues.sort()\n'), status.ok);
     let result = api.peony_run(handle, 0);
     for (let checkpoint = 0; result === status.timeslice && checkpoint < 1000; checkpoint += 1) result = api.peony_run(handle, 0);
     assert.equal(result, status.limit);

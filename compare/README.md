@@ -61,7 +61,7 @@ The runner accepts these controls:
 | `--json PATH` | Also write the complete machine-readable report to a chosen path. |
 | `--quiet` | Suppress per-case progress on standard error. |
 
-The default artifact is `zig-out/peony.wasm`; the default oracle command is `python`. The runner rejects an oracle outside the CPython 3.12 release line. Every successful run replaces [`report.md`](report.md) with a concise durable account of its inputs, exact comparison result, aggregates, and every case measurement. Standard output contains only a one-line completion summary. Request JSON explicitly when another tool needs every hash and raw field:
+The default artifact is `zig-out/peony.wasm`; the default oracle command is `python`. The runner rejects an oracle outside the CPython 3.12 release line. Every successful unfiltered run replaces [`report.md`](report.md) with a concise durable account of its inputs, exact comparison result, aggregates, and every case measurement. A filtered investigation prints its selected timing rows without replacing the full baseline; pass `--report PATH` when that focused result should also be durable. Request JSON explicitly when another tool needs every hash and raw field:
 
 ```powershell
 node compare/run.mjs --profile standard
