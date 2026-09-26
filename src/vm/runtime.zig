@@ -616,7 +616,7 @@ pub const Runtime = struct {
         self.sync_yield_requested = false;
         var executed: u32 = 0;
         var native_work_in_run: u64 = 0;
-        const native_work_budget: u64 = 16 * 1024;
+        const native_work_budget: u64 = quantum;
         while (executed < quantum) : (executed += 1) {
             if (self.currentNativeTask()) |task| {
                 if (task.stage == .ready) {

@@ -22,9 +22,9 @@ pub fn testNativeTaskChunksShareOneRunQuantum() !void {
     const caller = runtime.top_frame orelse return error.MissingChunkTaskCaller;
     const task = try types.createTask(&runtime.heap, null, .sys, 999, caller, 0, 1, 1, &.{}, &native_chunk_ops);
     try std.testing.expect(runtime.startNativeTask(task));
-    try std.testing.expectEqual(vm.RunStatus.timeslice, runtime.run(0));
+    try std.testing.expectEqual(vm.RunStatus.timeslice, runtime.run(16 * 1024));
     try std.testing.expectEqual(@as(i64, 253), task.child_value.asSmallInt().?);
-    try std.testing.expectEqual(vm.RunStatus.timeslice, runtime.run(0));
+    try std.testing.expectEqual(vm.RunStatus.timeslice, runtime.run(16 * 1024));
     try std.testing.expectEqual(@as(i64, 506), task.child_value.asSmallInt().?);
     try std.testing.expectEqual(vm.RunStatus.completed, try boundary(&runtime, 0));
     try std.testing.expectEqualStrings("after\n", runtime.stdout());
