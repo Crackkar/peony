@@ -65,7 +65,8 @@ pub fn call(
         default_roots[index].object = defaults[index].asObject();
     }
 
-    const bound = binder.bindFunction(
+    var bound_storage: [max_native_parameters]Value = undefined;
+    const bound = binder.bindFunctionInto(
         &self.heap,
         self.heap.allocator,
         names[0..spec.params.len],
@@ -73,22 +74,14 @@ pub fn call(
         defaults[0..spec.params.len],
         positional,
         keywords,
+        &bound_storage,
     ) catch |err| {
         self.setBinderException(err, line, column);
         return false;
     };
-    defer self.heap.allocator.free(bound.values);
+    defer if (bound.values_owned) self.heap.allocator.free(bound.values);
     defer if (bound.extra_keywords.len != 0) self.heap.allocator.free(bound.extra_keywords);
-    const roots = self.heap.allocator.alloc(gc.Root, bound.values.len) catch {
-        self.setException(exceptions.memoryError(), line, column, null);
-        return false;
-    };
-    defer self.heap.allocator.free(roots);
-    for (bound.values, 0..) |value, index| roots[index] = .{ .object = value.asObject() };
-    var bound_frame = gc.RootFrame{};
-    bound_frame.push(&self.heap.roots);
-    for (roots) |*root| bound_frame.add(root);
-    defer bound_frame.pop();
+    for (bound.values, 0..) |value, index| default_roots[index].object = value.asObject();
     return switch (module_id) {
         .sys => sys.execute(Runtime, self, destination, function_id, receiver, bound.values, bound.extra_keywords, line, column),
         .math => math.execute(Runtime, self, destination, function_id, receiver, bound.values, bound.extra_keywords, line, column),
