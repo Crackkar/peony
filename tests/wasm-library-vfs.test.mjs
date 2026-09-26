@@ -78,12 +78,12 @@ test('shipping WASM VFS failures preserve readonly roots and existing data', asy
     maxFileBytes: 16,
     stdout: (text) => output.push(text),
   });
-  session.mount({ '/course/lesson.txt': 'lesson' });
+  session.mount({ '/assets/sample.txt': 'sample' });
   const result = await session.run([
     'import os',
     'from pathlib import Path',
-    'print(Path("/course/lesson.txt").read_text())',
-    'for call, expected, label in [(lambda: Path("/course/lesson.txt").write_text("bad"), PermissionError, "PermissionError"), (lambda: os.remove("/course/lesson.txt"), PermissionError, "PermissionError")]:',
+    'print(Path("/assets/sample.txt").read_text())',
+    'for call, expected, label in [(lambda: Path("/assets/sample.txt").write_text("bad"), PermissionError, "PermissionError"), (lambda: os.remove("/assets/sample.txt"), PermissionError, "PermissionError")]:',
     '    try:',
     '        call()',
     '    except expected:',
@@ -101,7 +101,7 @@ test('shipping WASM VFS failures preserve readonly roots and existing data', asy
     '    print("self move", os.path.isdir("/home/dir/sub"))',
   ].join('\n'));
   assert.equal(result.status, 'completed', result.error?.message);
-  assert.equal(output.join(''), 'lesson\nPermissionError\nPermissionError\ntoo large old\nself move True\n');
+  assert.equal(output.join(''), 'sample\nPermissionError\nPermissionError\ntoo large old\nself move True\n');
 });
 
 test('shipping WASM retains Path files and empty directories across session runs', async () => {
@@ -124,16 +124,16 @@ test('shipping WASM Path bytes and readonly rename boundaries are native', async
   const peony = await load();
   const output = [];
   const session = peony.createSession({ quantum: 1, stdout: (text) => output.push(text) });
-  session.mount({ '/course/lesson.bin': new Uint8Array([0, 255]) });
+  session.mount({ '/assets/sample.bin': new Uint8Array([0, 255]) });
   const result = await session.run([
     'import os',
     'from pathlib import Path',
     'blob = Path("/home/blob.bin")',
     'print(blob.write_bytes(b"\\x00\\xff"), blob.read_bytes())',
     'try:',
-    '    os.rename("/course/lesson.bin", "/home/stolen.bin")',
+    '    os.rename("/assets/sample.bin", "/home/stolen.bin")',
     'except PermissionError:',
-    '    print("readonly", Path("/course/lesson.bin").read_bytes(), os.path.exists("/home/stolen.bin"))',
+    '    print("readonly", Path("/assets/sample.bin").read_bytes(), os.path.exists("/home/stolen.bin"))',
   ].join('\n'));
   assert.equal(result.status, 'completed', result.error?.message);
   assert.equal(output.join(''), "2 b'\\x00\\xff'\nreadonly b'\\x00\\xff' False\n");

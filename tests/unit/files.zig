@@ -186,7 +186,7 @@ pub fn testFileModesContextAndClosedErrors() !void {
         \\    print("closed")
     , "2\nexists\nclosed\n");
     try expectException("open('/home/missing.txt')\n", .file_not_found_error);
-    try expectException("open('/course/lesson.txt', 'w')\n", .permission_error);
+    try expectException("open('/assets/sample.txt', 'w')\n", .permission_error);
 }
 
 pub fn testFileContextClosesDuringExceptionAndReturn() !void {

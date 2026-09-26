@@ -9,7 +9,6 @@ const host = @import("runtime_host");
 const number = @import("runtime_number");
 const sequence = @import("runtime_sequence");
 const types = @import("types.zig");
-const ssl = @import("ssl.zig");
 const codec = @import("http.zig");
 const json_values = @import("json_values.zig");
 
@@ -20,7 +19,6 @@ pub const urllib_request_functions = [_]types.FunctionSpec{
         .{ .name = "url" },
         .{ .name = "data", .default = .none },
         .{ .name = "timeout", .default = .none },
-        .{ .name = "context", .flags = binder.parameter_flags_module.keyword_only, .default = .none },
     } },
     .{ .id = 101, .name = "read", .params = &.{.{ .name = "size", .default = .none }}, .exported = false },
     .{ .id = 102, .name = "getcode", .exported = false },
@@ -213,7 +211,6 @@ pub fn executeRequests(
 fn startUrlopen(comptime Runtime: type, self: *Runtime, destination: u16, args: []const Value, line: u32, column: u32) bool {
     const url = self.valueString(args[0]) orelse return self.nativeTypeError(line, column, "urlopen() url must be str");
     codec.validateUrl(url) catch return urlValueError(self, line, column);
-    if (args[3].tag() != .none and !ssl.isContext(args[3])) return self.nativeTypeError(line, column, "context must be an SSLContext or None");
     const body: []const u8 = if (args[1].tag() == .none) "" else self.valueBytes(args[1]) orelse return self.nativeTypeError(line, column, "urlopen() data must be bytes");
     const timeout = timeoutValue(Runtime, self, args[2], line, column) orelse if (args[2].tag() == .none) null else return false;
     var headers = codec.Headers.init(self.heap.allocator);

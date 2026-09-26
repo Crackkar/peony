@@ -48,7 +48,7 @@ test('Peony ESM transports requests through injected fetch with browser-safe pol
   assert.ok(options.signal instanceof AbortSignal);
 });
 
-test('Peony ESM follows redirects only when the host explicitly opts in', async () => {
+test('Peony ESM always requests redirect rejection', async () => {
   const peony = await loadPeony();
   const redirects = [];
   const fetch = async (_url, options) => {
@@ -58,12 +58,37 @@ test('Peony ESM follows redirects only when the host explicitly opts in', async 
   const firstOutput = [];
   const first = peony.createSession({ fetch, stdout: (chunk) => firstOutput.push(chunk) });
   assert.equal((await first.run('import requests\nprint(requests.get("https://api.test/a").text)\n')).status, 'completed');
-  const secondOutput = [];
-  const second = peony.createSession({ fetch, followRedirects: true, stdout: (chunk) => secondOutput.push(chunk) });
-  assert.equal((await second.run('import requests\nprint(requests.get("https://api.test/b").text)\n')).status, 'completed');
-  assert.deepEqual(redirects, ['error', 'follow']);
+  assert.throws(() => peony.createSession({ followRedirects: true }), TypeError);
+  assert.deepEqual(redirects, ['error']);
   assert.equal(firstOutput.join(''), 'ok\n');
-  assert.equal(secondOutput.join(''), 'ok\n');
+});
+
+test('HTTP timeout prevents a delayed URL decision from starting transport', async () => {
+  const peony = await loadPeony();
+  let releaseDecision;
+  let fetchCalls = 0;
+  const output = [];
+  const session = peony.createSession({
+    stdout: chunk => output.push(chunk),
+    allowUrl: () => new Promise(resolve => { releaseDecision = resolve; }),
+    fetch: async () => { fetchCalls += 1; return new Response('unexpected'); },
+  });
+  try {
+    const result = await session.run([
+      'import requests',
+      'try:',
+      '    requests.get("https://api.test/slow-policy", timeout=0.02)',
+      'except requests.exceptions.Timeout:',
+      '    print("timed out")',
+    ].join('\n'));
+    assert.equal(result.status, 'completed', result.error?.message);
+    releaseDecision(true);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(fetchCalls, 0);
+    assert.equal(output.join(''), 'timed out\n');
+  } finally {
+    await session.destroy();
+  }
 });
 
 test('Peony ESM denies policy failures before fetch and maps them into requests errors', async () => {

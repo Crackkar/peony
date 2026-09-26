@@ -37,7 +37,7 @@ test('shipping WASM JSON preserves integers, Unicode, options, and decode metada
   assert.equal(output, '123456789012345678901234567890 雪 𝄞 2\n{"a":"\\u96ea","b":[true,null,1]}\n[NaN, Infinity, -Infinity]\nTrue\nTrue True True True True\ncycle\n');
 });
 
-test('shipping WASM JSON file methods resume learner callbacks without replay', async () => {
+test('shipping WASM JSON file methods resume user callbacks without replay', async () => {
   const prompts = [];
   const { result, output } = await run([
     'import json',

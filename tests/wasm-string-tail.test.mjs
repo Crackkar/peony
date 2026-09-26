@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { instantiatePeony } from './wasm-files-host.mjs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -8,7 +9,7 @@ const status = Object.freeze({ ok: 0, completed: 5, pythonException: 6 });
 
 async function newApi() {
   const bytes = await readFile(wasmPath);
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const { instance } = await instantiatePeony(bytes);
   return instance.exports;
 }
 

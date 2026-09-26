@@ -1,8 +1,8 @@
 # Peony WASM ABI v1
 
-This is the internal interface between `web/peony-core.mjs` in the Worker and the Zig engine. Embedding applications use the [public Worker API](embedding.md). The ABI targets `wasm32-freestanding`; pointers and lengths are unsigned 32-bit byte offsets into exported `memory`. A zero pointer represents an empty slice or a failed pointer lookup/allocation. WASM exports return numeric statuses, not JavaScript exceptions or Python objects.
+This is the internal interface between `web/peony-core.mjs` in the Worker and the Zig engine. Embedding applications use the [public Worker API](embedding.md). The ABI targets `wasm32-freestanding`; pointers and lengths are unsigned 32-bit byte offsets into exported `memory`. A zero pointer represents an empty slice or a failed pointer lookup/allocation. WASM exports return numeric statuses. Worker JavaScript supplies the `env.peony_fs_call` import for filesystem storage.
 
-One WASM instance has a fixed table of up to 64 live session handles and 256 live transfer blocks. Sessions have independent Python runtime state, heaps, virtual files, output, diagnostics, and pending host requests. Transfer blocks are instance-owned temporary input storage; they are separate from a session's accounted heap. The JavaScript adapter checks `peony_abi_version() == 1` before creating sessions.
+One WASM instance has a fixed table of up to 64 live session handles and 256 live transfer blocks. Sessions have independent Python runtime state, heaps, Worker file trees, output, diagnostics, and pending host requests. Transfer blocks are instance-owned temporary input storage; they are separate from a session's accounted heap. The JavaScript adapter checks `peony_abi_version() == 1` before creating sessions.
 
 The normal run protocol is:
 
@@ -12,6 +12,35 @@ The normal run protocol is:
 4. On `COMPLETED`, `PYTHON_EXCEPTION`, `CANCELLED`, or `LIMIT`, copy any final output and diagnostic data, then end the run. Destroy the handle when the raw session is finished.
 
 The loop must serialize calls that mutate one session. In particular, a collector call must not interleave with VM execution, and a borrowed pointer cannot be treated as stable across a mutating call. The Worker adapter performs these steps; the exported ABI remains useful for integration tests and alternate adapters.
+
+## Filesystem host import
+
+`web/fs-host.mjs` provides synchronous filesystem storage inside the Worker. The WASM module imports one function from `env`:
+
+```text
+peony_fs_call(session: u32, operation: u32,
+              path_ptr: u32, path_len: u32,
+              data_ptr: u32, data_len: u32,
+              auxiliary: u32,
+              output_ptr: u32, output_len: u32) -> i32
+```
+
+Each call uses the generation-checked session handle. Pointers refer to current WASM linear memory. Whole-file reads and listings (`2`, `5`, and `11`) use `(output_ptr, output_len) = (0, 0)` to obtain the required byte length, then a second call copies the bytes into engine allocation. Positional read `21` instead returns the byte count copied into its supplied output buffer. Worker JavaScript owns the tree, byte arrays, and open-handle identity. Zig owns Python file modes, cursors, text decoding, newline behavior, and exception mapping.
+
+Open access in operation `4` uses `auxiliary = 0` for read, `1` for write, and `2` for read/write. Operations `19`, `20`, and `21` carry a little-endian `u64` byte offset or size in the eight bytes at `path_ptr`. Operation `21` fills the supplied output buffer from that offset and returns the number of bytes read. The file layer uses an 8 KiB read buffer for line-oriented and length-bounded reads while full-file reads retain the direct host path.
+
+| Operation | Worker action |
+|---:|---|
+| `1` | Stat a path: `0` missing, `1` file, `2` directory. |
+| `2`, `3` | Read or write a path. Write mode is in `auxiliary`. |
+| `4`, `5`, `6`, `7` | Open, read through, replace through, and close an opaque file handle. |
+| `8`, `9`, `10` | Create directory, remove entry, and rename entry. |
+| `11`, `12` | List entries or mount page supplied bytes into `/assets`. |
+| `13`, `14` | Clear `/tmp` or report current content bytes. |
+| `16`, `17` | Configure or destroy the Worker tree for a session. |
+| `18`, `19`, `20`, `21` | Get open-file length, write at a byte offset, truncate, and read at a byte offset. |
+
+Successful mutations return zero. Reads return a byte length or handle; stat uses its type codes. Negative results identify path, presence, directory, permission, size, allocation, move, and I/O errors. `peony_session_new` configures Worker storage with the session's file limits before returning its handle. `peony_session_destroy` closes engine handles and releases Worker storage unless the public Worker adapter is transferring that tree to a replacement raw session.
 
 ## Exported functions
 
@@ -31,7 +60,7 @@ The loop must serialize calls that mutate one session. In particular, a collecto
 | `peony_event_ptr`, `peony_event_len` | `(handle: u32) -> ptr/len: u32` | Return a borrowed request or flush event packet, or zero when no event is available. |
 | `peony_stdout_ptr`, `peony_stdout_len` | `(handle: u32) -> ptr/len: u32` | Return a borrowed view of buffered standard output, or zero when empty/invalid. |
 | `peony_stdout_consume` | `(handle, len: u32) -> status: u32` | Removes `len` bytes from the start of buffered output; rejects lengths beyond the buffer. |
-| `peony_vfs_mount` | `(handle, path_ptr, path_len, data_ptr, data_len: u32) -> status: u32` | Copies host content below `/course` into the session VFS as read-only content. Inputs must be live transfer slices. |
+| `peony_vfs_mount` | `(handle, path_ptr, path_len, data_ptr, data_len: u32) -> status: u32` | Copies page content below `/assets` in Worker storage. Inputs are live transfer slices. |
 | `peony_vfs_write` | `(handle, path_ptr, path_len, data_ptr, data_len: u32) -> status: u32` | Copies or replaces a writable `/home` or `/tmp` file. |
 | `peony_vfs_read` | `(handle, path_ptr, path_len: u32) -> status: u32` | Selects a file's bytes for borrowing through `peony_vfs_data_ptr/len`. |
 | `peony_vfs_list` | `(handle, path_ptr, path_len: u32) -> status: u32` | Selects sorted, NUL-separated full file paths below a directory for borrowing through `peony_vfs_data_ptr/len`. |
@@ -50,7 +79,7 @@ The loop must serialize calls that mutate one session. In particular, a collecto
 
 The `peony_*_ptr`/`peony_*_len` pairs are **borrowed views**. The caller must copy the bytes before a mutation that can invalidate them. A zero pointer with zero length means an empty view; it is not an error status. Counters and stats return zero for an invalid handle, so check handle validity through an operation that returns a status when that distinction matters.
 
-`peony_compile_and_start` consumes source and filename synchronously; their transfer blocks can then be freed. `peony_compile_and_start_argv` additionally validates a bounded argv record before restarting the program. `peony_run` with quantum `0` uses the session-configured quantum. `peony_cancel` sets a request checked by the next run call; it does not run Python cleanup code. Raw `peony_reset` clears the program and pending work while retaining `/home` and `/course` VFS content. Public `session.reset()` replaces the raw session and clears the VFS; see [embedding](embedding.md).
+`peony_compile_and_start` consumes source and filename synchronously; their transfer blocks can then be freed. `peony_compile_and_start_argv` also validates a bounded argv record before restarting the program. `peony_run` with quantum `0` uses the session-configured quantum. `peony_cancel` requests hard cancellation. Raw `peony_reset` clears the program and pending work while retaining Worker `/home` and `/assets` files. Public `session.reset()` replaces the raw runtime and transfers the existing Worker file tree to it; see [embedding](embedding.md).
 
 ## Host packets
 
@@ -93,7 +122,7 @@ HTTP, clock and sleep use the same pending request identity and packet limit. Se
 
 For these kinds, host error has status `2` and two UTF-8 sections: a classification and a message. HTTP classifications are `connection`, `policy`, and `timeout`; clock and sleep failures use `clock` and `sleep`. Native library code maps failures to its documented Python exception classes. EOF is invalid for these kinds. The total HTTP reply budget includes the packet header, descriptors, status and headers as well as the body.
 
-The HTTP response status code is the first **payload** section, distinct from the envelope's success/host-error status. Native code validates that status is `100..599`, validates the header block and section kinds, and constructs the supported Python response object only after a matching reply is accepted. The browser adapter restricts transport to HTTP(S), applies `credentials: 'omit'`, chooses redirect policy, and caps body streaming before forming this packet. The Python library code remains in Zig; the packet carries data and failure classification only.
+The HTTP response status code is the first **payload** section, distinct from the envelope's success/host-error status. Native code validates that status is `100..599`, validates the header block and section kinds, and constructs the supported Python response object only after a matching reply is accepted. The browser adapter restricts transport to HTTP(S), applies `credentials: 'omit'` and `redirect: 'error'`, and caps body streaming before forming this packet. The Python library code remains in Zig; the packet carries data and failure classification only.
 
 `print(..., flush=True)` creates a kind `5` output event with zero sections. It marks a drain boundary; stdout bytes remain available through `peony_stdout_ptr/len` and the host consumes them in the ordinary way without sending a response packet. Keeping output in the borrowed stdout buffer means a large flush is not constrained by the 1 MiB packet limit.
 
@@ -123,7 +152,7 @@ The optional argv transfer is at most 64 KiB: a little-endian `u16` count (`0..2
 | Value | Name | Meaning |
 |---:|---|---|
 | `0` | `OK` | The operation completed. |
-| `1` | `UNSUPPORTED` | Compilation recognized syntax outside the implemented subset. |
+| `1` | `UNSUPPORTED` | Compilation reported a source form that Peony cannot compile. |
 | `2` | `INVALID_HANDLE` | The handle is zero, stale, out of range, or destroyed. |
 | `3` | `INVALID_ARGUMENT` | A slice, packet, response, or stream consume is invalid. |
 | `4` | `OUT_OF_MEMORY` | A VFS content limit or allocation failure. Session creation and transfer allocation report failure as a zero handle/pointer; execution allocation failures are Python `MemoryError` exceptions. |
@@ -136,7 +165,7 @@ The optional argv transfer is at most 64 KiB: a little-endian `u16` count (`0..2
 | `11` | `OUTPUT_EVENT` | An explicit output flush boundary is ready. |
 | `12` | `LIMIT` | The configured per-run bytecode/native-work budget was reached. |
 
-The compile-and-start exports return `OK` for a compiled program, `UNSUPPORTED` for recognized syntax outside the supported subset, and `PYTHON_EXCEPTION` for syntax or compilation-time Python errors. A runtime `LIMIT` is not a catchable Python exception.
+The compile-and-start exports return `OK` for a compiled program, `UNSUPPORTED` for a source diagnostic, and `PYTHON_EXCEPTION` for syntax or compilation-time Python errors. A runtime `LIMIT` is a terminal run status.
 
 A call may fail before or after Python execution begins. Invalid handles and transfer slices are ABI errors (`INVALID_HANDLE` or `INVALID_ARGUMENT`); they do not create a Python traceback. Invalid VFS paths and permissions also report `INVALID_ARGUMENT` at the raw boundary, while a VFS content cap reports `OUT_OF_MEMORY`. An exception raised by an executing Python program reports `PYTHON_EXCEPTION` and has diagnostic views. An `INTERNAL_ERROR` signals an engine invariant problem and should not be presented as a Python exception. The Worker facade maps these raw results to its [public run result](embedding.md) or rejects a failed API operation.
 
@@ -151,10 +180,10 @@ A call may fail before or after Python execution begins. Invalid handles and tra
 - `memory.grow()` detaches existing JavaScript typed-array views. Recreate every `Uint8Array`/`DataView` from the current `memory.buffer` after a call that may allocate or grow memory.
 - The fixed session and transfer tables are instance-local. Separate WASM instances have separate tables.
 
-## VFS and borrowed-view rules
+## Browser files and borrowed views
 
-`peony_vfs_mount` copies host content to read-only `/course`; `peony_vfs_write` copies or replaces content under writable `/home` or `/tmp`. Paths and data are live transfer slices at call time. The VFS normalizes POSIX-like paths, rejects traversal above root and NUL, and charges content against both total and per-file caps. `peony_vfs_mkdir` creates missing writable parents. The read/list/dirs functions place a result in one session-owned output view, returned by `peony_vfs_data_ptr/len`. A successful read returns the exact file bytes; `list` and `dirs` return sorted full paths separated by NUL bytes. Directory listing excludes the queried root itself. Copy the result before calling another VFS operation, a run step, reset, or destroy.
+`peony_vfs_mount` copies page content to `/assets`; `peony_vfs_write` copies or replaces content under `/home` or `/tmp`. Paths and data are live transfer slices at call time. Worker JavaScript normalizes POSIX-style paths and applies total and per-file byte caps. `peony_vfs_mkdir` creates parent directories. Read and listing exports place a copied result in one session-owned WASM output view through `peony_vfs_data_ptr/len`. File reads return exact bytes; listings return sorted paths separated by NUL bytes. Copy a borrowed result before another file operation, run step, reset, or destroy.
 
-The raw runtime retains `/home` and `/course` across `peony_reset` and compile-and-start; it clears `/tmp`. The public Worker adapter takes a file and `/home` directory snapshot when it replaces a raw runtime for a new run, then restores it. Public `session.reset()` intentionally discards the snapshot and starts empty. Adapters that use the raw ABI directly must choose and implement their own public persistence policy.
+The raw runtime retains Worker `/home` and `/assets` across `peony_reset` and compile-and-start; it clears `/tmp`. The public Worker adapter transfers its file tree when it replaces a raw runtime for a new run and clears `/tmp` before the next run. Public `session.reset()` follows the same persistence rule. Raw ABI adapters can set their own session file lifetime around these exports.
 
 All borrowed views are valid only under their stated session lifetime. In particular, a host must rebuild typed-array or `DataView` objects from `memory.buffer` after any export that can grow linear memory; WebAssembly growth detaches older views. The safe pattern is: read length, read pointer, immediately copy bytes, then mutate the session. Transfer blocks are host-writable and remain live until freed with the original allocation pointer and length; an interior slice may be passed to an input export, but the allocation must still be freed by its original pair. At most 256 transfers are live at once.

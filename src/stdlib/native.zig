@@ -9,7 +9,6 @@ const sys = @import("sys.zig");
 const math = @import("math.zig");
 const time = @import("time.zig");
 const random = @import("random.zig");
-const ssl = @import("ssl.zig");
 const statistics = @import("statistics.zig");
 const json_values = @import("json_values.zig");
 const re = @import("re.zig");
@@ -98,7 +97,6 @@ pub fn call(
         .os_path => os.executePath(Runtime, self, destination, function_id, receiver, bound.values, bound.extra_keywords, line, column),
         .collections => collections.execute(Runtime, self, destination, function_id, receiver, bound.values, bound.extra_keywords, line, column),
         .copy => copy.execute(Runtime, self, destination, function_id, receiver, bound.values, bound.extra_keywords, line, column),
-        .ssl => ssl.execute(Runtime, self, destination, function_id, receiver, bound.values, bound.extra_keywords, line, column),
         else => self.engineFault(),
     };
 }
@@ -106,7 +104,6 @@ pub fn call(
 pub fn getAttribute(comptime Runtime: type, self: *Runtime, object: *types.NativeObject, name: []const u8, line: u32, column: u32) ?Value {
     return switch (object.type_id) {
         .sys_stream, .implementation, .version_info => sys.getAttribute(Runtime, self, object, name, line, column),
-        .ssl_context => ssl.getAttribute(Runtime, self, object, name, line, column),
         .regex_pattern, .regex_match => re.getAttribute(Runtime, self, object, name, line, column),
         .urllib_response, .requests_response, .http_headers => http.getAttribute(Runtime, self, object, name, line, column),
         .csv_reader, .csv_writer, .csv_dict_reader, .csv_dict_writer => csv.getAttribute(Runtime, self, object, name, line, column),
@@ -118,7 +115,6 @@ pub fn getAttribute(comptime Runtime: type, self: *Runtime, object: *types.Nativ
 
 pub fn setAttribute(comptime Runtime: type, self: *Runtime, object: *types.NativeObject, name: []const u8, value: Value, line: u32, column: u32) bool {
     return switch (object.type_id) {
-        .ssl_context => ssl.setAttribute(Runtime, self, object, name, value, line, column),
         .requests_response => http.setAttribute(Runtime, self, object, name, value, line, column),
         .defaultdict => collections.setAttribute(Runtime, self, object, name, value, line, column),
         else => self.nativeAttributeError(line, column, "native attribute is read-only"),

@@ -100,15 +100,15 @@ pub fn testVfsReadonlyAndErrorAtomicity() !void {
     var runtime: vm.Runtime = undefined;
     try runtime.initWithConfig(std.testing.allocator, config);
     defer runtime.deinit();
-    try runtime.mountCourseFile("/course/lesson.txt", "lesson");
+    try runtime.mountAssetFile("/assets/sample.txt", "sample");
     try runScript(&runtime,
         \\import os
         \\from pathlib import Path
-        \\print(Path('/course/lesson.txt').read_text())
+        \\print(Path('/assets/sample.txt').read_text())
         \\for call, expected, label in [
-        \\    (lambda: Path('/course/lesson.txt').write_text('bad'), PermissionError, 'PermissionError'),
-        \\    (lambda: os.remove('/course/lesson.txt'), PermissionError, 'PermissionError'),
-        \\    (lambda: os.rename('/course/lesson.txt', '/home/stolen.txt'), PermissionError, 'PermissionError'),
+        \\    (lambda: Path('/assets/sample.txt').write_text('bad'), PermissionError, 'PermissionError'),
+        \\    (lambda: os.remove('/assets/sample.txt'), PermissionError, 'PermissionError'),
+        \\    (lambda: os.rename('/assets/sample.txt', '/home/stolen.txt'), PermissionError, 'PermissionError'),
         \\]:
         \\    try:
         \\        call()
@@ -131,7 +131,7 @@ pub fn testVfsReadonlyAndErrorAtomicity() !void {
         \\    print('directory preserved', os.path.isdir('/home/dir'))
     , "library-vfs-errors.py", 1);
     try std.testing.expectEqualStrings(
-        "lesson\nPermissionError\nPermissionError\nPermissionError\ntoo large old\nself move True\ndirectory preserved True\n",
+        "sample\nPermissionError\nPermissionError\nPermissionError\ntoo large old\nself move True\ndirectory preserved True\n",
         runtime.stdout(),
     );
 }

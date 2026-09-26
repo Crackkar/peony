@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { instantiatePeony } from './wasm-files-host.mjs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -15,7 +16,7 @@ const status = Object.freeze({
 
 async function newApi() {
   const bytes = await readFile(wasmPath);
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const { instance } = await instantiatePeony(bytes);
   return instance.exports;
 }
 
@@ -27,11 +28,11 @@ function transfer(api, value) {
   return { pointer, length: bytes.length };
 }
 
-function writeVfs(api, handle, path, source, course = false) {
+function writeVfs(api, handle, path, source, asset = false) {
   const pathBlock = transfer(api, path);
   const sourceBlock = transfer(api, source);
   try {
-    return course
+    return asset
       ? api.peony_vfs_mount(handle, pathBlock.pointer, pathBlock.length, sourceBlock.pointer, sourceBlock.length)
       : api.peony_vfs_write(handle, pathBlock.pointer, pathBlock.length, sourceBlock.pointer, sourceBlock.length);
   } finally {
@@ -143,11 +144,11 @@ test('shipping WASM resolves packages and explicit relative imports from the VFS
   const handle = api.peony_session_new(0, 0);
   assert.ok(handle > 0);
   try {
-    assert.equal(writeVfs(api, handle, '/course/pkg.py', 'print("wrong sibling")\nsibling = True\n', true), status.ok);
-    assert.equal(writeVfs(api, handle, '/course/pkg/__init__.py', "print('package init')\n__all__ = ['root']\nroot = 'package'\nfrom . import child\n", true), status.ok);
-    assert.equal(writeVfs(api, handle, '/course/pkg/child.py', "print('child init')\nvalue = 'child'\n", true), status.ok);
-    assert.equal(writeVfs(api, handle, '/course/pkg/sub/__init__.py', "local = 'sub'\n", true), status.ok);
-    assert.equal(writeVfs(api, handle, '/course/pkg/sub/mod.py', 'from .. import root\nfrom . import local\n', true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/pkg.py', 'print("wrong sibling")\nsibling = True\n', true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/pkg/__init__.py', "print('package init')\n__all__ = ['root']\nroot = 'package'\nfrom . import child\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/pkg/child.py', "print('child init')\nvalue = 'child'\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/pkg/sub/__init__.py', "local = 'sub'\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/pkg/sub/mod.py', 'from .. import root\nfrom . import local\n', true), status.ok);
     const source = [
       'import pkg',
       'import pkg.child',
@@ -168,7 +169,7 @@ test('shipping WASM reports ImportError when a package member and child module a
   const handle = api.peony_session_new(0, 0);
   assert.ok(handle > 0);
   try {
-    assert.equal(writeVfs(api, handle, '/course/present_package/__init__.py', 'value = 1\n', true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/present_package/__init__.py', 'value = 1\n', true), status.ok);
     assert.equal(compile(api, handle, 'from present_package import absent\n'), status.ok);
     assert.equal(runAtQuantum(api, handle, 1, [status.pythonException]), status.pythonException);
     assert.match(errorText(api, handle), /ImportError: cannot import name from package/);
@@ -206,7 +207,7 @@ test('shipping WASM star import raises AttributeError for a missing __all__ name
   const handle = api.peony_session_new(0, 0);
   assert.ok(handle > 0);
   try {
-    assert.equal(writeVfs(api, handle, '/course/missing_all/__init__.py', "__all__ = ['missing']\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/missing_all/__init__.py', "__all__ = ['missing']\n", true), status.ok);
     assert.equal(compile(api, handle, 'from missing_all import *\n'), status.ok);
     assert.equal(runAtQuantum(api, handle, 1, [status.pythonException]), status.pythonException);
     assert.match(errorText(api, handle), /AttributeError: module does not define name in __all__/);
@@ -221,8 +222,8 @@ test('shipping WASM resolves dotted imports only under the selected parent packa
   assert.ok(handle > 0);
   try {
     assert.equal(writeVfs(api, handle, '/home/pkgmod.py', "value = 'module'\n"), status.ok);
-    assert.equal(writeVfs(api, handle, '/course/pkgmod/__init__.py', "value = 'package'\n", true), status.ok);
-    assert.equal(writeVfs(api, handle, '/course/pkgmod/child.py', "value = 'wrong parent'\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/pkgmod/__init__.py', "value = 'package'\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/pkgmod/child.py', "value = 'wrong parent'\n", true), status.ok);
     assert.equal(compile(api, handle, 'import pkgmod.child\n'), status.ok);
     assert.equal(runAtQuantum(api, handle, 1, [status.pythonException]), status.pythonException);
     assert.match(errorText(api, handle), /No module named in the session VFS/);
@@ -255,8 +256,8 @@ test('shipping WASM star import schedules an __all__ child that suspends for inp
   const handle = api.peony_session_new(0, 0);
   assert.ok(handle > 0);
   try {
-    assert.equal(writeVfs(api, handle, '/course/star_pkg/__init__.py', "__all__ = ['child']\n", true), status.ok);
-    assert.equal(writeVfs(api, handle, '/course/star_pkg/child.py', "answer = input('Child: ')\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/star_pkg/__init__.py', "__all__ = ['child']\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/star_pkg/child.py', "answer = input('Child: ')\n", true), status.ok);
     assert.equal(compile(api, handle, 'from star_pkg import *\nprint(child.answer)\n', 'star-child.py'), status.ok);
     assert.equal(runAtQuantum(api, handle, 1, [status.hostRequest]), status.hostRequest);
     const eventPointer = api.peony_event_ptr(handle);
@@ -277,9 +278,9 @@ test('shipping WASM dotted relative imports initialize intermediate packages', a
   const handle = api.peony_session_new(0, 0);
   assert.ok(handle > 0);
   try {
-    assert.equal(writeVfs(api, handle, '/course/relative_pkg/__init__.py', "print('package init')\nfrom .sub.mod import value\n", true), status.ok);
-    assert.equal(writeVfs(api, handle, '/course/relative_pkg/sub/__init__.py', "print('sub init')\nready = 'sub'\n", true), status.ok);
-    assert.equal(writeVfs(api, handle, '/course/relative_pkg/sub/mod.py', "print('module init')\nvalue = 8\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/relative_pkg/__init__.py', "print('package init')\nfrom .sub.mod import value\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/relative_pkg/sub/__init__.py', "print('sub init')\nready = 'sub'\n", true), status.ok);
+    assert.equal(writeVfs(api, handle, '/assets/relative_pkg/sub/mod.py', "print('module init')\nvalue = 8\n", true), status.ok);
     const source = [
       'import relative_pkg',
       'print(relative_pkg.sub.ready, relative_pkg.sub.mod.value, relative_pkg.value)',

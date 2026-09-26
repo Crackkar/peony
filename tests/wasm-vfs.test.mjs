@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { instantiatePeony } from './wasm-files-host.mjs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -8,7 +9,7 @@ const status = Object.freeze({ ok: 0, invalidHandle: 2, invalidArgument: 3, outO
 
 async function newApi() {
   const bytes = await readFile(wasmPath);
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const { instance } = await instantiatePeony(bytes);
   return instance.exports;
 }
 
@@ -35,27 +36,27 @@ test('shipping WASM exports bulk VFS operations', async () => {
   ]) assert.equal(typeof api[name], 'function', `${name} must be exported`);
 });
 
-test('raw reset preserves course and home VFS entries and clears temporary entries', async () => {
+test('raw reset preserves asset and home VFS entries and clears temporary entries', async () => {
   const api = await newApi();
   const handle = api.peony_session_new(0, 0);
   const other = api.peony_session_new(0, 0);
   assert.ok(handle > 0);
   assert.ok(other > 0);
   try {
-    const coursePath = pathBytes('/course/lesson.txt');
-    const courseText = new TextEncoder().encode('mounted lesson');
-    const coursePathBlock = transfer(api, coursePath);
-    const courseTextBlock = transfer(api, courseText);
-    const nestedCoursePath = transfer(api, pathBytes('/course/unit/lesson.txt'));
-    const nestedCourseText = transfer(api, new TextEncoder().encode('nested lesson'));
+    const assetPath = pathBytes('/assets/sample.txt');
+    const assetText = new TextEncoder().encode('mounted sample');
+    const assetPathBlock = transfer(api, assetPath);
+    const assetTextBlock = transfer(api, assetText);
+    const nestedAssetPath = transfer(api, pathBytes('/assets/unit/sample.txt'));
+    const nestedAssetText = transfer(api, new TextEncoder().encode('nested sample'));
     try {
-      assert.equal(api.peony_vfs_mount(handle, coursePathBlock.pointer, coursePathBlock.length, courseTextBlock.pointer, courseTextBlock.length), status.ok);
-      assert.equal(api.peony_vfs_mount(handle, nestedCoursePath.pointer, nestedCoursePath.length, nestedCourseText.pointer, nestedCourseText.length), status.ok);
+      assert.equal(api.peony_vfs_mount(handle, assetPathBlock.pointer, assetPathBlock.length, assetTextBlock.pointer, assetTextBlock.length), status.ok);
+      assert.equal(api.peony_vfs_mount(handle, nestedAssetPath.pointer, nestedAssetPath.length, nestedAssetText.pointer, nestedAssetText.length), status.ok);
     } finally {
-      api.peony_transfer_free(coursePathBlock.pointer, coursePathBlock.length);
-      api.peony_transfer_free(courseTextBlock.pointer, courseTextBlock.length);
-      api.peony_transfer_free(nestedCoursePath.pointer, nestedCoursePath.length);
-      api.peony_transfer_free(nestedCourseText.pointer, nestedCourseText.length);
+      api.peony_transfer_free(assetPathBlock.pointer, assetPathBlock.length);
+      api.peony_transfer_free(assetTextBlock.pointer, assetTextBlock.length);
+      api.peony_transfer_free(nestedAssetPath.pointer, nestedAssetPath.length);
+      api.peony_transfer_free(nestedAssetText.pointer, nestedAssetText.length);
     }
 
     for (const [path, text] of [['/home/saved.txt', 'saved'], ['/tmp/throwaway.txt', 'throwaway']]) {
@@ -70,7 +71,7 @@ test('raw reset preserves course and home VFS entries and clears temporary entri
     }
 
     assert.equal(api.peony_reset(handle), status.ok);
-    for (const [path, expected] of [['/course/lesson.txt', 'mounted lesson'], ['/home/saved.txt', 'saved']]) {
+    for (const [path, expected] of [['/assets/sample.txt', 'mounted sample'], ['/home/saved.txt', 'saved']]) {
       const pathBlock = transfer(api, pathBytes(path));
       try {
         assert.equal(api.peony_vfs_read(handle, pathBlock.pointer, pathBlock.length), status.ok);
@@ -88,11 +89,11 @@ test('raw reset preserves course and home VFS entries and clears temporary entri
       api.peony_transfer_free(tempPath.pointer, tempPath.length);
     }
 
-    const nestedDirectory = transfer(api, pathBytes('/course/unit'));
+    const nestedDirectory = transfer(api, pathBytes('/assets/unit'));
     try {
       assert.equal(api.peony_vfs_list(handle, nestedDirectory.pointer, nestedDirectory.length), status.ok);
       const list = new TextDecoder().decode(new Uint8Array(api.memory.buffer, api.peony_vfs_data_ptr(handle), api.peony_vfs_data_len(handle)).slice());
-      assert.equal(list, '/course/unit/lesson.txt\0');
+      assert.equal(list, '/assets/unit/sample.txt\0');
     } finally {
       api.peony_transfer_free(nestedDirectory.pointer, nestedDirectory.length);
     }

@@ -14,19 +14,19 @@ async function loadPeony() {
 test('Peony session mounts, reads, writes and lists copied file bytes', async () => {
   const peony = await loadPeony();
   const session = peony.createSession();
-  const mounted = new TextEncoder().encode('course text');
-  await session.mount({ '/course/lesson.txt': mounted }, { root: '/course' });
-  await session.mount({ 'unit/part.txt': 'nested course text' }, { root: '/course' });
+  const mounted = new TextEncoder().encode('asset text');
+  await session.mount({ '/assets/sample.txt': mounted }, { root: '/assets' });
+  await session.mount({ 'unit/part.txt': 'nested asset text' }, { root: '/assets' });
   mounted.fill(0);
-  assert.equal(new TextDecoder().decode(await session.readFile('/course/lesson.txt')), 'course text');
-  assert.equal(new TextDecoder().decode(await session.readFile('/course/unit/part.txt')), 'nested course text');
-  await session.writeFile('/home/note.txt', new TextEncoder().encode('learner data'));
+  assert.equal(new TextDecoder().decode(await session.readFile('/assets/sample.txt')), 'asset text');
+  assert.equal(new TextDecoder().decode(await session.readFile('/assets/unit/part.txt')), 'nested asset text');
+  await session.writeFile('/home/note.txt', new TextEncoder().encode('user data'));
   const read = await session.readFile('/home/note.txt');
-  assert.equal(new TextDecoder().decode(read), 'learner data');
+  assert.equal(new TextDecoder().decode(read), 'user data');
   read.fill(0);
-  assert.equal(new TextDecoder().decode(await session.readFile('/home/note.txt')), 'learner data');
+  assert.equal(new TextDecoder().decode(await session.readFile('/home/note.txt')), 'user data');
   assert.deepEqual(await session.listFiles('/home'), ['/home/note.txt']);
-  await assert.rejects(session.writeFile('/course/lesson.txt', new Uint8Array([1])), /read.only|permission/i);
+  await assert.rejects(session.writeFile('/assets/sample.txt', new Uint8Array([1])), /read.only|permission/i);
   await assert.rejects(session.readFile('/../../escape'), /path|traversal|invalid/i);
   await session.destroy();
 });
@@ -40,7 +40,7 @@ test('ESM VFS file APIs reject non-string paths without coercion', async () => {
     assert.throws(() => session.listFiles(null), TypeError);
     const symbolPaths = { [Symbol('path')]: 'x' };
     await assert.rejects(session.mount(symbolPaths), TypeError);
-    await assert.rejects(session.mount({ '/course/file.txt': 'x' }, { root: null }), TypeError);
+    await assert.rejects(session.mount({ '/assets/file.txt': 'x' }, { root: null }), TypeError);
     assert.deepEqual(await session.listFiles('/home'), []);
   } finally {
     await session.destroy();
@@ -108,7 +108,60 @@ test('file modes, encoding, binary writes and text seek cookies follow Python', 
   await session.destroy();
 });
 
-test('persistent VFS snapshot does not need a second session copy of file contents', async () => {
+test('Worker file host treats positional offsets as bytes', async () => {
+  const peony = await loadPeony();
+  const session = peony.createSession();
+  try {
+    const result = await session.run([
+      'with open("/home/offset.bin", "wb+") as file:',
+      '    file.seek(255)',
+      '    file.write(b"x")',
+      '    file.truncate(256)',
+      '    file.seek(254)',
+      '    assert file.read() == b"\\x00x"',
+    ].join('\n'));
+    assert.equal(result.status, 'completed', result.error?.message);
+    const bytes = await session.readFile('/home/offset.bin');
+    assert.equal(bytes.length, 256);
+    assert.equal(bytes[254], 0);
+    assert.equal(bytes[255], 120);
+  } finally {
+    await session.destroy();
+  }
+});
+
+test('Worker file host keeps unlinked open bytes charged until close', async () => {
+  const peony = await loadPeony();
+  const output = [];
+  const session = peony.createSession({
+    stdout: chunk => output.push(chunk),
+    maxVfsBytes: 32,
+    maxFileBytes: 32,
+  });
+  try {
+    const result = await session.run([
+      'import os',
+      'with open("/home/old.bin", "wb+") as stream:',
+      '    stream.write(b"a" * 32)',
+      '    os.unlink("/home/old.bin")',
+      '    try:',
+      '        open("/home/new.bin", "wb").write(b"x")',
+      '    except OSError:',
+      '        print("held")',
+      'with open("/home/new.bin", "wb") as stream:',
+      '    stream.write(b"b" * 32)',
+      'print(open("/home/new.bin", "rb").read() == b"b" * 32)',
+    ].join('\n'));
+    assert.equal(result.status, 'completed', result.error?.message);
+    assert.equal(output.join(''), 'held\nTrue\n');
+    assert.equal((await session.readFile('/home/new.bin')).length, 32);
+    assert.equal((await session.stats()).vfsBytes, 32);
+  } finally {
+    await session.destroy();
+  }
+});
+
+test('persistent Worker files survive raw runtime replacement without a file copy', async () => {
   const peony = await loadPeony();
   const output = [];
   const session = peony.createSession({
@@ -129,11 +182,11 @@ test('persistent VFS snapshot does not need a second session copy of file conten
   await session.destroy();
 });
 
-test('ESM fresh runs retain course and home but clear temporary files and reset does too', async () => {
+test('ESM fresh runs retain asset and home but clear temporary files and reset does too', async () => {
   const peony = await loadPeony();
   const output = [];
   const session = peony.createSession({ stdout: (chunk) => output.push(chunk) });
-  await session.mount({ '/course/lesson.txt': new TextEncoder().encode('course') });
+  await session.mount({ '/assets/sample.txt': new TextEncoder().encode('asset') });
   let result = await session.run([
     'with open("/home/notes.txt", "w") as file:',
     '    file.write("home")',
@@ -144,7 +197,7 @@ test('ESM fresh runs retain course and home but clear temporary files and reset 
   assert.equal(result.status, 'completed');
 
   result = await session.run([
-    'print(open("/course/lesson.txt").read())',
+    'print(open("/assets/sample.txt").read())',
     'print(open("/home/notes.txt").read())',
     'try:',
     '    open("/tmp/notes.txt")',
@@ -153,12 +206,12 @@ test('ESM fresh runs retain course and home but clear temporary files and reset 
     '',
   ].join('\n'));
   assert.equal(result.status, 'completed');
-  assert.equal(output.join(''), 'course\nhome\ntmp cleared\n');
+  assert.equal(output.join(''), 'asset\nhome\ntmp cleared\n');
 
   await session.writeFile('/tmp/reset.txt', new TextEncoder().encode('tmp'));
   await session.reset();
   assert.equal(new TextDecoder().decode(await session.readFile('/home/notes.txt')), 'home');
-  assert.equal(new TextDecoder().decode(await session.readFile('/course/lesson.txt')), 'course');
+  assert.equal(new TextDecoder().decode(await session.readFile('/assets/sample.txt')), 'asset');
   await assert.rejects(session.readFile('/tmp/reset.txt'), /not found|missing/i);
   await session.destroy();
 });

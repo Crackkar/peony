@@ -1,3 +1,5 @@
+import { createFsHost } from './fs-host.mjs';
+
 const STATUS = Object.freeze({
   ok: 0,
   invalidHandle: 2,
@@ -21,6 +23,7 @@ const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 export const Peony = Object.freeze({
   async load(source) {
     await assertWorkerContext();
+    const filesystem = createFsHost();
     let input;
     if (source instanceof URL || typeof source === 'string') {
       const response = await fetch(source);
@@ -30,8 +33,9 @@ export const Peony = Object.freeze({
       const response = source.clone();
       if (typeof WebAssembly.instantiateStreaming === 'function') {
         try {
-          const { instance } = await WebAssembly.instantiateStreaming(response, {});
-          return new PeonyModule(instance.exports);
+          const { instance } = await WebAssembly.instantiateStreaming(response, filesystem.imports);
+          filesystem.bind(instance.exports);
+          return new PeonyModule(instance.exports, filesystem);
         } catch {
           // Servers sometimes send WASM with the wrong MIME type; byte instantiation works there.
         }
@@ -44,27 +48,31 @@ export const Peony = Object.freeze({
     } else {
       throw new TypeError('Peony.load expects a URL string, URL, Response, ArrayBuffer, or typed array');
     }
-    const { instance } = await WebAssembly.instantiate(input, {});
-    return new PeonyModule(instance.exports);
+    const { instance } = await WebAssembly.instantiate(input, filesystem.imports);
+    filesystem.bind(instance.exports);
+    return new PeonyModule(instance.exports, filesystem);
   },
 });
 
 class PeonyModule {
-  constructor(exports) {
+  constructor(exports, filesystem) {
     if (!(exports.memory instanceof WebAssembly.Memory) || exports.peony_abi_version() !== 1) {
       throw new Error('incompatible Peony WASM ABI');
     }
     this.exports = exports;
+    this.filesystem = filesystem;
   }
 
   createSession(options = {}) {
-    return new PeonySession(this.exports, options);
+    return new PeonySession(this.exports, this.filesystem, options);
   }
 }
 
 class PeonySession {
-  constructor(api, options) {
+  constructor(api, filesystem, options) {
     this.api = api;
+    this.filesystem = filesystem;
+    this.savedFilesHandle = 0;
     this.options = {
       stdout: options.stdout,
       stderr: options.stderr,
@@ -72,7 +80,6 @@ class PeonySession {
       fetch: options.fetch ?? globalThis.fetch,
       allowUrl: options.allowUrl,
       maxHttpResponseBytes: options.maxHttpResponseBytes ?? MAX_PACKET_BYTES - 16 * 1024,
-      followRedirects: options.followRedirects ?? false,
       wallClock: options.wallClock ?? (() => Date.now() / 1000),
       monotonicClock: options.monotonicClock ?? (() => performance.now() / 1000),
       sleep: options.sleep ?? defaultSleep,
@@ -218,11 +225,11 @@ class PeonySession {
   }
 
   mount(files, options = {}) {
-    if (files === null || typeof files !== 'object') throw new TypeError('mount expects a mapping of /course paths to bytes');
+    if (files === null || typeof files !== 'object') throw new TypeError('mount expects a mapping of /assets paths to bytes');
     if (options === null || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('mount options must be an object');
     for (const key of Reflect.ownKeys(options)) if (key !== 'root') throw new TypeError(`unsupported mount option: ${String(key)}`);
-    const root = Object.hasOwn(options, 'root') ? options.root : '/course';
-    if (typeof root !== 'string' || !root.startsWith('/course')) throw new TypeError('mount root must be inside /course');
+    const root = Object.hasOwn(options, 'root') ? options.root : '/assets';
+    if (typeof root !== 'string' || !root.startsWith('/assets')) throw new TypeError('mount root must be inside /assets');
     if (!(files instanceof Map) && Object.getOwnPropertySymbols(files).some((key) => Object.prototype.propertyIsEnumerable.call(files, key))) {
       throw new TypeError('mount paths must be strings');
     }
@@ -313,21 +320,6 @@ class PeonySession {
     throw new Error(`Peony VFS ${operation} rejected: invalid path or permission denied (${result})`);
   }
 
-  snapshotPersistentVfs() {
-    const files = [];
-    for (const root of ['/course', '/home']) {
-      for (const path of this.listFiles(root)) files.push([path, this.readFile(path)]);
-    }
-    return { directories: this.listDirectories('/home'), files };
-  }
-
-  restorePersistentVfs(snapshot) {
-    for (const path of snapshot.directories) this.vfsMkdir(path);
-    for (const [path, bytes] of snapshot.files) {
-      this.vfsWrite(path.startsWith('/course/') ? 'peony_vfs_mount' : 'peony_vfs_write', path, bytes);
-    }
-  }
-
   reset() {
     if (this.running) {
       this.resetRequested = true;
@@ -341,6 +333,11 @@ class PeonySession {
 
   destroy() {
     if (this.running) throw new Error('cannot destroy a running Peony session');
+    if (this.handle === 0) {
+      if (this.savedFilesHandle !== 0) this.filesystem.release(this.savedFilesHandle);
+      this.savedFilesHandle = 0;
+      return true;
+    }
     const result = this.api.peony_session_destroy(this.handle);
     this.handle = 0;
     return result === STATUS.ok;
@@ -445,13 +442,18 @@ class PeonySession {
     let timedOut = false;
     const timer = timeout === null ? null : setTimeout(() => { timedOut = true; controller.abort(); }, Math.min(timeout * 1000, 0x7fff_ffff));
     try {
-      if (this.options.allowUrl && !(await this.options.allowUrl(url))) return serviceError('policy', new Error('URL denied by host policy'));
+      if (this.options.allowUrl) {
+        const allowed = await awaitAbortable(this.options.allowUrl(url), controller.signal);
+        if (controller.signal.aborted) return serviceError(timedOut ? 'timeout' : 'connection', new Error('request aborted'));
+        if (!allowed) return serviceError('policy', new Error('URL denied by host policy'));
+      }
+      if (controller.signal.aborted) return serviceError(timedOut ? 'timeout' : 'connection', new Error('request aborted'));
       const response = await this.options.fetch(url, {
         method,
         headers,
         body: sections[3].bytes.length ? sections[3].bytes : undefined,
         credentials: 'omit',
-        redirect: this.options.followRedirects ? 'follow' : 'error',
+        redirect: 'error',
         signal: controller.signal,
       });
       if (!(response instanceof Response)) throw new Error('fetch did not return a Response');
@@ -569,14 +571,22 @@ class PeonySession {
   }
 
   replaceRawSession() {
-    const persistentFiles = this.handle === 0 ? { directories: [], files: [] } : this.snapshotPersistentVfs();
     if (this.handle !== 0) {
+      this.filesystem.retain(this.handle);
       const destroyed = this.api.peony_session_destroy(this.handle);
-      if (destroyed !== STATUS.ok) throw new Error(`Peony session destroy failed (${destroyed})`);
+      if (destroyed !== STATUS.ok) {
+        this.filesystem.unretain(this.handle);
+        throw new Error(`Peony session destroy failed (${destroyed})`);
+      }
+      this.savedFilesHandle = this.handle;
       this.handle = 0;
     }
-    this.handle = this.createRawSession();
-    this.restorePersistentVfs(persistentFiles);
+    const next = this.createRawSession();
+    if (this.savedFilesHandle !== 0) {
+      this.filesystem.move(this.savedFilesHandle, next);
+      this.savedFilesHandle = 0;
+    }
+    this.handle = next;
     this.outputDecoder = new TextDecoder();
     this.cancelled = false;
   }
@@ -753,6 +763,16 @@ function positiveUint64(value) {
 
 function yieldToHostTask() {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function awaitAbortable(value, signal) {
+  if (signal.aborted) return Promise.resolve(false);
+  let onAbort;
+  const aborted = new Promise(resolve => {
+    onAbort = () => resolve(false);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  return Promise.race([Promise.resolve(value), aborted]).finally(() => signal.removeEventListener('abort', onAbort));
 }
 
 function encodePacket({ kind, requestId, statusCode = 0, text, sections }) {

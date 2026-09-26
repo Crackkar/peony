@@ -30,7 +30,6 @@ pub const ModuleId = enum(u8) {
     requests,
     requests_exceptions,
     time,
-    ssl,
 };
 
 pub const TypeId = enum(u8) {
@@ -48,7 +47,6 @@ pub const TypeId = enum(u8) {
     urllib_response,
     requests_response,
     http_headers,
-    ssl_context,
     version_info,
     implementation,
 };

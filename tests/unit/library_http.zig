@@ -99,7 +99,7 @@ fn httpOk(runtime: *vm.Runtime, request_id: u32, status_code: u16, headers: []co
     try resumePacket(runtime, .http, request_id, .ok, &sections);
 }
 
-pub fn testUrlopenResponseCursorContextSslAndValidation() !void {
+pub fn testUrlopenResponseCursorAndValidation() !void {
     _ = &compileUrllibModule;
     _ = &compileRequestsModule;
     var runtime: vm.Runtime = undefined;
@@ -108,12 +108,7 @@ pub fn testUrlopenResponseCursorContextSslAndValidation() !void {
     try ready(&runtime,
         \\from urllib.request import urlopen
         \\from urllib.error import URLError, HTTPError
-        \\import ssl
-        \\context = ssl.create_default_context()
-        \\print(isinstance(context, ssl.SSLContext), context.check_hostname, context.verify_mode == ssl.CERT_REQUIRED)
-        \\context.check_hostname = False
-        \\context.verify_mode = ssl.CERT_NONE
-        \\response = urlopen("https://example.test/data", timeout=2.5, context=context)
+        \\response = urlopen("https://example.test/data", timeout=2.5)
         \\print(response.status, response.getcode(), response.headers["content-type"])
         \\print(response.read(2), response.read(-1), response.read())
         \\response.close()
@@ -122,10 +117,6 @@ pub fn testUrlopenResponseCursorContextSslAndValidation() !void {
         \\except ValueError:
         \\    print("closed")
         \\try:
-        \\    ssl.SSLContext().verify_mode = 99
-        \\except ValueError:
-        \\    print("bad verify")
-        \\try:
         \\    urlopen("ftp://example.test/file")
         \\except ValueError:
         \\    print("bad scheme")
@@ -133,10 +124,6 @@ pub fn testUrlopenResponseCursorContextSslAndValidation() !void {
         \\    urlopen("https://example.test/", data="text")
         \\except TypeError:
         \\    print("bad data")
-        \\try:
-        \\    urlopen("https://example.test/", context=1)
-        \\except TypeError:
-        \\    print("bad context")
         \\try:
         \\    urlopen("https://example.test/", timeout=-1)
         \\except ValueError:
@@ -156,47 +143,9 @@ pub fn testUrlopenResponseCursorContextSslAndValidation() !void {
     if (result != .completed) std.debug.print("urlopen result={s}: {s}\n", .{ @tagName(result), runtime.errorText() });
     try std.testing.expectEqual(vm.RunStatus.completed, result);
     try std.testing.expectEqualStrings(
-        "True True True\n200 200 text/plain; charset=utf-8\nb'he' b'llo' b''\nclosed\nbad verify\nbad scheme\nbad data\nbad context\nbad timeout\n",
+        "200 200 text/plain; charset=utf-8\nb'he' b'llo' b''\nclosed\nbad scheme\nbad data\nbad timeout\n",
         runtime.stdout(),
     );
-}
-
-pub fn testSslContextTypeAndMutation() !void {
-    var runtime: vm.Runtime = undefined;
-    try runtime.init(std.testing.allocator, 4 * 1024 * 1024);
-    defer runtime.deinit();
-    try ready(&runtime,
-        \\import ssl
-        \\first = ssl.SSLContext()
-        \\second = ssl.create_default_context()
-        \\print(type(first) is ssl.SSLContext, isinstance(second, ssl.SSLContext))
-        \\print(first.check_hostname, first.verify_mode == ssl.CERT_REQUIRED)
-        \\try:
-        \\    first.verify_mode = ssl.CERT_NONE
-        \\except ValueError:
-        \\    print("hostname guard")
-        \\first.check_hostname = False
-        \\first.verify_mode = ssl.CERT_NONE
-        \\print(first.check_hostname, first.verify_mode == ssl.CERT_NONE)
-        \\first.check_hostname = True
-        \\print(first.check_hostname, first.verify_mode == ssl.CERT_REQUIRED)
-        \\try:
-        \\    first.verify_mode = 99
-        \\except ValueError:
-        \\    print("invalid mode")
-        \\try:
-        \\    first.check_hostname = "yes"
-        \\except TypeError:
-        \\    print("invalid hostname")
-        \\try:
-        \\    first.extra = 1
-        \\except AttributeError:
-        \\    print("readonly")
-    );
-    const result = try boundary(&runtime, 1);
-    if (result != .completed) std.debug.print("ssl result={s}: {s}\n", .{ @tagName(result), runtime.errorText() });
-    try std.testing.expectEqual(vm.RunStatus.completed, result);
-    try std.testing.expectEqualStrings("True True\nTrue True\nhostname guard\nFalse True\nTrue True\ninvalid mode\ninvalid hostname\nreadonly\n", runtime.stdout());
 }
 
 pub fn testUrlopenPostContextManagerAndErrors() !void {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Error = error{
     InvalidPath,
@@ -8,6 +9,7 @@ pub const Error = error{
     NotDirectory,
     IsDirectory,
     PermissionDenied,
+    IoFailure,
     TooLarge,
     OutOfMemory,
 };
@@ -23,6 +25,41 @@ pub const FileNode = struct {
     links: usize = 1,
     handles: usize = 0,
     read_only: bool = false,
+    host_handle: u32 = 0,
+};
+
+pub const HostKind = enum { missing, file, directory };
+pub const FileAccess = enum { read_only, write_only, read_write };
+
+/// Filesystem storage belongs to the host. The VM retains Python file and
+/// path semantics while an adapter supplies real OS or Worker-owned storage.
+pub const HostBackend = struct {
+    context: *anyopaque,
+    ops: *const Ops,
+
+    pub const Ops = struct {
+        stat: *const fn (*anyopaque, []const u8) HostKind,
+        read: *const fn (*anyopaque, std.mem.Allocator, []const u8, usize) Error![]u8,
+        write: *const fn (*anyopaque, []const u8, []const u8, WriteMode) Error!void,
+        open: *const fn (*anyopaque, []const u8, FileAccess) Error!u32,
+        read_open: *const fn (*anyopaque, std.mem.Allocator, u32, usize) Error![]u8,
+        read_at: *const fn (*anyopaque, u32, u64, []u8) Error!usize,
+        replace_open: *const fn (*anyopaque, u32, []const u8) Error!void,
+        length_open: *const fn (*anyopaque, u32) Error!usize,
+        write_at: *const fn (*anyopaque, u32, u64, []const u8) Error!void,
+        truncate_open: *const fn (*anyopaque, u32, u64) Error!void,
+        close: *const fn (*anyopaque, u32) void,
+        mkdir: *const fn (*anyopaque, []const u8, bool, bool) Error!void,
+        remove: *const fn (*anyopaque, []const u8, bool) Error!void,
+        rename: *const fn (*anyopaque, []const u8, []const u8, bool) Error!void,
+        list: *const fn (*anyopaque, std.mem.Allocator, []const u8, bool, usize) Error![]u8,
+        mount_asset: *const fn (*anyopaque, []const u8, []const u8) Error!void,
+        clear_temporary: *const fn (*anyopaque) void,
+        total_bytes: *const fn (*anyopaque) usize,
+        normalize: *const fn (*anyopaque, std.mem.Allocator, []const u8) Error![]u8,
+        writable: *const fn (*anyopaque, []const u8) bool,
+        destroy: *const fn (*anyopaque) void,
+    };
 };
 
 pub const Entry = struct {
@@ -39,6 +76,14 @@ pub const Vfs = struct {
     total_bytes: usize = 0,
     max_total_bytes: usize,
     max_file_bytes: usize,
+    host: ?HostBackend = null,
+    native_paths: bool = false,
+    host_nodes: std.ArrayList(*FileNode) = .empty,
+    borrowed: []u8 = &.{},
+
+    pub fn bindHost(self: *Vfs, backend: HostBackend) void {
+        self.host = backend;
+    }
 
     pub fn init(allocator: std.mem.Allocator, max_total_bytes: usize, max_file_bytes: usize) Error!Vfs {
         var fs = Vfs{
@@ -47,14 +92,28 @@ pub const Vfs = struct {
             .max_file_bytes = @min(max_file_bytes, max_total_bytes),
         };
         errdefer fs.deinit();
-        try fs.addDirectory("/", false);
-        try fs.addDirectory("/course", true);
-        try fs.addDirectory("/home", false);
-        try fs.addDirectory("/tmp", false);
+        // The in-Zig store exists for direct engine unit tests. Shipping
+        // adapters bind OS or Worker storage before exposing a session.
+        if (builtin.is_test) {
+            try fs.addDirectory("/", false);
+            try fs.addDirectory("/assets", true);
+            try fs.addDirectory("/home", false);
+            try fs.addDirectory("/tmp", false);
+        }
         return fs;
     }
 
     pub fn deinit(self: *Vfs) void {
+        if (self.host) |backend| {
+            for (self.host_nodes.items) |node| {
+                backend.ops.close(backend.context, node.host_handle);
+                if (node.bytes.len != 0) self.allocator.free(node.bytes);
+                self.allocator.destroy(node);
+            }
+            self.host_nodes.deinit(self.allocator);
+            if (self.borrowed.len != 0) self.allocator.free(self.borrowed);
+            backend.ops.destroy(backend.context);
+        }
         for (self.entries.items) |entry| self.allocator.free(entry.path);
         self.entries.deinit(self.allocator);
         for (self.nodes.items) |node| {
@@ -66,27 +125,56 @@ pub const Vfs = struct {
     }
 
     pub fn normalizeOwned(self: *const Vfs, path: []const u8) Error![]u8 {
+        if (self.host) |backend| return backend.ops.normalize(backend.context, self.allocator, path);
         return normalizePath(self.allocator, path);
     }
 
+    pub fn writable(self: *const Vfs, path: []const u8) bool {
+        if (self.host) |backend| return backend.ops.writable(backend.context, path);
+        return isWritablePath(path);
+    }
+
     pub fn read(self: *const Vfs, path: []const u8) Error![]const u8 {
+        if (self.host) |backend| {
+            const mutable: *Vfs = @constCast(self);
+            if (mutable.borrowed.len != 0) self.allocator.free(mutable.borrowed);
+            mutable.borrowed = &.{};
+            mutable.borrowed = try backend.ops.read(backend.context, self.allocator, path, self.max_file_bytes);
+            return mutable.borrowed;
+        }
         const normalized = try normalizePath(self.allocator, path);
         defer self.allocator.free(normalized);
         return self.readNormalized(normalized);
     }
 
     pub fn exists(self: *const Vfs, path: []const u8) bool {
+        if (self.host) |backend| return backend.ops.stat(backend.context, path) != .missing;
         const normalized = normalizePath(self.allocator, path) catch return false;
         defer self.allocator.free(normalized);
         return self.find(normalized) != null;
     }
 
     pub fn existsNormalized(self: *const Vfs, normalized: []const u8) bool {
+        if (self.host) |backend| return backend.ops.stat(backend.context, normalized) != .missing;
         return self.find(normalized) != null;
     }
 
     pub fn readNormalized(self: *const Vfs, normalized: []const u8) Error![]const u8 {
+        if (self.host != null) return self.read(normalized);
         return self.readNode(try self.fileNodeNormalized(normalized));
+    }
+
+    pub fn openNode(self: *Vfs, normalized: []const u8, access: FileAccess) Error!*FileNode {
+        if (self.host) |backend| {
+            const handle = try backend.ops.open(backend.context, normalized, access);
+            errdefer backend.ops.close(backend.context, handle);
+            const node = self.allocator.create(FileNode) catch return error.OutOfMemory;
+            errdefer self.allocator.destroy(node);
+            node.* = .{ .host_handle = handle, .links = 0, .handles = 1 };
+            self.host_nodes.append(self.allocator, node) catch return error.OutOfMemory;
+            return node;
+        }
+        return self.fileNodeNormalized(normalized);
     }
 
     pub fn fileNodeNormalized(self: *const Vfs, normalized: []const u8) Error!*FileNode {
@@ -96,8 +184,40 @@ pub const Vfs = struct {
         return entry.node.?;
     }
 
-    pub fn readNode(_: *const Vfs, node: *const FileNode) Error![]const u8 {
+    pub fn readNode(self: *const Vfs, node: *const FileNode) Error![]const u8 {
+        if (self.host) |backend| {
+            const mutable: *FileNode = @constCast(node);
+            if (mutable.bytes.len != 0) self.allocator.free(mutable.bytes);
+            mutable.bytes = &.{};
+            mutable.bytes = try backend.ops.read_open(backend.context, self.allocator, node.host_handle, self.max_file_bytes);
+            return mutable.bytes;
+        }
         return node.bytes;
+    }
+
+    pub fn readAtNode(self: *const Vfs, node: *const FileNode, offset: u64, output: []u8) Error!usize {
+        const backend = self.host orelse return error.IoFailure;
+        return backend.ops.read_at(backend.context, node.host_handle, offset, output);
+    }
+
+    pub fn totalBytes(self: *const Vfs) usize {
+        if (self.host) |backend| return backend.ops.total_bytes(backend.context);
+        return self.total_bytes;
+    }
+
+    pub fn lengthNode(self: *const Vfs, node: *const FileNode) Error!usize {
+        if (self.host) |backend| return backend.ops.length_open(backend.context, node.host_handle);
+        return node.bytes.len;
+    }
+
+    pub fn writeAtNode(self: *Vfs, node: *FileNode, offset: u64, bytes: []const u8) Error!void {
+        const backend = self.host orelse return error.IoFailure;
+        return backend.ops.write_at(backend.context, node.host_handle, offset, bytes);
+    }
+
+    pub fn truncateNode(self: *Vfs, node: *FileNode, length: u64) Error!void {
+        const backend = self.host orelse return error.IoFailure;
+        return backend.ops.truncate_open(backend.context, node.host_handle, length);
     }
 
     pub fn retainFile(_: *Vfs, node: *FileNode) void {
@@ -107,21 +227,36 @@ pub const Vfs = struct {
     pub fn releaseFile(self: *Vfs, node: *FileNode) void {
         std.debug.assert(node.handles != 0);
         node.handles -= 1;
+        if (self.host) |backend| {
+            if (node.handles == 0) {
+                backend.ops.close(backend.context, node.host_handle);
+                if (node.bytes.len != 0) self.allocator.free(node.bytes);
+                for (self.host_nodes.items, 0..) |item, index| if (item == node) {
+                    _ = self.host_nodes.orderedRemove(index);
+                    break;
+                };
+                self.allocator.destroy(node);
+            }
+            return;
+        }
         self.maybeDestroyNode(node);
     }
 
     pub fn isDirectoryNormalized(self: *const Vfs, normalized: []const u8) bool {
+        if (self.host) |backend| return backend.ops.stat(backend.context, normalized) == .directory;
         const index = self.find(normalized) orelse return false;
         return self.entries.items[index].kind == .directory;
     }
 
     pub fn write(self: *Vfs, path: []const u8, bytes: []const u8, mode: WriteMode) Error!void {
+        if (self.host) |backend| return backend.ops.write(backend.context, path, bytes, mode);
         const normalized = try normalizePath(self.allocator, path);
         defer self.allocator.free(normalized);
         try self.writeNormalized(normalized, bytes, mode);
     }
 
     pub fn writeNormalized(self: *Vfs, normalized: []const u8, bytes: []const u8, mode: WriteMode) Error!void {
+        if (self.host) |backend| return backend.ops.write(backend.context, normalized, bytes, mode);
         if (!isWritablePath(normalized)) return error.PermissionDenied;
         if (bytes.len > self.max_file_bytes) return error.TooLarge;
         const parent = parentPath(normalized) orelse return error.InvalidPath;
@@ -142,6 +277,16 @@ pub const Vfs = struct {
     }
 
     pub fn writeNode(self: *Vfs, node: *FileNode, bytes: []const u8, mode: WriteMode) Error!void {
+        if (self.host) |backend| {
+            if (mode == .exclusive) return error.Exists;
+            if (mode == .replace) return backend.ops.replace_open(backend.context, node.host_handle, bytes);
+            const old = try self.readNode(node);
+            const combined = self.allocator.alloc(u8, old.len + bytes.len) catch return error.OutOfMemory;
+            defer self.allocator.free(combined);
+            @memcpy(combined[0..old.len], old);
+            @memcpy(combined[old.len..], bytes);
+            return backend.ops.replace_open(backend.context, node.host_handle, combined);
+        }
         if (node.read_only) return error.PermissionDenied;
         if (mode == .exclusive) return error.Exists;
         const old_len = node.bytes.len;
@@ -165,6 +310,11 @@ pub const Vfs = struct {
 
     /// On success the VFS takes ownership of `replacement` without copying it.
     pub fn replaceNodeOwned(self: *Vfs, node: *FileNode, replacement: []u8) Error!void {
+        if (self.host) |backend| {
+            try backend.ops.replace_open(backend.context, node.host_handle, replacement);
+            if (replacement.len != 0) self.allocator.free(replacement);
+            return;
+        }
         if (node.read_only) return error.PermissionDenied;
         if (replacement.len > self.max_file_bytes) return error.TooLarge;
         const new_total = std.math.add(usize, self.total_bytes - node.bytes.len, replacement.len) catch return error.TooLarge;
@@ -174,12 +324,13 @@ pub const Vfs = struct {
         self.total_bytes = new_total;
     }
 
-    /// Mounts read-only course content. Missing parent directories are created
+    /// Mounts read-only asset content. Missing parent directories are created
     /// transactionally so an allocation failure leaves the visible tree intact.
-    pub fn mountCourse(self: *Vfs, path: []const u8, bytes: []const u8) Error!void {
+    pub fn mountAsset(self: *Vfs, path: []const u8, bytes: []const u8) Error!void {
+        if (self.host) |backend| return backend.ops.mount_asset(backend.context, path, bytes);
         const normalized = try normalizePath(self.allocator, path);
         defer self.allocator.free(normalized);
-        if (!std.mem.startsWith(u8, normalized, "/course/") or normalized.len <= "/course/".len) return error.PermissionDenied;
+        if (!std.mem.startsWith(u8, normalized, "/assets/") or normalized.len <= "/assets/".len) return error.PermissionDenied;
         if (bytes.len > self.max_file_bytes) return error.TooLarge;
         if (self.find(normalized)) |index| {
             const entry = self.entries.items[index];
@@ -192,17 +343,19 @@ pub const Vfs = struct {
         const original_len = self.entries.items.len;
         errdefer self.rollbackEntries(original_len);
         const parent = parentPath(normalized) orelse return error.InvalidPath;
-        try self.createMissingCourseParents(parent);
+        try self.createMissingAssetParents(parent);
         try self.addFile(normalized, bytes, true);
     }
 
     pub fn mkdir(self: *Vfs, path: []const u8, parents: bool, exist_ok: bool) Error!void {
+        if (self.host) |backend| return backend.ops.mkdir(backend.context, path, parents, exist_ok);
         const normalized = try normalizePath(self.allocator, path);
         defer self.allocator.free(normalized);
         try self.mkdirNormalized(normalized, parents, exist_ok);
     }
 
     pub fn mkdirNormalized(self: *Vfs, normalized: []const u8, parents: bool, exist_ok: bool) Error!void {
+        if (self.host) |backend| return backend.ops.mkdir(backend.context, normalized, parents, exist_ok);
         if (!isWritablePath(normalized) or std.mem.eql(u8, normalized, "/home") or std.mem.eql(u8, normalized, "/tmp")) {
             if (self.find(normalized)) |index| {
                 if (self.entries.items[index].kind == .directory and exist_ok) return;
@@ -249,12 +402,14 @@ pub const Vfs = struct {
 
     /// Removes a file (`directory == false`) or an empty directory.
     pub fn remove(self: *Vfs, path: []const u8, directory: bool) Error!void {
+        if (self.host) |backend| return backend.ops.remove(backend.context, path, directory);
         const normalized = try normalizePath(self.allocator, path);
         defer self.allocator.free(normalized);
         try self.removeNormalized(normalized, directory);
     }
 
     pub fn removeNormalized(self: *Vfs, normalized: []const u8, directory: bool) Error!void {
+        if (self.host) |backend| return backend.ops.remove(backend.context, normalized, directory);
         if (!isWritablePath(normalized)) return error.PermissionDenied;
         const index = self.find(normalized) orelse return error.NotFound;
         const entry = self.entries.items[index];
@@ -270,6 +425,7 @@ pub const Vfs = struct {
     /// Moves a file or complete directory subtree. When `replace_destination` is
     /// true, a same-kind file or empty directory destination is removed first.
     pub fn rename(self: *Vfs, source: []const u8, destination: []const u8, replace_destination: bool) Error!void {
+        if (self.host) |backend| return backend.ops.rename(backend.context, source, destination, replace_destination);
         const normalized_source = try normalizePath(self.allocator, source);
         defer self.allocator.free(normalized_source);
         const normalized_destination = try normalizePath(self.allocator, destination);
@@ -278,6 +434,7 @@ pub const Vfs = struct {
     }
 
     pub fn renameNormalized(self: *Vfs, source: []const u8, destination: []const u8, replace_destination: bool) Error!void {
+        if (self.host) |backend| return backend.ops.rename(backend.context, source, destination, replace_destination);
         if (!isWritablePath(source) or !isWritablePath(destination)) return error.PermissionDenied;
         if (std.mem.eql(u8, source, destination)) return;
         const source_index = self.find(source) orelse return error.NotFound;
@@ -328,6 +485,7 @@ pub const Vfs = struct {
     }
 
     pub fn list(self: *const Vfs, path: []const u8) Error![]u8 {
+        if (self.host) |backend| return backend.ops.list(backend.context, self.allocator, path, false, 0);
         const normalized = try normalizePath(self.allocator, path);
         defer self.allocator.free(normalized);
         return self.listNormalized(normalized);
@@ -335,6 +493,7 @@ pub const Vfs = struct {
 
     /// Returns NUL-separated full file paths below a directory, sorted by bytes.
     pub fn listNormalized(self: *const Vfs, normalized: []const u8) Error![]u8 {
+        if (self.host) |backend| return backend.ops.list(backend.context, self.allocator, normalized, false, 0);
         const index = self.find(normalized) orelse return error.NotFound;
         if (self.entries.items[index].kind != .directory) return error.NotDirectory;
         var paths: std.ArrayList([]const u8) = .empty;
@@ -349,12 +508,14 @@ pub const Vfs = struct {
 
     /// Returns sorted, NUL-separated immediate child names, including directories.
     pub fn listDirectory(self: *const Vfs, path: []const u8) Error![]u8 {
+        if (self.host) |backend| return backend.ops.list(backend.context, self.allocator, path, false, 1);
         const normalized = try normalizePath(self.allocator, path);
         defer self.allocator.free(normalized);
         return self.listDirectoryNormalized(normalized);
     }
 
     pub fn listDirectoryNormalized(self: *const Vfs, normalized: []const u8) Error![]u8 {
+        if (self.host) |backend| return backend.ops.list(backend.context, self.allocator, normalized, false, 1);
         const index = self.find(normalized) orelse return error.NotFound;
         if (self.entries.items[index].kind != .directory) return error.NotDirectory;
         var names: std.ArrayList([]const u8) = .empty;
@@ -375,12 +536,14 @@ pub const Vfs = struct {
     /// parent before its descendants, which makes the result directly usable
     /// by persistence restore code.
     pub fn listDirectories(self: *const Vfs, path: []const u8) Error![]u8 {
+        if (self.host) |backend| return backend.ops.list(backend.context, self.allocator, path, true, 0);
         const normalized = try normalizePath(self.allocator, path);
         defer self.allocator.free(normalized);
         return self.listDirectoriesNormalized(normalized);
     }
 
     pub fn listDirectoriesNormalized(self: *const Vfs, normalized: []const u8) Error![]u8 {
+        if (self.host) |backend| return backend.ops.list(backend.context, self.allocator, normalized, true, 0);
         const index = self.find(normalized) orelse return error.NotFound;
         if (self.entries.items[index].kind != .directory) return error.NotDirectory;
         var paths: std.ArrayList([]const u8) = .empty;
@@ -394,6 +557,7 @@ pub const Vfs = struct {
     }
 
     pub fn clearTemporary(self: *Vfs) void {
+        if (self.host) |backend| return backend.ops.clear_temporary(backend.context);
         var index: usize = 0;
         while (index < self.entries.items.len) {
             if (!isDescendant("/tmp", self.entries.items[index].path)) {
@@ -475,9 +639,9 @@ pub const Vfs = struct {
         return false;
     }
 
-    fn createMissingCourseParents(self: *Vfs, path: []const u8) Error!void {
-        if (!std.mem.startsWith(u8, path, "/course")) return error.PermissionDenied;
-        var start: usize = "/course".len + 1;
+    fn createMissingAssetParents(self: *Vfs, path: []const u8) Error!void {
+        if (!std.mem.startsWith(u8, path, "/assets")) return error.PermissionDenied;
+        var start: usize = "/assets".len + 1;
         while (start <= path.len) {
             const separator = std.mem.indexOfScalarPos(u8, path, start, '/') orelse path.len;
             const directory_path = path[0..separator];
@@ -592,11 +756,11 @@ test "directory snapshot includes nested empty and read-only parents" {
     var fs = try Vfs.init(std.testing.allocator, 1024, 512);
     defer fs.deinit();
     try fs.mkdir("/home/persist/nested/empty", true, false);
-    try fs.mountCourse("/course/unit/lesson.txt", "lesson");
+    try fs.mountAsset("/assets/unit/sample.txt", "sample");
     const directories = try fs.listDirectories("/");
     defer fs.allocator.free(directories);
     try std.testing.expectEqualStrings(
-        "/course\x00/course/unit\x00/home\x00/home/persist\x00/home/persist/nested\x00/home/persist/nested/empty\x00/tmp\x00",
+        "/assets\x00/assets/unit\x00/home\x00/home/persist\x00/home/persist/nested\x00/home/persist/nested/empty\x00/tmp\x00",
         directories,
     );
     const nested = try fs.listDirectories("/home/persist");

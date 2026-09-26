@@ -73,7 +73,7 @@ pub fn populate(comptime Runtime: type, self: *Runtime, environment: *gc.Header,
     const cache = self.moduleCache() orelse return self.engineFault();
     if (!store(Runtime, self, environment, "modules", Value.object(&cache.header), line, column)) return false;
     if (!storeText(Runtime, self, environment, "platform", "peony", line, column)) return false;
-    if (!storeText(Runtime, self, environment, "version", "Peony 0.1 (Python 3.12 language subset)", line, column)) return false;
+    if (!storeText(Runtime, self, environment, "version", "Peony 0.1 (Python 3.12)", line, column)) return false;
     if (!storeFunction(Runtime, self, environment, "exit", 1, line, column)) return false;
     if (!storeStream(Runtime, self, environment, "stdout", false, line, column)) return false;
     if (!storeStream(Runtime, self, environment, "stderr", true, line, column)) return false;
@@ -115,9 +115,9 @@ pub fn populate(comptime Runtime: type, self: *Runtime, environment: *gc.Header,
     }
     if (!store(Runtime, self, environment, "argv", Value.object(&argv.header), line, column)) return false;
 
-    const path_texts = [_][]const u8{ "/home", "/course", "/tmp" };
-    var path_values: [path_texts.len]Value = undefined;
-    var path_roots: [path_texts.len]gc.Root = @splat(.{ .object = null });
+    const path_texts = self.import_roots[0..self.import_root_count];
+    var path_values: [3]Value = undefined;
+    var path_roots: [3]gc.Root = @splat(.{ .object = null });
     var path_frame = gc.RootFrame{};
     path_frame.push(&self.heap.roots);
     for (&path_roots) |*root| path_frame.add(root);
@@ -126,7 +126,7 @@ pub fn populate(comptime Runtime: type, self: *Runtime, environment: *gc.Header,
         path_values[index] = self.createStringValue(text, line, column) orelse return false;
         path_roots[index].object = path_values[index].asObject();
     }
-    const path = switch (sequence.createList(&self.heap, &path_values)) {
+    const path = switch (sequence.createList(&self.heap, path_values[0..path_texts.len])) {
         .value => |list| list,
         .python_exception => |exception| {
             self.setException(exception, line, column, null);

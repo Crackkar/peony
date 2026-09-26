@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { instantiatePeony, instantiatePeonyStreaming } from './wasm-files-host.mjs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -7,7 +8,7 @@ const wasmPath = fileURLToPath(new URL('../zig-out/peony.wasm', import.meta.url)
 
 async function instantiateBytes() {
   const bytes = await readFile(wasmPath);
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const { instance } = await instantiatePeony(bytes);
   return { bytes, instance };
 }
 
@@ -123,7 +124,7 @@ test('shipping artifact instantiates from bytes and streaming with the WASM MIME
   const response = new Response(bytes, {
     headers: { 'Content-Type': 'application/wasm' },
   });
-  const { instance } = await WebAssembly.instantiateStreaming(response, {});
+  const { instance } = await instantiatePeonyStreaming(response);
 
   assert.equal(instance.exports.peony_abi_version(), 1);
   assert.ok(instance.exports.memory instanceof WebAssembly.Memory);

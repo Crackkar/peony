@@ -411,8 +411,7 @@ pub fn resolveModuleFile(self: *Runtime, name: []const u8) std.mem.Allocator.Err
             return self.resolveModuleFileUnder(parent.search_path, name[separator + 1 ..]);
         }
     }
-    const roots = [_][]const u8{"/home", "/course", "/tmp"};
-    for (roots) |root| {
+    for (self.import_roots[0..self.import_root_count]) |root| {
         if (try self.resolveModuleFileUnder(root, name)) |resolved| return resolved;
     }
     return null;

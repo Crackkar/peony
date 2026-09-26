@@ -81,6 +81,9 @@ pub const Runtime = struct {
     vfs: vfs_module.Vfs = undefined,
     vfs_output: []const u8 = &.{},
     vfs_output_owned: bool = false,
+    import_roots: [3][]const u8 = .{ "/home", "/assets", "/tmp" },
+    import_root_count: usize = 3,
+    cwd_text: []const u8 = "/home",
     environment: *Environment = undefined,
     environment_frame: gc.RootFrame = .{},
     environment_root: gc.Root = .{ .object = null },
@@ -737,9 +740,9 @@ pub const Runtime = struct {
         return self.max_instructions -| self.work_executed;
     }
 
-    pub fn mountCourseFile(self: *Runtime, path: []const u8, bytes: []const u8) vfs_module.Error!void {
+    pub fn mountAssetFile(self: *Runtime, path: []const u8, bytes: []const u8) vfs_module.Error!void {
         self.clearVfsOutput();
-        try self.vfs.mountCourse(path, bytes);
+        try self.vfs.mountAsset(path, bytes);
     }
 
     pub fn writeVfsFile(self: *Runtime, path: []const u8, bytes: []const u8) vfs_module.Error!void {

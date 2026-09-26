@@ -192,11 +192,11 @@ class PeonySession {
   }
 
   async mount(files, options = {}) {
-    if (!files || typeof files !== 'object') throw new TypeError('mount expects a mapping of /course paths to bytes');
+    if (!files || typeof files !== 'object') throw new TypeError('mount expects a mapping of /assets paths to bytes');
     if (!options || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('mount options must be an object');
     for (const key of Reflect.ownKeys(options)) if (key !== 'root') throw new TypeError(`unsupported mount option: ${String(key)}`);
-    const root = Object.hasOwn(options, 'root') ? options.root : '/course';
-    if (typeof root !== 'string' || !root.startsWith('/course')) throw new TypeError('mount root must be inside /course');
+    const root = Object.hasOwn(options, 'root') ? options.root : '/assets';
+    if (typeof root !== 'string' || !root.startsWith('/assets')) throw new TypeError('mount root must be inside /assets');
     if (Object.getOwnPropertySymbols(files).some(key => Object.prototype.propertyIsEnumerable.call(files, key))) throw new TypeError('mount paths must be strings');
     const copy = {};
     for (const [path, value] of Object.entries(files)) { checkedPath(path); copy[path] = copyBytes(value); }
@@ -279,6 +279,7 @@ function copyBytes(value) {
 
 function validateOptions(options) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('Peony session options must be an object');
+  if (Object.hasOwn(options, 'followRedirects')) throw new TypeError('redirect handling is controlled by the host transport');
   for (const key of ['quantum', 'maxMemoryBytes', 'maxVfsBytes', 'maxFileBytes']) {
     const value = options[key];
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0 || value > 0xffff_ffff)) throw new RangeError(`${key} must be a positive u32 integer`);
@@ -291,7 +292,7 @@ function validateOptions(options) {
     if (integer <= 0n || integer > 0xffff_ffff_ffff_ffffn) throw new RangeError('maxInstructions must be a positive u64 integer');
   }
   if (options.maxHttpResponseBytes !== undefined && (!Number.isSafeInteger(options.maxHttpResponseBytes) || options.maxHttpResponseBytes < 0 || options.maxHttpResponseBytes > MAX_HTTP_BYTES)) throw new RangeError('maxHttpResponseBytes must be between 0 and 1 MiB');
-  return Object.fromEntries(['quantum', 'maxMemoryBytes', 'maxInstructions', 'maxVfsBytes', 'maxFileBytes', 'seed', 'maxHttpResponseBytes', 'followRedirects'].filter(key => options[key] !== undefined).map(key => [key, key === 'seed' && typeof options[key] !== 'string' ? copyBytes(options[key]) : options[key]]));
+  return Object.fromEntries(['quantum', 'maxMemoryBytes', 'maxInstructions', 'maxVfsBytes', 'maxFileBytes', 'seed', 'maxHttpResponseBytes'].filter(key => options[key] !== undefined).map(key => [key, key === 'seed' && typeof options[key] !== 'string' ? copyBytes(options[key]) : options[key]]));
 }
 
 async function readBody(response, limit, signal) {

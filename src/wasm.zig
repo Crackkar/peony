@@ -2,6 +2,7 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const runtime_vm = @import("runtime_vm");
 const host = @import("runtime_host");
+const wasm_fs = @import("wasm_fs.zig");
 const Runtime = runtime_vm.Runtime;
 
 comptime {
@@ -18,6 +19,7 @@ const SessionSlot = struct {
     active: bool = false,
     generation: u32 = 1,
     runtime: Runtime = undefined,
+    fs_handle: u32 = 0,
     host_error: []const u8 = "",
 };
 
@@ -64,9 +66,16 @@ export fn peony_session_new(config_ptr: u32, config_len: u32) u32 {
     for (&sessions, 0..) |*slot, index| {
         if (!slot.active) {
             slot.runtime.initWithConfig(std.heap.wasm_allocator, config) catch return 0;
+            const handle = abi.encodeSessionHandle(index, slot.generation);
+            if (!wasm_fs.configure(handle, config.max_vfs_bytes, config.max_file_bytes)) {
+                slot.runtime.deinit();
+                return 0;
+            }
+            slot.fs_handle = handle;
+            slot.runtime.vfs.bindHost(wasm_fs.backend(&slot.fs_handle));
             slot.active = true;
             slot.host_error = "";
-            return abi.encodeSessionHandle(index, slot.generation);
+            return handle;
         }
     }
     return 0;
@@ -156,7 +165,7 @@ export fn peony_vfs_mount(handle: u32, path_ptr: u32, path_len: u32, data_ptr: u
     if (!isTransferSlice(path_ptr, path_len) or !isTransferSlice(data_ptr, data_len)) return status(Status.invalid_argument);
     const path = transferSlice(path_ptr, path_len) orelse return status(Status.invalid_argument);
     const data = transferSlice(data_ptr, data_len) orelse return status(Status.invalid_argument);
-    slot.runtime.mountCourseFile(path, data) catch |err| return vfsErrorStatus(err);
+    slot.runtime.mountAssetFile(path, data) catch |err| return vfsErrorStatus(err);
     return status(Status.ok);
 }
 
@@ -257,7 +266,7 @@ export fn peony_gc_collection_count(handle: u32) u64 {
 
 export fn peony_vfs_total_bytes(handle: u32) u64 {
     const slot = sessionSlot(handle) orelse return 0;
-    return slot.runtime.vfs.total_bytes;
+    return slot.runtime.vfs.totalBytes();
 }
 
 /// The caller must serialize this with VM work. The runtime's permanent roots

@@ -28,6 +28,9 @@ pub const File = struct {
     universal_newlines: bool,
     recognize_newlines: bool,
     cursor: usize = 0,
+    read_cache: []u8 = &.{},
+    cache_start: usize = 0,
+    cache_len: usize = 0,
     closed: bool = false,
 };
 
@@ -57,16 +60,18 @@ pub fn open(
         if (selected.len != 0) return pythonError(*File, .value_error, "newline must be None or an empty string");
     }
 
-    const normalized = vfs_module.normalizePath(heap.allocator, path) catch |err| return .{ .python_exception = pathException(err) };
-    var node: ?*vfs_module.FileNode = fs.fileNodeNormalized(normalized) catch |err| switch (err) {
-        error.NotFound => null,
-        else => {
-            heap.allocator.free(normalized);
-            return .{ .python_exception = pathException(err) };
-        },
-    };
-    const exists = node != null;
-    const existing_len = if (node) |selected| selected.bytes.len else 0;
+    const normalized = fs.normalizeOwned(path) catch |err| return .{ .python_exception = pathException(err) };
+    var node: ?*vfs_module.FileNode = null;
+    if (fs.host == null) {
+        node = fs.fileNodeNormalized(normalized) catch |err| switch (err) {
+            error.NotFound => null,
+            else => {
+                heap.allocator.free(normalized);
+                return .{ .python_exception = pathException(err) };
+            },
+        };
+    }
+    const exists = if (fs.host != null) fs.existsNormalized(normalized) else node != null;
     if (mode.exclusive and exists) {
         heap.allocator.free(normalized);
         return pythonError(*File, .file_exists_error, "file already exists");
@@ -76,7 +81,7 @@ pub fn open(
         return .{ .python_exception = pathException(error.NotFound) };
     }
 
-    if (mode.writable and !std.mem.startsWith(u8, normalized, "/home/") and !std.mem.startsWith(u8, normalized, "/tmp/")) {
+    if (mode.writable and !fs.writable(normalized)) {
         heap.allocator.free(normalized);
         return .{ .python_exception = pathException(error.PermissionDenied) };
     }
@@ -88,16 +93,25 @@ pub fn open(
         };
     }
 
-    if (node == null) node = fs.fileNodeNormalized(normalized) catch |err| {
+    const access: vfs_module.FileAccess = if (mode.readable and mode.writable) .read_write else if (mode.writable) .write_only else .read_only;
+    if (node == null) node = fs.openNode(normalized, access) catch |err| {
         heap.allocator.free(normalized);
         return .{ .python_exception = pathException(err) };
     };
 
+    const initial_cursor = if (mode.append) fs.lengthNode(node.?) catch |err| {
+        if (fs.host != null) fs.releaseFile(node.?);
+        heap.allocator.free(normalized);
+        return .{ .python_exception = pathException(err) };
+    } else 0;
+
     const owned_mode = heap.allocator.dupe(u8, mode_text) catch {
+        if (fs.host != null) fs.releaseFile(node.?);
         heap.allocator.free(normalized);
         return pythonError(*File, .memory_error, "session memory limit exceeded");
     };
     const object = heap.createObject(File, &file_kind) catch {
+        if (fs.host != null) fs.releaseFile(node.?);
         heap.allocator.free(owned_mode);
         heap.allocator.free(normalized);
         return pythonError(*File, .memory_error, "session memory limit exceeded");
@@ -111,17 +125,19 @@ pub fn open(
         .mode = mode,
         .universal_newlines = newline == null,
         .recognize_newlines = newline == null or (newline != null and newline.?.len == 0),
-        .cursor = if (mode.append) existing_len else 0,
+        .cursor = initial_cursor,
     };
-    fs.retainFile(node.?);
+    if (fs.host == null) fs.retainFile(node.?);
     return .{ .value = object };
 }
 
 pub fn readBuffer(heap: *Heap, fs: *vfs_module.Vfs, file: *File, size: ?i64, line_mode: bool) exceptions.Result([]u8) {
     if (file.closed) return pythonError([]u8, .value_error, "I/O operation on closed file");
     if (!file.mode.readable) return pythonError([]u8, .os_error, "file not open for reading");
-    const contents = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const limit: ?usize = if (size) |selected| if (selected < 0) null else std.math.cast(usize, selected) orelse return pythonError([]u8, .overflow_error, "read length is too large") else null;
+    if (fs.host != null and (line_mode or limit != null)) return readHostBuffer(heap, fs, file, limit, line_mode);
+    const contents = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
+    file.cache_len = 0;
     if (!line_mode and file.cursor <= contents.len and (file.mode.binary or limit == null)) {
         const end = if (file.mode.binary and limit != null)
             @min(contents.len, file.cursor +| limit.?)
@@ -174,10 +190,97 @@ pub fn readBuffer(heap: *Heap, fs: *vfs_module.Vfs, file: *File, size: ?i64, lin
     return .{ .value = result };
 }
 
+fn hostByte(heap: *Heap, fs: *vfs_module.Vfs, file: *File, position: usize) vfs_module.Error!?u8 {
+    if (file.read_cache.len == 0) {
+        file.read_cache = heap.allocator.alloc(u8, 8192) catch return error.OutOfMemory;
+    }
+    if (position < file.cache_start or position - file.cache_start >= file.cache_len) {
+        file.cache_start = position;
+        file.cache_len = try fs.readAtNode(file.node, position, file.read_cache);
+    }
+    const index = position - file.cache_start;
+    return if (index < file.cache_len) file.read_cache[index] else null;
+}
+
+fn readHostBuffer(heap: *Heap, fs: *vfs_module.Vfs, file: *File, limit: ?usize, line_mode: bool) exceptions.Result([]u8) {
+    if (limit == 0) return .{ .value = &.{} };
+    if (file.mode.binary and !line_mode) {
+        const length = fs.lengthNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
+        const available = length -| file.cursor;
+        const take = @min(available, limit orelse available);
+        if (take == 0) return .{ .value = &.{} };
+        const bytes = heap.allocator.alloc(u8, take) catch return pythonError([]u8, .memory_error, "session memory limit exceeded");
+        const count = fs.readAtNode(file.node, file.cursor, bytes) catch |err| {
+            heap.allocator.free(bytes);
+            return .{ .python_exception = pathException(err) };
+        };
+        if (count != take) {
+            const resized = heap.allocator.realloc(bytes, count) catch {
+                heap.allocator.free(bytes);
+                return pythonError([]u8, .memory_error, "session memory limit exceeded");
+            };
+            file.cursor += count;
+            return .{ .value = resized };
+        }
+        file.cursor += take;
+        return .{ .value = bytes };
+    }
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(heap.allocator);
+    var cursor = file.cursor;
+    var characters: usize = 0;
+    while (limit == null or characters < limit.?) {
+        const first = (hostByte(heap, fs, file, cursor) catch |err| return .{ .python_exception = pathException(err) }) orelse break;
+        if (first == '\r' and file.recognize_newlines and !file.mode.binary) {
+            cursor += 1;
+            const paired_lf = (hostByte(heap, fs, file, cursor) catch |err| return .{ .python_exception = pathException(err) }) == '\n';
+            if (file.universal_newlines) {
+                if (paired_lf) cursor += 1;
+                output.append(heap.allocator, '\n') catch return pythonError([]u8, .memory_error, "session memory limit exceeded");
+                characters += 1;
+            } else {
+                output.append(heap.allocator, '\r') catch return pythonError([]u8, .memory_error, "session memory limit exceeded");
+                characters += 1;
+                if (line_mode and paired_lf and (limit == null or characters < limit.?)) {
+                    cursor += 1;
+                    output.append(heap.allocator, '\n') catch return pythonError([]u8, .memory_error, "session memory limit exceeded");
+                    characters += 1;
+                }
+            }
+            if (line_mode) break;
+            continue;
+        }
+        const width: usize = if (file.mode.binary) 1 else std.unicode.utf8ByteSequenceLength(first) catch 0;
+        if (width == 0) return pythonError([]u8, .unicode_decode_error, "invalid UTF-8 data in file");
+        var scalar: [4]u8 = undefined;
+        scalar[0] = first;
+        for (1..width) |index| {
+            scalar[index] = (hostByte(heap, fs, file, cursor + index) catch |err| return .{ .python_exception = pathException(err) }) orelse return pythonError([]u8, .unicode_decode_error, "invalid UTF-8 data in file");
+        }
+        if (!file.mode.binary and !std.unicode.utf8ValidateSlice(scalar[0..width])) return pythonError([]u8, .unicode_decode_error, "invalid UTF-8 data in file");
+        output.appendSlice(heap.allocator, scalar[0..width]) catch return pythonError([]u8, .memory_error, "session memory limit exceeded");
+        cursor += width;
+        characters += 1;
+        if (line_mode and (first == '\n' or (!file.recognize_newlines and first == '\r'))) break;
+    }
+    const result = output.toOwnedSlice(heap.allocator) catch return pythonError([]u8, .memory_error, "session memory limit exceeded");
+    file.cursor = cursor;
+    return .{ .value = result };
+}
+
 pub fn writeBuffer(heap: *Heap, fs: *vfs_module.Vfs, file: *File, bytes: []const u8) exceptions.Result(usize) {
     if (file.closed) return pythonError(usize, .value_error, "I/O operation on closed file");
     if (!file.mode.writable) return pythonError(usize, .os_error, "file not open for writing");
     if (!file.mode.binary and !std.unicode.utf8ValidateSlice(bytes)) return pythonError(usize, .unicode_encode_error, "text file write contains invalid UTF-8");
+    if (fs.host != null) {
+        const position = if (file.mode.append) fs.lengthNode(file.node) catch |err| return .{ .python_exception = pathException(err) } else file.cursor;
+        const end = std.math.add(usize, position, bytes.len) catch return pythonError(usize, .overflow_error, "file position is too large");
+        fs.writeAtNode(file.node, position, bytes) catch |err| return .{ .python_exception = pathException(err) };
+        file.cursor = end;
+        file.cache_len = 0;
+        return .{ .value = if (file.mode.binary) bytes.len else std.unicode.utf8CountCodepoints(bytes) catch bytes.len };
+    }
     const old = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const position = if (file.mode.append) old.len else file.cursor;
     const end = std.math.add(usize, position, bytes.len) catch return pythonError(usize, .memory_error, "session memory limit exceeded");
@@ -199,11 +302,11 @@ pub fn seek(fs: *vfs_module.Vfs, file: *File, offset: i64, whence: i64) exceptio
     if (file.closed) return pythonError(usize, .value_error, "I/O operation on closed file");
     if (whence < 0 or whence > 2) return pythonError(usize, .value_error, "invalid whence value");
     if (!file.mode.binary and ((whence != 0 and offset != 0) or (whence == 0 and offset < 0))) return pythonError(usize, .value_error, "invalid seek in text mode");
-    const contents = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
+    const length = fs.lengthNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const base: i128 = switch (whence) {
         0 => 0,
         1 => @intCast(file.cursor),
-        2 => @intCast(contents.len),
+        2 => @intCast(length),
         else => unreachable,
     };
     const target = base + offset;
@@ -216,6 +319,11 @@ pub fn truncate(heap: *Heap, fs: *vfs_module.Vfs, file: *File, requested: ?i64) 
     if (file.closed) return pythonError(usize, .value_error, "I/O operation on closed file");
     if (!file.mode.writable) return pythonError(usize, .os_error, "file not open for writing");
     const target = if (requested) |selected| if (selected < 0) return pythonError(usize, .value_error, "negative size value") else std.math.cast(usize, selected) orelse return pythonError(usize, .overflow_error, "file size is too large") else file.cursor;
+    if (fs.host != null) {
+        fs.truncateNode(file.node, target) catch |err| return .{ .python_exception = pathException(err) };
+        file.cache_len = 0;
+        return .{ .value = target };
+    }
     const old = fs.readNode(file.node) catch |err| return .{ .python_exception = pathException(err) };
     const replacement = heap.allocator.alloc(u8, target) catch return pythonError(usize, .memory_error, "session memory limit exceeded");
     const copied = @min(old.len, target);
@@ -232,6 +340,11 @@ pub fn close(file: *File) void {
     if (file.node_retained) {
         file.fs.releaseFile(file.node);
         file.node_retained = false;
+    }
+    if (file.read_cache.len != 0) {
+        file.fs.allocator.free(file.read_cache);
+        file.read_cache = &.{};
+        file.cache_len = 0;
     }
     file.closed = true;
 }
@@ -254,6 +367,7 @@ pub fn pathException(err: vfs_module.Error) exceptions.PythonException {
         error.NotDirectory => valueException(.os_error, "parent path is not a directory"),
         error.IsDirectory => valueException(.os_error, "is a directory"),
         error.PermissionDenied => valueException(.permission_error, "permission denied"),
+        error.IoFailure => valueException(.os_error, "filesystem operation failed"),
         error.TooLarge => valueException(.os_error, "file or VFS size limit exceeded"),
         error.OutOfMemory => valueException(.memory_error, "session memory limit exceeded"),
     };

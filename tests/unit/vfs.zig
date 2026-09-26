@@ -67,13 +67,13 @@ pub fn testVfsRejectsTraversalAndMissingParentsWithoutMutation() !void {
     try std.testing.expectEqualStrings("escape rejected\nparent required\nunchanged\n", runtime.stdout());
 }
 
-pub fn testNestedCourseMountCreatesEveryParentDirectory() !void {
+pub fn testNestedAssetMountCreatesEveryParentDirectory() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 8 * 1024 * 1024);
     defer runtime.deinit();
-    try runtime.mountCourseFile("/course/unit/lesson.txt", "lesson");
-    const files = try runtime.listVfsFiles("/course/unit");
-    try std.testing.expectEqualStrings("/course/unit/lesson.txt\x00", files);
+    try runtime.mountAssetFile("/assets/unit/sample.txt", "sample");
+    const files = try runtime.listVfsFiles("/assets/unit");
+    try std.testing.expectEqualStrings("/assets/unit/sample.txt\x00", files);
 }
 
 pub fn testHomeSurvivesNewProgramWhileTemporaryFilesClear() !void {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { instantiatePeony } from './wasm-files-host.mjs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -12,7 +13,7 @@ const decoder = new TextDecoder();
 
 async function api() {
   const bytes = await readFile(wasmPath);
-  return (await WebAssembly.instantiate(bytes, {})).instance.exports;
+  return (await instantiatePeony(bytes)).instance.exports;
 }
 
 function transfer(instance, value) {
@@ -138,11 +139,7 @@ test('shipping WASM urlopen emits bounded HTTP packets and exposes response prot
     const source = [
       'from urllib.request import urlopen',
       'from urllib.error import URLError, HTTPError',
-      'import ssl',
-      'context = ssl.create_default_context()',
-      'context.check_hostname = False',
-      'context.verify_mode = ssl.CERT_NONE',
-      'with urlopen("https://example.test/data", data=b"payload", timeout=2.5, context=context) as response:',
+      'with urlopen("https://example.test/data", data=b"payload", timeout=2.5) as response:',
       '    print(response.status, response.getcode(), response.headers["content-type"])',
       '    print(response.read(2), response.read(), response.read())',
       'try:',

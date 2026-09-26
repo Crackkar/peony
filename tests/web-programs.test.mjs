@@ -6,14 +6,14 @@ import { Peony } from '../web/peony.mjs';
 const wasmPath = new URL('../zig-out/peony.wasm', import.meta.url);
 const load = async () => Peony.load(new Uint8Array(await readFile(wasmPath)));
 
-test('course word-frequency program reads a mounted file and counts native words', async () => {
+test('browser word-frequency program reads a mounted file and counts words', async () => {
   const peony = await load();
   const output = [];
   const session = peony.createSession({ stdout: text => output.push(text) });
-  session.mount({ '/course/words.txt': 'red blue red green red blue\n' });
+  session.mount({ '/assets/words.txt': 'red blue red green red blue\n' });
   const result = await session.run([
     'from collections import Counter',
-    'with open("/course/words.txt") as source:',
+    'with open("/assets/words.txt") as source:',
     '    counts = Counter(source.read().split())',
     'print(counts.most_common(2))',
   ].join('\n'), { filename: '/home/frequency.py' });
@@ -21,15 +21,15 @@ test('course word-frequency program reads a mounted file and counts native words
   assert.equal(output.join(''), "[('red', 3), ('blue', 2)]\n");
 });
 
-test('course regex program extracts email domains and preserves encounter ties', async () => {
+test('browser regex program extracts email domains and preserves encounter ties', async () => {
   const peony = await load();
   const output = [];
   const session = peony.createSession({ stdout: text => output.push(text) });
-  session.mount({ '/course/mail.txt': 'Ada@school.edu Bo@club.org Cy@school.edu\n' });
+  session.mount({ '/assets/mail.txt': 'Ada@school.edu Bo@club.org Cy@school.edu\n' });
   const result = await session.run([
     'import re',
     'from collections import Counter',
-    'with open("/course/mail.txt") as source:',
+    'with open("/assets/mail.txt") as source:',
     '    addresses = re.findall(r"[A-Za-z]+@[A-Za-z.]+", source.read())',
     'domains = Counter()',
     'for address in addresses:',
@@ -40,16 +40,16 @@ test('course regex program extracts email domains and preserves encounter ties',
   assert.equal(output.join(''), "[('school.edu', 2), ('club.org', 1)]\n");
 });
 
-test('course CSV aggregation uses Path, native reader and int conversion', async () => {
+test('browser CSV aggregation uses Path, native reader and int conversion', async () => {
   const peony = await load();
   const output = [];
   const session = peony.createSession({ stdout: text => output.push(text), quantum: 1 });
-  session.mount({ '/course/points.csv': 'Ada,2\nBo,3\nCy,4\n' });
+  session.mount({ '/assets/points.csv': 'Ada,2\nBo,3\nCy,4\n' });
   const result = await session.run([
     'import csv',
     'from pathlib import Path',
     'total = 0',
-    'with open(Path("/course/points.csv"), newline="") as source:',
+    'with open(Path("/assets/points.csv"), newline="") as source:',
     '    for row in csv.reader(source):',
     '        total += int(row[1])',
     'print(total)',
@@ -58,7 +58,7 @@ test('course CSV aggregation uses Path, native reader and int conversion', async
   assert.equal(output.join(''), '9\n');
 });
 
-test('course JSON API program uses mocked browser transport and native parsing', async () => {
+test('browser JSON API program uses mocked transport and native parsing', async () => {
   const peony = await load();
   const output = [];
   const urls = [];
@@ -71,7 +71,7 @@ test('course JSON API program uses mocked browser transport and native parsing',
   });
   const result = await session.run([
     'import requests',
-    'response = requests.get("https://example.test/scores", params={"lesson": 1})',
+    'response = requests.get("https://example.test/scores", params={"sample": 1})',
     'total = 0',
     'for item in response.json()["items"]:',
     '    total += item["score"]',
@@ -79,10 +79,10 @@ test('course JSON API program uses mocked browser transport and native parsing',
   ].join('\n'));
   assert.equal(result.status, 'completed', result.error?.message);
   assert.equal(output.join(''), '8 True\n');
-  assert.deepEqual(urls, [['https://example.test/scores?lesson=1', 'omit', 'error']]);
+  assert.deepEqual(urls, [['https://example.test/scores?sample=1', 'omit', 'error']]);
 });
 
-test('course Path and copy program retains files and graph aliases across runs', async () => {
+test('browser Path and copy program retains files and graph aliases across runs', async () => {
   const peony = await load();
   const output = [];
   const session = peony.createSession({ stdout: text => output.push(text) });
@@ -101,7 +101,7 @@ test('course Path and copy program retains files and graph aliases across runs',
   assert.equal(output.join(''), 'True False\nchapter one\n');
 });
 
-test('course input program converts a learner answer to an integer', async () => {
+test('browser input program converts a user answer to an integer', async () => {
   const peony = await load();
   const output = [];
   const prompts = [];
@@ -116,7 +116,7 @@ test('course input program converts a learner answer to an integer', async () =>
   assert.equal(output.join(''), 'Celsius: 68.0\n');
 });
 
-test('course exclusions fail with module errors instead of accidental stand-ins', async () => {
+test('browser unknown modules raise import errors', async () => {
   const peony = await load();
   const output = [];
   const session = peony.createSession({ stdout: text => output.push(text) });

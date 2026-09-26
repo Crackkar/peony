@@ -193,7 +193,7 @@ test "regex work limit GC and reset" {
 }
 
 test "urlopen response cursor context SSL and validation" {
-    try library_http_tests.testUrlopenResponseCursorContextSslAndValidation();
+    try library_http_tests.testUrlopenResponseCursorAndValidation();
 }
 
 test "urlopen POST context manager and errors" {
@@ -210,10 +210,6 @@ test "requests status and transport exceptions" {
 
 test "time clock sleep validation and cancellation" {
     try library_http_tests.testTimeClockSleepValidationAndCancellation();
-}
-
-test "SSLContext identity constructor and mutation" {
-    try library_http_tests.testSslContextTypeAndMutation();
 }
 
 test "host reply identity schema and size retain pending request" {
@@ -937,8 +933,8 @@ test "VFS rejects traversal and missing parents atomically" {
     try vfs_tests.testVfsRejectsTraversalAndMissingParentsWithoutMutation();
 }
 
-test "nested course mounts create every parent directory" {
-    try vfs_tests.testNestedCourseMountCreatesEveryParentDirectory();
+test "nested asset mounts create every parent directory" {
+    try vfs_tests.testNestedAssetMountCreatesEveryParentDirectory();
 }
 
 test "home persists between programs while temporary files clear" {

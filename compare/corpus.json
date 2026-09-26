@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "version": "1.0.0",
+  "version": "2.0.0",
   "profiles": {
     "smoke": { "scale": 1, "warmups": 0, "samples": 1, "timeoutMs": 30000 },
     "standard": { "scale": 4, "warmups": 1, "samples": 3, "timeoutMs": 120000 },
@@ -48,9 +48,9 @@
       "file": "cases/libraries/import-packages.py",
       "tags": ["library", "import", "package", "vfs"],
       "fixtures": [
-        { "source": "fixtures/imports/training/__init__.py", "path": "training/__init__.py" },
-        { "source": "fixtures/imports/training/constants.py", "path": "training/constants.py" },
-        { "source": "fixtures/imports/training/metrics.py", "path": "training/metrics.py" }
+        { "source": "fixtures/imports/samplepkg/__init__.py", "path": "samplepkg/__init__.py" },
+        { "source": "fixtures/imports/samplepkg/constants.py", "path": "samplepkg/constants.py" },
+        { "source": "fixtures/imports/samplepkg/metrics.py", "path": "samplepkg/metrics.py" }
       ]
     },
 

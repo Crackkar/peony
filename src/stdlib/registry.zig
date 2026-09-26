@@ -4,7 +4,6 @@ const sys = @import("sys.zig");
 const math = @import("math.zig");
 const time = @import("time.zig");
 const random = @import("random.zig");
-const ssl = @import("ssl.zig");
 const statistics = @import("statistics.zig");
 const json_values = @import("json_values.zig");
 const re = @import("re.zig");
@@ -37,7 +36,6 @@ pub fn moduleId(name: []const u8) ?ModuleId {
     if (std.mem.eql(u8, name, "os.path")) return .os_path;
     if (std.mem.eql(u8, name, "collections")) return .collections;
     if (std.mem.eql(u8, name, "copy")) return .copy;
-    if (std.mem.eql(u8, name, "ssl")) return .ssl;
     return null;
 }
 
@@ -58,7 +56,6 @@ pub fn functionSpecs(module_id: ModuleId) []const FunctionSpec {
         .os_path => &os.path_functions,
         .collections => &collections.functions,
         .copy => &copy.functions,
-        .ssl => &ssl.functions,
         else => &.{},
     };
 }
@@ -68,7 +65,6 @@ pub fn functionSpec(module_id: ModuleId, function_id: u16) ?*const FunctionSpec 
 }
 
 pub fn typeSpec(type_id: types.TypeId) ?*const types.TypeSpec {
-    for (&ssl.classes) |*spec| if (spec.type_id == type_id) return spec;
     for (&re.classes) |*spec| if (spec.type_id == type_id) return spec;
     for (&http.classes) |*spec| if (spec.type_id == type_id) return spec;
     for (&csv.classes) |*spec| if (spec.type_id == type_id) return spec;
@@ -92,7 +88,6 @@ pub fn populate(comptime Runtime: type, self: *Runtime, module_id: ModuleId, env
         .os, .os_path => os.populate(Runtime, self, environment, line, column),
         .collections => collections.populate(Runtime, self, environment, line, column),
         .copy => copy.populate(Runtime, self, environment, line, column),
-        .ssl => ssl.populate(Runtime, self, environment, line, column),
     };
 }
 

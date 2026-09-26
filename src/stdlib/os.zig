@@ -58,6 +58,21 @@ pub fn pathJoin(allocator: std.mem.Allocator, segments: []const []const u8) ![]u
     return output.toOwnedSlice(allocator);
 }
 
+fn pathJoinNative(allocator: std.mem.Allocator, segments: []const []const u8) ![]u8 {
+    if (segments.len == 0) return error.MissingArgument;
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    for (segments) |segment| {
+        if (!std.unicode.utf8ValidateSlice(segment)) return error.InvalidUtf8;
+        if (std.fs.path.isAbsolute(segment)) output.clearRetainingCapacity();
+        if (output.items.len != 0 and segment.len != 0 and
+            output.items[output.items.len - 1] != '/' and output.items[output.items.len - 1] != '\\' and
+            segment[0] != '/' and segment[0] != '\\') try output.append(allocator, std.fs.path.sep);
+        try output.appendSlice(allocator, segment);
+    }
+    return output.toOwnedSlice(allocator);
+}
+
 pub fn basename(path: []const u8) []const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
     return path[slash + 1 ..];
@@ -102,7 +117,7 @@ pub fn execute(
     _ = receiver;
     if (extra.len != 0) return self.nativeTypeError(line, column, "unexpected keyword argument");
     return switch (function_id) {
-        1 => storeString(self, destination, "/home", line, column),
+        1 => storeString(self, destination, self.cwd_text, line, column),
         2 => listDirectory(Runtime, self, destination, args[0], line, column),
         3 => makeDirectory(self, destination, args[0], args[1], false, false, line, column),
         4 => makeDirectory(self, destination, args[0], args[1], true, args[2].asBool() orelse return self.nativeTypeError(line, column, "exist_ok must be bool"), line, column),
@@ -128,8 +143,8 @@ pub fn executePath(
     if (function_id == 1) return joinPaths(self, destination, args[0], line, column);
     const path = pathArgument(self, args[0], line, column) orelse return false;
     return switch (function_id) {
-        2 => storeString(self, destination, basename(path), line, column),
-        3 => storeString(self, destination, dirname(path), line, column),
+        2 => storeString(self, destination, if (self.vfs.native_paths) std.fs.path.basename(path) else basename(path), line, column),
+        3 => storeString(self, destination, if (self.vfs.native_paths) std.fs.path.dirname(path) orelse "" else dirname(path), line, column),
         4 => storeBoolean(self, destination, self.vfs.exists(path)),
         5 => storeBoolean(self, destination, isFile(self, path)),
         6 => storeBoolean(self, destination, isDirectory(self, path)),
@@ -204,7 +219,7 @@ fn joinPaths(self: anytype, destination: u16, tuple_value: Value, line: u32, col
     const segments = self.heap.allocator.alloc([]const u8, tuple.items.len) catch return memoryFailure(self, line, column);
     defer self.heap.allocator.free(segments);
     for (tuple.items, 0..) |value, index| segments[index] = pathArgument(self, value, line, column) orelse return false;
-    const joined = pathJoin(self.heap.allocator, segments) catch |err| {
+    const joined = (if (self.vfs.native_paths) pathJoinNative(self.heap.allocator, segments) else pathJoin(self.heap.allocator, segments)) catch |err| {
         if (err == error.OutOfMemory) return memoryFailure(self, line, column);
         return self.nativeTypeError(line, column, "invalid path");
     };

@@ -1,142 +1,62 @@
 # Peony comparison corpus
 
-`compare/` is Peony's canonical executable corpus for semantic comparison and performance measurement against CPython 3.12. Every case is a program within Peony's documented language and library surface. The same source bytes, command arguments, and fixture bytes run through CPython, Peony WASM in its public Worker facade, and the Peony native executable. A case succeeds only when all three runtimes complete and produce byte-for-byte identical standard output and standard error on every repetition.
+`compare/` holds 46 deterministic, scalable Python programs. Every case runs in two separate paired experiments:
 
-The runner measures those same executions. Correctness and timing therefore cannot drift into separate collections with different inputs. A performance result always carries a differential result, the exact corpus and artifact hashes, the scale, and Peony's internal work and memory counters.
+1. **One-shot command line:** `python SCRIPT ARG...` against `peony SCRIPT ARG...`. This measures full process lifetime and peak resident memory for native use.
+2. **Started interpreters:** a running CPython process against an already loaded Peony WASM Worker. This measures the time and peak resident memory needed to handle a program job after interpreter startup.
 
-The `.py` files in this directory are interpreter inputs. They are not Peony implementation modules and are never loaded to provide a library feature. Peony's language, objects, and importable utilities remain Zig code in `src/`.
+Both pairs receive the same source, arguments, and fixture bytes. A sample enters the report only after its pair has completed with matching stdout and stderr. The experiments have different timing boundaries, so their results appear in separate tables. The `.py` case files and [`warm_python.py`](warm_python.py) are corpus inputs and measurement machinery; Peony's language and libraries remain Zig implementations.
 
-## Corpus shape
+## Corpus and profiles
 
-[`corpus.json`](corpus.json) is the versioned manifest. Its 46 cases are divided into three groups:
+[`corpus.json`](corpus.json) names each case, its tags, scale overrides, and any files it needs. `core/` covers language and objects, `libraries/` covers Zig library APIs, and `workloads/` combines them. Cases print compact summaries so console traffic does not dominate execution. The import case includes package fixture files. File cases create their own files inside private workspaces.
 
-| Group | Purpose | Representative pressure |
-|---|---|---|
-| `core/` | Language and object semantics in isolation | integer and float operations, control flow, closures, argument binding, comprehensions, generators, classes, exceptions, matching, Unicode, bytes, formatting, lists, dictionaries, sets, and numeric key equality |
-| `libraries/` | The native Zig library surface | `math`, `statistics`, `json`, `csv`, `re`, `collections`, `copy`, `pathlib`, `os`, `random`, and VFS package imports |
-| `workloads/` | Composed programs that cross subsystem boundaries | word frequency, CSV and JSON pipelines, log analysis, graph search, a prime sieve, text indexing, object dispatch, file throughput, and record sorting |
+| Profile | Scale | Warmups | Measured samples | Purpose |
+|---|---:|---:|---:|---|
+| `smoke` | 1 | 0 | 1 | End-to-end correctness and harness check |
+| `standard` | 4 | 1 | 3 | Reviewable baseline with median and p95 |
+| `stress` | 12 | 1 | 5 | Sustained execution and memory pressure |
 
-Cases print compact deterministic summaries rather than their entire generated data. This allows exact comparison without turning console or Worker transfer time into the main workload. Tags in the manifest select related cases across directories. For example, `--filter regex` selects the focused regex cases and the integrated regex workloads.
-
-The manifest can attach fixture files to a case. The runner copies the same bytes into an isolated CPython workspace below ignored `zig-out/compare-work/` and into Peony's `/home` VFS before timing starts. `libraries/import-packages` uses this mechanism to exercise package resolution and relative imports. Each repetition gets a new filesystem, so state from one sample cannot warm or alter the next. The execution workspace is removed when the run ends.
-
-## Running it
-
-Build both shipping artifacts first, then run one of the profiles:
+Build the artifacts, then run a profile:
 
 ```powershell
-zig build wasm --summary all
-zig build native --summary all
+zig build native
+zig build wasm
 npm run compare:smoke
 npm run compare
 npm run compare:stress
 ```
 
-The profiles change the argument passed to every case and the number of repetitions:
-
-| Profile | Scale | Warmups | Measured samples | Use |
-|---|---:|---:|---:|---|
-| `smoke` | 1 | 0 | 1 | Fast end-to-end semantic gate and harness check |
-| `standard` | 4 | 1 | 3 | Normal differential benchmark with a median and useful p95 |
-| `stress` | 12 | 1 | 5 | Sustained pressure, larger live data, and repeatability evidence |
-
-Stress is intentionally long. Use a filter while investigating one subsystem:
+Use a case ID or tag while investigating one area:
 
 ```powershell
-node compare/run.mjs --profile standard --filter json
-node compare/run.mjs --profile stress --filter core/list-algorithms --samples 2
-node compare/run.mjs --list --filter vfs
+node compare/run.mjs --profile smoke --filter pathlib-files
+node compare/run.mjs --profile standard --filter regex
+node compare/run.mjs --list --filter import
 ```
 
-The runner accepts these controls:
+`--warmups N` and `--samples N` override the profile counts. `--timeout-ms N` sets each child or job deadline. `--python PATH`, `--native PATH`, and `--wasm PATH` choose artifacts; the corresponding environment variables are `PEONY_CPYTHON`, `PEONY_COMPARE_NATIVE`, and `PEONY_COMPARE_WASM`. `--json PATH` writes the complete machine-readable record. `--report PATH` chooses a Markdown report path. `--quiet` suppresses case progress. A successful unfiltered run updates the tracked [`report.md`](report.md); filtered runs print their selected cases and leave that baseline intact unless `--report` is explicit.
 
-| Option | Meaning |
-|---|---|
-| `--profile smoke\|standard\|stress` | Select scale and repetition defaults. |
-| `--filter TEXT` | Select cases whose id or tag contains the text. |
-| `--warmups N`, `--samples N` | Override repetition counts. Warmups still undergo semantic comparison. |
-| `--timeout-ms N` | Set the safety timeout for each CPython or native child execution. |
-| `--python PATH` | Select the CPython 3.12 executable. `PEONY_CPYTHON` is the environment equivalent. |
-| `--wasm PATH` | Select a Peony artifact. `PEONY_COMPARE_WASM` is the environment equivalent. |
-| `--native PATH` | Select a native Peony executable. `PEONY_COMPARE_NATIVE` is the environment equivalent. |
-| `--report PATH` | Override the Markdown report path. The default is `compare/report.md`. |
-| `--json PATH` | Also write the complete machine-readable report to a chosen path. |
-| `--quiet` | Suppress per-case progress on standard error. |
+The runner requires CPython 3.12 and the Peony v0.1 native executable. Its disposable workspaces and compiled process probe live under ignored `zig-out/`. The runner removes each run workspace after completion.
 
-The default artifacts are `zig-out/peony.wasm` and the platform executable `zig-out/peony.exe` or `zig-out/peony`; the default oracle command is `python`. The runner rejects an oracle outside the CPython 3.12 release line and a native executable that does not report the v0.1 Peony identity. Every successful unfiltered run replaces [`report.md`](report.md) with a concise durable account of its inputs, exact comparison result, aggregates, and every case measurement. A filtered investigation prints its selected timing rows without replacing the full baseline; pass `--report PATH` when that focused result should also be durable. Request JSON explicitly when another tool needs every hash and raw field:
+## One-shot command-line experiment
 
-```powershell
-node compare/run.mjs --profile standard
-node compare/run.mjs --profile standard --json zig-out/compare-standard.json
-```
+Each repetition prepares two independent OS directories with identical script and fixture bytes. A small C launcher, [`process_probe.c`](process_probe.c), starts each command and records elapsed time from just before process creation until process exit. It passes program stdout and stderr through unchanged. On Windows it reads the child's peak working set; on Unix it uses the child resource usage returned by `wait4`. The probe compiles through `zig cc` when its source changes. Its own startup and memory are outside the recorded child measurement.
 
-The Markdown report is the reviewable repository baseline. Optional JSON and execution work remain in ignored `zig-out/`.
+The commands launch the interpreter with the script path and case arguments. CPython receives deterministic UTF-8 and hash settings through its environment; bytecode cache writes are disabled. Peony uses its ordinary CLI invocation. Timed work includes interpreter startup, source loading, compilation, program execution, filesystem operations, output, and shutdown. The reported peak RSS belongs to the Python or Peony process itself.
 
-## What is timed
+Windows CPython translates terminal newlines to CRLF while Peony currently emits LF. The harness normalizes CRLF to LF for the CLI output comparison only; the process measurements retain the real execution. Other output bytes must agree. Each pair also has to produce stable output across repetitions.
 
-All three runtimes time source compilation plus program execution. Fixture setup and process or session construction remain outside that interval.
+## Started-interpreter experiment
 
-For CPython, each repetition starts a fresh isolated CPython process and prepares a private workspace under `zig-out/compare-work/`. Python process startup, reading the source file, and constructing the capture buffers happen before its internal `perf_counter_ns()` interval. The timed code calls `compile(...)` and `exec(...)` in a fresh `__main__` namespace. Standard output and error are in-memory text buffers. `-I` prevents ambient user configuration from entering the oracle, and `-B` prevents bytecode cache files from changing later samples.
+For each case, the runner starts one isolated CPython driver and one Node process that loads Peony into a Worker. Both are ready before measured jobs begin. Each repetition gets fresh program state and private fixture storage. The CPython driver executes the source with `compile` and `exec` in a new `__main__` namespace and captures Python stdout and stderr. It runs with `-X utf8` so `pathlib` and `open()` use the same UTF-8 default as the direct CLI experiment even under isolated mode. The Peony driver creates a new public session and installs fixtures in Worker storage before timing `session.run(source, { filename, argv })`.
 
-For Peony WASM, the runner loads one artifact into its public Worker facade. Each repetition creates a fresh public session, writes fixtures through the public VFS API, and confirms the session is ready before starting the timer. The timed interval is `session.run(...)`, which includes source transfer, compilation, execution, Worker scheduling, and output delivery. The WASM instance remains in its Worker throughout; the runner does not use the raw ABI or execute WASM on the main thread.
+The CPython timer covers compilation and execution inside the started process. The Peony timer covers the public run call, including page-to-Worker messages, compilation, execution, scheduling, and output delivery. Protocol requests to the two measurement drivers, process startup, session construction, fixture preparation, and post-run statistics are outside these intervals. Each repetition compares the two captured streams exactly. Case-local Python modules are cleared between CPython jobs so package imports begin in fresh program state, as they do in each Peony session.
 
-For Peony native, each repetition launches the shipping executable as a fresh process. The runner writes a private pristine source and fixture tree separate from CPython's mutable workspace; the CLI reads that source, installs every fixture through an explicit `/home` mount, and creates its runtime before starting its internal metrics clock. The reported interval begins immediately before `compileAndStartArgs` and ends at the terminal run status, including stdout/stderr delivery and any host operation inside the program. Process startup, source and fixture reads, VFS installation, and metrics-file output remain outside that interval. Program output stays on stdout and stderr; a separate JSON metrics file carries timing and counters.
+Peak RSS is reported for each **host process** during a job. A CPython background sampler and the WASM driver's Node timer read current resident memory about every millisecond; both also check whether the OS process high-water mark advanced during the job. The Peony figure includes Node and the Worker. The report gives absolute peak and growth above resident memory immediately before each job. A short spike below an earlier lifetime high-water mark can fall between samples. These are deployment-level memory numbers, not WASM linear-memory allocation. The optional JSON retains Peony instruction, work, and session-memory counters for engine-level inspection.
 
-This is a comparison of the execution environments users encounter after engine startup. It is not an instruction-per-cycle microbenchmark. CPython and Peony native execute machine code in separate processes; Peony WASM executes behind a Worker message boundary. Node, browser engine, OS, target architecture, CPU frequency, and background activity affect wall time. Use repeated results on the same machine and artifacts to judge a change. The report's artifact and corpus hashes make those inputs explicit.
+## Reading the report
 
-Every warmup and measured run is checked before its timing is accepted. The runner requires:
+The durable report records the corpus and artifact hashes, host identity, paired correctness result, median and nearest-rank p95 time, peak RSS, and per-case Peony/CPython timing ratios. It gives separate aggregate timing and RSS ratios for one-shot CLI and started-interpreter use. A sum of case medians and a geometric mean are orientation measures; no single application assigns equal weight to all 46 cases. Review a case's output agreement, wall time, peak RSS, and usage shape together before drawing a performance conclusion.
 
-1. CPython to complete without an unhandled exception.
-2. Peony WASM to return `completed` rather than `error`, `limit`, or `cancelled`.
-3. Peony native to exit successfully with a `completed` metrics status.
-4. Standard output to match exactly across all three runtimes.
-5. Standard error to match exactly across all three runtimes.
-6. Output to remain stable across repetitions.
-
-A mismatch stops the run at the first failing case and shows abbreviated outputs. There is no tolerance mode that can silently benchmark different answers.
-
-## Report contents
-
-The durable Markdown report records the semantic result and the measurements needed to review a baseline:
-
-- corpus version, full corpus hash, selected profile, case count, warmups, and sample count;
-- Node, platform, exact CPython version and command;
-- WASM path, byte length, SHA-256, and Worker load time;
-- native executable identity, path, byte length, and SHA-256;
-- CPython, Peony WASM, and Peony native median and nearest-rank p95 compile-plus-run times;
-- target-specific Peony median instruction and work counts plus maximum observed peak session bytes;
-- per-case WASM/CPython and native/CPython median-time ratios;
-- totals of case medians and geometric means of both target-specific ratios.
-
-The optional JSON adds each case's tags, arguments, input/output hashes, minimum/maximum times, and raw environment fields for automation.
-
-The aggregate ratio is a compact orientation value. It does not represent one real application because every case receives equal weight. For optimization work, inspect the per-case wall time, ratio, work count, and peak bytes together. A large ratio with little charged work often points to dispatch, callback, allocation, or protocol overhead; large wall time accompanied by proportionally large work can simply describe a deliberately larger algorithm.
-
-## Compatibility choices
-
-The corpus stays inside the admitted surface in [the language contract](../docs/language.md) and [native library contract](../docs/libraries.md). It does not use an absent CPython feature merely to increase breadth. Conversely, it does not normalize observable results after execution. Exact output remains the oracle.
-
-Some Peony behavior is intentionally different from CPython and is tested through common invariants:
-
-- Peony's seeded PRNG stream is stable within a Peony version but does not copy CPython's Mersenne Twister stream. Random workloads compare size, uniqueness, bounds, membership, and permutation properties rather than drawn values.
-- Hash seeds and set iteration order need not match. Cases compare equality and membership properties or sort scalar results where ordering is part of presentation.
-- Peony's files live in a POSIX-like VFS while CPython uses an isolated host workspace. File cases use relative paths and compare file behavior, contents, and names without printing the host cwd.
-- Runtime identity strings such as `sys.version` and `sys.implementation.name` correctly differ and are outside exact-output cases.
-
-Host-backed HTTP, clocks, sleeps, input UI, hard cancellation, memory limits, raw ABI validation, native process behavior, and Worker lifecycle races remain in integration tests. CPython is not a meaningful oracle for Peony's host transport policy or terminal control outcomes. The comparison corpus concentrates on deterministic Python-visible computation where all three runtimes promise the same answer.
-
-## Adding a case
-
-A new case should add one `.py` program below `cases/` and one manifest entry. Keep the program self-contained, deterministic, and scalable through `int(sys.argv[1])`. Use the scale to grow repeated data or work while preserving the same semantic path. Print enough information to catch a wrong result, including lengths and checksums or selected boundary values, but avoid bulk output.
-
-Use only documented Peony syntax and APIs. Avoid elapsed time, object addresses, raw hashes, unordered set rendering, temporary absolute paths, locale data, network services, and implementation-specific exception prose. Catch an expected exception inside the program and print a stable property when error text differs legitimately. If a case needs files or user modules, add them below `fixtures/` and map their source and relative runtime path in `corpus.json`.
-
-Run the focused smoke case first, then the entire smoke profile, then the standard profile:
-
-```powershell
-node compare/run.mjs --profile smoke --filter new-case-id
-npm run compare:smoke
-npm run compare
-```
-
-Change the corpus version when its inputs or comparison meaning change. A report hash still identifies exact bytes, but the human version signals an intentional corpus revision.
+The corpus covers deterministic Python-visible work. HTTP transport, clocks, input callbacks, browser cancellation, terminal failures, and OS-specific behavior have their own integration tests. Add a case by writing one `.py` program under `cases/`, adding a manifest entry, and including fixture files when necessary. Keep outputs compact and deterministic. Bump the corpus version when its inputs or measurement meaning change.

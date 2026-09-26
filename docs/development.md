@@ -20,22 +20,22 @@ zig build wasm --summary all
 node --test --test-concurrency=1 tests/*.test.mjs
 ```
 
-`zig build test` runs engine unit and semantic checks. `zig build native` makes the executable used by `tests/native-cli.test.mjs`; that test covers version identity, arguments, explicit VFS mounts, stdin, diagnostics, metrics, clocks, sleep, HTTP, and timeout mapping through an actual child process. `zig build wasm` makes the artifact used by the raw-WASM and Worker suites. Raw tests check exports, handles, packets, execution, libraries, and VFS. Worker tests call only `web/peony.mjs` and assert that no WASM compilation or execution falls back to the calling thread.
+`zig build test` runs engine unit and semantic checks. `zig build native` makes the executable used by `tests/native-cli.test.mjs`; that test covers arguments, real filesystem access, sibling imports, persisted writes, stdin, diagnostics, metrics, clocks, sleep, HTTP, and timeouts through an actual child process. `zig build wasm` makes the artifact used by the raw-WASM and Worker suites. Raw tests use the Worker filesystem host import and check exports, handles, packets, execution, libraries, and files. Worker tests call `web/peony.mjs` and verify that WASM execution stays in the Worker.
 
 ## What each test layer owns
 
 | Layer | Main location | Question answered |
 |---|---|---|
-| Native Zig | `tests/unit/` | Do lexer, parser, scope, values, VM, GC, VFS, and native algorithms implement the admitted behavior? |
+| Native Zig | `tests/unit/` | Lexer, parser, scope, values, VM, GC, files, and native algorithms |
 | Native process | `tests/native-cli.test.mjs` | Does the shipping executable connect the shared runtime to process arguments, streams, files, clocks, timers, networking, diagnostics and metrics? |
 | Raw WASM/ABI | `tests/wasm-*.test.mjs` | Does the shipping artifact export the right ABI and preserve semantics, limits, errors, and memory lifetimes? |
-| Public Worker | `tests/web-*.test.mjs`, `tests/course-library.test.mjs` | Do message routing, callbacks, copied files, cancellation, and complete programs work through the actual facade? |
+| Public Worker | `tests/web-*.test.mjs` | Message routing, callbacks, copied files, cancellation, and complete programs through the public facade |
 | Browser showcase | `tests/showcase-browser.mjs` | Does the editor, input, stop, error location, Worker path, and narrow-screen UI work in a browser? |
-| CPython comparison corpus | `compare/` | Do deterministic programs agree across CPython, Peony WASM, and Peony native, and what does the same execution cost on each target? |
+| CPython comparison corpus | `compare/` | Do native CLI launches and started Worker jobs each agree with their matching CPython shape, and what are their latency and peak RSS? |
 
 Unit and integration programs are embedded as strings in Zig or JavaScript tests, or mounted into the VFS at runtime. The tracked `.py` files under `compare/` are executable corpus inputs shared with CPython; they are not implementation modules. Library behavior belongs in Zig, while Python text is program input.
 
-The suite includes tests for unsupported forms and error paths as well as successful output. Such tests matter for Peony's subset contract: an excluded syntax form must fail clearly, a bad host packet must not consume a valid pending request, and a cancelled native callback must not replay earlier effects. Tests also cover execution under small quanta and memory/work caps, where state-lifetime bugs become visible.
+The suite covers successful programs, compiler diagnostics, Python errors, malformed host packets, and cancellation. It also runs under small quanta and memory/work caps to exercise state lifetime and suspended callbacks.
 
 ## Browser showcase
 
@@ -71,12 +71,12 @@ Cross compilation checks source and link portability. Run `tests/native-cli.test
 
 | Command | Purpose and interpretation |
 |---|---|
-| `npm run compare:smoke` | Run all cases once across CPython 3.12, Peony WASM, and Peony native and require exact output agreement. |
-| `npm run compare` | Run the standard scaled corpus with warmups and three measured samples on all three runtimes. |
+| `npm run compare:smoke` | Run every case once in the native CLI pair and started-interpreter pair, requiring matching output within each pair. |
+| `npm run compare` | Run the standard scaled corpus in one-shot native and started-interpreter pairs, with warmups and three measured samples. |
 | `npm run compare:stress` | Run the largest corpus profile with sustained data and five measured samples. This is intentionally long. |
 | `node tools/gen_unicode.mjs --check` | Verify the checked-in Unicode 15 data against pinned source inputs; no Python installation is needed for this generator. |
 | `node tools/cache_report.mjs --check --json` | Read-only report of repository-local `.zig-cache/` size; it exits nonzero above the 512 MiB maintenance threshold. |
 
-Every comparison sample is also a semantic check: a timing is rejected unless CPython, Peony WASM, and Peony native complete with identical output. The corpus, methodology, filters, and report fields are documented in [`compare/README.md`](../compare/README.md). The Unicode generator separately verifies the data used by string classification, casing, and native regex classes.
+Every comparison sample is also a semantic check: a timing is rejected unless its Peony target and matching CPython execution complete with equivalent output. The corpus, two timing boundaries, memory measurements, filters, and report fields are documented in [`compare/README.md`](../compare/README.md). The Unicode generator separately verifies the data used by string classification, casing, and native regex classes.
 
 Zig's content-addressed cache can grow as source changes. `.zig-cache/` is the one repository-local cache, and the shared Zig global cache is outside the repository. The 512 MiB report threshold is a maintenance signal, not a hard per-build allocation limit. Inspect the cache after a build finishes; do not remove it while Zig is using it. `zig-out/`, `.zig-cache/`, and generated probes are ignored.

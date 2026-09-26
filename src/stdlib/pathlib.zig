@@ -62,8 +62,30 @@ pub fn construct(allocator: std.mem.Allocator, segments: []const []const u8) !Pa
     return .{ .text = try normalizeLexical(allocator, raw.items) };
 }
 
+fn constructNative(allocator: std.mem.Allocator, segments: []const []const u8) !PathData {
+    var converted: std.ArrayList([]u8) = .empty;
+    defer {
+        for (converted.items) |item| allocator.free(item);
+        converted.deinit(allocator);
+    }
+    for (segments) |segment| {
+        const copy = try allocator.dupe(u8, segment);
+        for (copy) |*byte| if (byte.* == '\\') { byte.* = '/'; };
+        try converted.append(allocator, copy);
+    }
+    var start: usize = 0;
+    for (converted.items, 0..) |item, index| {
+        if (item.len >= 3 and item[1] == ':' and item[2] == '/') start = index;
+    }
+    return construct(allocator, converted.items[start..]);
+}
+
 pub fn join(allocator: std.mem.Allocator, base: []const u8, child: []const u8) !PathData {
     return construct(allocator, &.{ base, child });
+}
+
+fn joinNative(allocator: std.mem.Allocator, base: []const u8, child: []const u8) !PathData {
+    return constructNative(allocator, &.{ base, child });
 }
 
 pub fn name(path: []const u8) []const u8 {
@@ -91,6 +113,13 @@ pub fn parent(allocator: std.mem.Allocator, path: []const u8) !PathData {
     if (slash == 0) return .{ .text = try allocator.dupe(u8, "/") };
     if (slash == 1 and path[0] == '/' and path[1] == '/') return .{ .text = try allocator.dupe(u8, "//") };
     return .{ .text = try allocator.dupe(u8, path[0..slash]) };
+}
+
+fn parentNative(allocator: std.mem.Allocator, path: []const u8) !PathData {
+    if (path.len >= 3 and path[1] == ':' and path[2] == '/' and std.mem.lastIndexOfScalar(u8, path, '/') == 2) {
+        return .{ .text = try allocator.dupe(u8, path[0..3]) };
+    }
+    return parent(allocator, path);
 }
 
 fn normalizeLexical(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -166,7 +195,7 @@ fn constructPath(comptime Runtime: type, self: *Runtime, destination: u16, tuple
     for (tuple.items, 0..) |value, index| {
         segments[index] = self.valueString(value) orelse pathText(value) orelse return self.nativeTypeError(line, column, "Path segments must be str or Path");
     }
-    const data = construct(self.heap.allocator, segments) catch |err| return pathDataFailure(self, err, line, column);
+    const data = (if (self.vfs.native_paths) constructNative(self.heap.allocator, segments) else construct(self.heap.allocator, segments)) catch |err| return pathDataFailure(self, err, line, column);
     return storePathData(Runtime, self, destination, data, line, column);
 }
 
@@ -234,7 +263,7 @@ pub fn getAttribute(comptime Runtime: type, self: *Runtime, object: *types.Nativ
     if (std.mem.eql(u8, attribute, "suffix")) return self.createStringValue(suffix(state.text), line, column);
     if (std.mem.eql(u8, attribute, "stem")) return self.createStringValue(stem(state.text), line, column);
     if (std.mem.eql(u8, attribute, "parent")) {
-        var parent_data = parent(self.heap.allocator, state.text) catch {
+        var parent_data = (if (self.vfs.native_paths) parentNative(self.heap.allocator, state.text) else parent(self.heap.allocator, state.text)) catch {
             _ = memoryFailure(self, line, column);
             return null;
         };
@@ -407,9 +436,9 @@ fn pathOps(comptime Runtime: type) *const types.NativeObjectOps {
             const state = stateFromObject(object) orelse return null;
             const other_text = self.valueString(other) orelse pathText(other) orelse return null;
             var combined = (if (reflected)
-                join(self.heap.allocator, other_text, state.text)
+                if (self.vfs.native_paths) joinNative(self.heap.allocator, other_text, state.text) else join(self.heap.allocator, other_text, state.text)
             else
-                join(self.heap.allocator, state.text, other_text)) catch {
+                if (self.vfs.native_paths) joinNative(self.heap.allocator, state.text, other_text) else join(self.heap.allocator, state.text, other_text)) catch {
                 _ = memoryFailure(self, line, column);
                 return null;
             };

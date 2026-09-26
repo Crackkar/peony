@@ -47,11 +47,11 @@ pub fn testPackagesRelativeImportsAndPackagePrecedence() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 8 * 1024 * 1024);
     defer runtime.deinit();
-    try runtime.mountCourseFile("/course/pkg.py", "print('wrong sibling')\nsibling = True\n");
-    try runtime.mountCourseFile("/course/pkg/__init__.py", "print('package init')\n__all__ = ['root']\nroot = 'package'\nfrom . import child\n");
-    try runtime.mountCourseFile("/course/pkg/child.py", "print('child init')\nvalue = 'child'\n");
-    try runtime.mountCourseFile("/course/pkg/sub/__init__.py", "local = 'sub'\n");
-    try runtime.mountCourseFile("/course/pkg/sub/mod.py", "from .. import root\nfrom . import local\n");
+    try runtime.mountAssetFile("/assets/pkg.py", "print('wrong sibling')\nsibling = True\n");
+    try runtime.mountAssetFile("/assets/pkg/__init__.py", "print('package init')\n__all__ = ['root']\nroot = 'package'\nfrom . import child\n");
+    try runtime.mountAssetFile("/assets/pkg/child.py", "print('child init')\nvalue = 'child'\n");
+    try runtime.mountAssetFile("/assets/pkg/sub/__init__.py", "local = 'sub'\n");
+    try runtime.mountAssetFile("/assets/pkg/sub/mod.py", "from .. import root\nfrom . import local\n");
     try runToCompletion(&runtime,
         \\import pkg
         \\import pkg.child
@@ -105,7 +105,7 @@ pub fn testMissingPackageMemberUsesImportError() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 8 * 1024 * 1024);
     defer runtime.deinit();
-    try runtime.mountCourseFile("/course/present_package/__init__.py", "value = 1\n");
+    try runtime.mountAssetFile("/assets/present_package/__init__.py", "value = 1\n");
     try expectException(&runtime, "from present_package import absent\n", .import_error);
 }
 
@@ -138,8 +138,8 @@ pub fn testPackageAllLoadsUninitializedChildThroughScheduledFrame() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 8 * 1024 * 1024);
     defer runtime.deinit();
-    try runtime.mountCourseFile("/course/star_pkg/__init__.py", "__all__ = ['child']\n");
-    try runtime.mountCourseFile("/course/star_pkg/child.py", "answer = input('Child: ')\n");
+    try runtime.mountAssetFile("/assets/star_pkg/__init__.py", "__all__ = ['child']\n");
+    try runtime.mountAssetFile("/assets/star_pkg/child.py", "answer = input('Child: ')\n");
     try expectReady(&runtime, runtime.compileAndStart("from star_pkg import *\nprint(child.answer)\n", "star-child.py"));
 
     var status = runtime_vm.RunStatus.timeslice;
@@ -167,7 +167,7 @@ pub fn testStarImportMissingListedNameRaisesAttributeError() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 8 * 1024 * 1024);
     defer runtime.deinit();
-    try runtime.mountCourseFile("/course/missing_all/__init__.py", "__all__ = ['missing']\n");
+    try runtime.mountAssetFile("/assets/missing_all/__init__.py", "__all__ = ['missing']\n");
     try expectException(&runtime, "from missing_all import *\n", .attribute_error);
 }
 
@@ -219,9 +219,9 @@ pub fn testDottedRelativeFromImportInitializesIntermediatePackages() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 8 * 1024 * 1024);
     defer runtime.deinit();
-    try runtime.mountCourseFile("/course/relative_pkg/__init__.py", "print('package init')\nfrom .sub.mod import value\n");
-    try runtime.mountCourseFile("/course/relative_pkg/sub/__init__.py", "print('sub init')\nready = 'sub'\n");
-    try runtime.mountCourseFile("/course/relative_pkg/sub/mod.py", "print('module init')\nvalue = 8\n");
+    try runtime.mountAssetFile("/assets/relative_pkg/__init__.py", "print('package init')\nfrom .sub.mod import value\n");
+    try runtime.mountAssetFile("/assets/relative_pkg/sub/__init__.py", "print('sub init')\nready = 'sub'\n");
+    try runtime.mountAssetFile("/assets/relative_pkg/sub/mod.py", "print('module init')\nvalue = 8\n");
     try runToCompletion(&runtime,
         \\import relative_pkg
         \\print(relative_pkg.sub.ready, relative_pkg.sub.mod.value, relative_pkg.value)
@@ -234,8 +234,8 @@ pub fn testCannotImportChildOfSelectedModule() !void {
     try runtime.init(std.testing.allocator, 8 * 1024 * 1024);
     defer runtime.deinit();
     try runtime.writeVfsFile("/home/pkgmod.py", "value = 'module'\n");
-    try runtime.mountCourseFile("/course/pkgmod/__init__.py", "value = 'package'\n");
-    try runtime.mountCourseFile("/course/pkgmod/child.py", "value = 'wrong parent'\n");
+    try runtime.mountAssetFile("/assets/pkgmod/__init__.py", "value = 'package'\n");
+    try runtime.mountAssetFile("/assets/pkgmod/child.py", "value = 'wrong parent'\n");
     try expectException(&runtime, "import pkgmod.child\n", .module_not_found_error);
 }
 

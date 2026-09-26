@@ -10,9 +10,9 @@ import test from 'node:test';
 const execute = promisify(execFile);
 const executable = resolve('zig-out', process.platform === 'win32' ? 'peony.exe' : 'peony');
 
-function executeWithInput(arguments_, input) {
+function executeWithInput(arguments_, input, cwd) {
   return new Promise((resolveRun, rejectRun) => {
-    const child = spawn(executable, arguments_, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(executable, arguments_, { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     const stdout = [];
     const stderr = [];
     child.stdout.setEncoding('utf8').on('data', chunk => stdout.push(chunk));
@@ -38,11 +38,11 @@ async function withWorkspace(run) {
 
 test('native CLI reports its runtime identity', async () => {
   const { stdout, stderr } = await execute(executable, ['--version'], { encoding: 'utf8', windowsHide: true });
-  assert.equal(stdout, 'Peony 0.1.0 (Python 3.12 subset)\n');
+  assert.equal(stdout, 'Peony 0.1.0\n');
   assert.equal(stderr, '');
 });
 
-test('native CLI executes a file with argv, explicit VFS mounts, and metrics', async () => {
+test('native CLI reads sibling modules and persists files in its working directory', async () => {
   await withWorkspace(async root => {
     const script = join(root, 'main.py');
     const helper = join(root, 'helper.py');
@@ -51,21 +51,23 @@ test('native CLI executes a file with argv, explicit VFS mounts, and metrics', a
     await writeFile(script, [
       'import sys',
       'from helper import answer',
+      'with open("result.txt", "w") as file:',
+      '    file.write(str(answer + 2))',
+      'print(open("result.txt").read(), open(__file__).read().startswith("import sys"))',
       'name = input("Name: ")',
-      'print(answer + 2, sys.argv, name)',
+      'print(sys.argv[1:], name)',
     ].join('\n'));
 
     const { stdout, stderr } = await executeWithInput([
-      '--filename', '/home/main.py',
-      '--mount', helper, '/home/helper.py',
       '--metrics', metrics,
       script,
       'alpha',
       'two words',
-    ], 'Ada\n');
+    ], 'Ada\n', root);
 
-    assert.equal(stdout, "Name: 42 ['/home/main.py', 'alpha', 'two words'] Ada\n");
+    assert.equal(stdout, "42 True\nName: ['alpha', 'two words'] Ada\n");
     assert.equal(stderr, '');
+    assert.equal(await readFile(join(root, 'result.txt'), 'utf8'), '42');
     const report = JSON.parse(await readFile(metrics, 'utf8'));
     assert.equal(report.schema, 1);
     assert.equal(report.status, 'completed');
@@ -73,6 +75,54 @@ test('native CLI executes a file with argv, explicit VFS mounts, and metrics', a
     assert.ok(Number.isSafeInteger(report.instructions) && report.instructions > 0);
     assert.ok(Number.isSafeInteger(report.work) && report.work >= report.instructions);
     assert.ok(Number.isSafeInteger(report.peak_session_bytes) && report.peak_session_bytes > 0);
+  });
+});
+
+test('native paths use host absolute paths and directory operations', async () => {
+  await withWorkspace(async root => {
+    const script = join(root, 'paths.py');
+    await writeFile(script, [
+      'import os',
+      'import sys',
+      'from pathlib import Path',
+      'directory = os.path.join(sys.argv[1], "nested")',
+      'os.makedirs(directory)',
+      'file = Path(directory) / "note.txt"',
+      'file.write_text("native")',
+      'with open(file, "r+") as stream:',
+      '    stream.seek(2)',
+      '    stream.write("!")',
+      '    stream.truncate(4)',
+      'print(file.name, file.parent.name, file.read_text())',
+      'print(os.path.exists(str(file)), os.path.isdir(directory))',
+    ].join('\n'));
+    const { stdout, stderr } = await execute(executable, [script, root], { encoding: 'utf8', windowsHide: true });
+    assert.equal(stdout, 'note.txt nested na!i\nTrue True\n');
+    assert.equal(stderr, '');
+    assert.equal(await readFile(join(root, 'nested', 'note.txt'), 'utf8'), 'na!i');
+  });
+});
+
+test('native buffered file reads cross chunk, UTF-8, and CRLF boundaries', async () => {
+  await withWorkspace(async root => {
+    const script = join(root, 'stream.py');
+    await writeFile(join(root, 'text.txt'), `${'x'.repeat(8191)}\r\né\n${'y'.repeat(8191)}é\n`);
+    await writeFile(script, [
+      'with open("text.txt", newline="") as stream:',
+      '    first = stream.readline()',
+      '    second = stream.readline()',
+      '    third = stream.readline()',
+      '    print(len(first), repr(second), len(third), third.endswith("é\\n"))',
+      'with open("text.txt") as stream:',
+      '    first = stream.read(8192)',
+      '    print(len(first), first.endswith("\\n"), stream.read(1))',
+      'with open("text.txt", "rb") as stream:',
+      '    stream.seek(8191)',
+      '    print(stream.read(3))',
+    ].join('\n'));
+    const { stdout, stderr } = await execute(executable, [script], { cwd: root, encoding: 'utf8', windowsHide: true });
+    assert.equal(stdout, "8193 'é\\n' 8193 True\n8192 True é\nb'\\r\\n\\xc3'\n");
+    assert.equal(stderr, '');
   });
 });
 

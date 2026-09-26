@@ -1,15 +1,11 @@
 const std = @import("std");
 const host = @import("runtime_host");
 const runtime_vm = @import("runtime_vm");
+const native_fs = @import("native_fs.zig");
 
 const Runtime = runtime_vm.Runtime;
 const max_source_bytes = 16 * 1024 * 1024;
 const max_http_response_bytes = host.max_packet_bytes - 16 * 1024;
-
-const Mount = struct {
-    host_path: []const u8,
-    virtual_path: []const u8,
-};
 
 const Options = struct {
     config: host.Config = host.Config.defaults(),
@@ -17,7 +13,6 @@ const Options = struct {
     display_filename: ?[]const u8 = null,
     metrics_path: ?[]const u8 = null,
     program_args: []const []const u8 = &.{},
-    mounts: std.ArrayList(Mount) = .empty,
 };
 
 const TerminalStatus = enum {
@@ -306,8 +301,7 @@ fn runMain(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var options = Options{};
-    defer options.mounts.deinit(allocator);
-    const parse_result = parseOptions(allocator, args, &options) catch |err| {
+    const parse_result = parseOptions(args, &options) catch |err| {
         writeError(io, "peony: {s}\n\n", .{@errorName(err)});
         writeUsage(io, .stderr);
         return 2;
@@ -318,7 +312,7 @@ fn runMain(init: std.process.Init) !u8 {
             return 0;
         },
         .version => {
-            try std.Io.File.writeStreamingAll(.stdout(), io, "Peony 0.1.0 (Python 3.12 subset)\n");
+            try std.Io.File.writeStreamingAll(.stdout(), io, "Peony 0.1.0\n");
             return 0;
         },
         .run => {},
@@ -336,16 +330,22 @@ fn runMain(init: std.process.Init) !u8 {
     defer allocator.free(source);
 
     var runtime: Runtime = undefined;
+    var filesystem = native_fs.NativeFs.init(allocator, io);
+    defer filesystem.deinit();
     runtime.initWithConfig(allocator, options.config) catch |err| {
         writeError(io, "peony: cannot initialize runtime: {s}\n", .{@errorName(err)});
         return 2;
     };
     defer runtime.deinit();
-    for (options.mounts.items) |mount| installMount(io, allocator, &runtime, options.config, mount) catch |err| {
-        writeError(io, "peony: cannot mount \"{s}\" at \"{s}\": {s}\n", .{ mount.host_path, mount.virtual_path, @errorName(err) });
-        return 2;
-    };
-
+    runtime.vfs.bindHost(filesystem.backend());
+    runtime.vfs.max_file_bytes = std.math.maxInt(usize);
+    runtime.vfs.max_total_bytes = std.math.maxInt(usize);
+    runtime.vfs.native_paths = true;
+    const cwd_text = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cwd_text);
+    runtime.cwd_text = cwd_text;
+    runtime.import_roots = .{ std.fs.path.dirname(script_path) orelse ".", ".", "" };
+    runtime.import_root_count = 2;
     var native_host = try NativeHost.init(allocator, io);
     defer native_host.deinit();
 
@@ -391,7 +391,7 @@ fn runMain(init: std.process.Init) !u8 {
 
 const ParseResult = enum { run, help, version };
 
-fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8, options: *Options) !ParseResult {
+fn parseOptions(args: []const [:0]const u8, options: *Options) !ParseResult {
     var index: usize = 1;
     while (index < args.len) {
         const argument: []const u8 = args[index];
@@ -406,20 +406,12 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8, option
             options.display_filename = try optionValue(args, &index);
         } else if (std.mem.eql(u8, argument, "--metrics")) {
             options.metrics_path = try optionValue(args, &index);
-        } else if (std.mem.eql(u8, argument, "--mount")) {
-            const host_path = try optionValue(args, &index);
-            const virtual_path = try optionValue(args, &index);
-            try options.mounts.append(allocator, .{ .host_path = host_path, .virtual_path = virtual_path });
         } else if (std.mem.eql(u8, argument, "--max-memory")) {
             options.config.max_memory_bytes = try parsePositive(u32, try optionValue(args, &index));
         } else if (std.mem.eql(u8, argument, "--max-work")) {
             options.config.max_instructions = try parsePositive(u64, try optionValue(args, &index));
         } else if (std.mem.eql(u8, argument, "--quantum")) {
             options.config.quantum = try parsePositive(u32, try optionValue(args, &index));
-        } else if (std.mem.eql(u8, argument, "--max-vfs")) {
-            options.config.max_vfs_bytes = try parsePositive(u32, try optionValue(args, &index));
-        } else if (std.mem.eql(u8, argument, "--max-file")) {
-            options.config.max_file_bytes = try parsePositive(u32, try optionValue(args, &index));
         } else if (std.mem.eql(u8, argument, "--seed")) {
             options.config.seed = try optionValue(args, &index);
             if (options.config.seed.len > host.max_seed_length) return error.SeedTooLong;
@@ -427,7 +419,6 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8, option
         } else return error.UnknownOption;
         index += 1;
     }
-    if (options.config.max_file_bytes > options.config.max_vfs_bytes) return error.InvalidVfsLimits;
     if (index >= args.len) return error.MissingScript;
     options.script_path = args[index];
     options.program_args = args[index + 1 ..];
@@ -444,22 +435,6 @@ fn parsePositive(comptime T: type, bytes: []const u8) !T {
     const value = try std.fmt.parseUnsigned(T, bytes, 10);
     if (value == 0) return error.ValueMustBePositive;
     return value;
-}
-
-fn installMount(io: std.Io, allocator: std.mem.Allocator, runtime: *Runtime, config: host.Config, mount: Mount) !void {
-    if (!std.unicode.utf8ValidateSlice(mount.virtual_path) or mount.virtual_path.len < 2 or mount.virtual_path[0] != '/') return error.InvalidMountPath;
-    const contents = try std.Io.Dir.cwd().readFileAlloc(io, mount.host_path, allocator, .limited(config.max_file_bytes));
-    defer allocator.free(contents);
-    if (std.mem.startsWith(u8, mount.virtual_path, "/course/")) {
-        try runtime.mountCourseFile(mount.virtual_path, contents);
-        return;
-    }
-    if (!std.mem.startsWith(u8, mount.virtual_path, "/home/")) return error.InvalidMountPath;
-    if (std.mem.lastIndexOfScalar(u8, mount.virtual_path, '/')) |separator| {
-        const parent = mount.virtual_path[0..separator];
-        if (parent.len != 0 and !std.mem.eql(u8, parent, "/home")) try runtime.mkdirVfsDirectory(parent);
-    }
-    try runtime.writeVfsFile(mount.virtual_path, contents);
 }
 
 fn execute(runtime: *Runtime, native_host: *NativeHost) !TerminalStatus {
@@ -568,19 +543,16 @@ fn writeUsage(io: std.Io, output: Output) void {
     const text =
         \\Usage: peony [options] SCRIPT [ARG ...]
         \\
-        \\Run a Python 3.12 subset program with the native Peony runtime.
+        \\Run a Python program with Peony.
         \\
         \\Options:
         \\  -h, --help                 show this help
         \\  -V, --version              show the runtime version
         \\  --filename NAME            override sys.argv[0] and diagnostic filename
-        \\  --mount HOST_PATH VFS_PATH copy one host file into /home or /course
         \\  --metrics PATH              write JSON execution metrics after the run
         \\  --max-memory BYTES          session allocation limit
         \\  --max-work COUNT            bytecode and native-work limit
         \\  --quantum COUNT             execution scheduling quantum
-        \\  --max-vfs BYTES             total virtual filesystem content limit
-        \\  --max-file BYTES            single virtual file content limit
         \\  --seed TEXT                 deterministic session hash seed
         \\
     ;

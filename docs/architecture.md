@@ -1,37 +1,37 @@
 # Architecture
 
-Peony is one Zig runtime with two shipping adapters: a native process executable and a `wasm32-freestanding` module hosted by a JavaScript Worker. The shared engine owns Python syntax, values, execution, libraries, and virtual files. Each adapter owns access to its environment: stdio and operating-system services in the native process; presentation and browser facilities in the Worker distribution. Neither adapter reimplements Python behavior.
+Peony is one Zig runtime with two shipping adapters: a native process executable and a `wasm32-freestanding` module hosted by a JavaScript Worker. The shared engine owns Python syntax, values, execution, libraries, and file object semantics. Each adapter owns external storage and services: operating system files and stdio in the native process; JavaScript file storage and browser facilities in the Worker distribution.
 
 ```text
                            src/vm/runtime.zig
                      compiler, VM, values, GC,
-                     native libraries, host tasks, VFS
+                native libraries, host tasks, file API
                          /                     \
                         /                       \
              src/native.zig                 src/wasm.zig
              process adapter                versioned raw ABI
-          stdio, clocks, sleep, HTTP               |
+          OS files, stdio, clocks, HTTP             |
                     |                         web/peony-core.mjs
              peony executable                packet/event pump
                                                    |
-                                       web/peony.worker.mjs
+                                 web/fs-host.mjs + peony.worker.mjs
                                             Worker owner
                                                    |
                                            web/peony.mjs
                                             public proxy
 ```
 
-`src/native.zig` owns CLI parsing, source-file loading, explicit host-to-VFS mounts, terminal diagnostics, process exit codes, and the process implementation of host requests. It constructs the same `Runtime` type used by WASM and drives `compileAndStartArgs`, `run`, and `resumeHost` directly. The [native CLI reference](native-cli.md) defines its external contract.
+`src/native.zig` owns CLI parsing, source-file loading, terminal diagnostics, process exit codes, and process host requests. `src/native_fs.zig` connects the file interface to Zig's operating system file APIs. The adapter constructs the shared `Runtime` type and drives `compileAndStartArgs`, `run`, and `resumeHost` directly. The [native CLI reference](native-cli.md) defines its process contract.
 
 `Peony.load(...)` in `web/peony.mjs` always creates a module Worker. The Worker loads `web/peony-core.mjs`, which compiles or instantiates WASM and drives the raw exports. The public facade does not instantiate WASM on the calling thread. Browser and Node integrations use the same facade; Node supplies `worker_threads` in place of a browser Worker. The raw ABI is documented separately because it is a Worker-to-engine contract rather than the recommended application API.
 
 ## Runs through either adapter
 
-A native invocation reads one source file, installs requested VFS mounts, and passes the remaining command arguments to `compileAndStartArgs`. The adapter repeatedly calls `run`, drains buffered output to process streams, and services input, HTTP, clock, and sleep packets. It turns terminal statuses into process exit codes and source-located diagnostics. Runtime setup, source-file I/O, mounts, and optional metrics-file I/O occur outside the measured compile-and-execute interval reported by the CLI.
+A native invocation reads one source file and passes the remaining command arguments to `compileAndStartArgs`. The adapter repeatedly calls `run`, drains buffered output to process streams, and services input, HTTP, clock, and sleep packets. File operations use OS paths through `src/native_fs.zig`; imports search the script directory and working directory.
 
 A browser application creates a session, optionally mounts files, and calls `session.run(source, { filename, argv })`. The Worker validates the request and sends source and metadata through transfer blocks to the Zig exports. It may regain control several times before the program finishes. At each return it continues after a quantum, drains output, awaits a host operation, or produces a terminal result. The page receives an eventual `completed`, `error`, `cancelled`, or `limit` result and may already have received output chunks while the program ran.
 
-One loaded WASM instance can hold multiple raw sessions, each identified by a generation-checked handle. Each runtime owns its Python heap, interpreter frames, module cache, streams, limits, native operation state, and VFS. The public facade replaces a raw runtime between consecutive `run()` calls so Python globals and imports start fresh; it snapshots and restores `/course` and `/home` files and empty `/home` directories. Calling public `session.reset()` instead discards that persistent state. The distinction between public session behavior and the lower-level `peony_reset` export is explicit in the [ABI reference](wasm-abi.md).
+One loaded WASM instance can hold multiple raw sessions, each identified by a generation-checked handle. Each runtime owns its Python heap, interpreter frames, module cache, streams, limits, and native operation state. `web/fs-host.mjs` owns a file tree for each handle. The public facade replaces a raw runtime between consecutive `run()` calls so Python globals and imports start fresh; the Worker transfers the existing file tree to the new handle without copying its bytes and clears `/tmp`. Public `session.reset()` follows the same file persistence rule. The lower-level `peony_reset` export keeps its current host file tree and clears `/tmp`.
 
 ## From text to bytecode
 
@@ -43,7 +43,7 @@ Scope resolution also fixes the storage slot for every local, cell, and free var
 
 Global namespaces retain ordered name/value entries because imports, module attributes, deletion, and class fallback remain dynamic. Each code object keeps a small inline cache from its interned names to validated namespace slots. A cache entry is accepted only for the same environment address and structural version; inserting, deleting, or clearing a name advances that version. Existing-name assignments keep the shape stable. Hot global loads and stores therefore become direct indexed access while namespace mutation preserves Python's name-based behavior.
 
-The compiled language includes ordinary expressions and control flow, functions and generators, class creation, imports, exceptions, context managers, comprehensions, and the documented `match` subset. The front end is a subset compiler: syntax outside the [language surface](language.md) is rejected rather than passed through to an unavailable CPython runtime.
+The compiled language includes expressions and control flow, functions and generators, class creation, imports, exceptions, context managers, comprehensions, and the documented `match` forms. The front end reports source diagnostics with filename, line, and column when it encounters a form outside the [language guide](language.md).
 
 ## The VM and Python control flow
 
@@ -61,7 +61,7 @@ Function frames use bounded per-session storage reuse. A returned ordinary frame
 
 `src/runtime/` implements values and core object behavior. On wasm32, `Value` is an eight-byte tagged word. Floats, small integers, `None`, booleans, and some internal sentinels are immediate; larger integers and compound objects have heap storage. The integer implementation promotes beyond the small-int range rather than losing Python integer precision. String data is valid UTF-8; indexing and slicing follow code point boundaries. Collections, functions, classes, modules, exceptions, file objects, and native objects share the same value graph.
 
-Each runtime has a `SessionAllocator` that counts live and peak bytes and rejects growth beyond its configured cap. The heap is a nonmoving mark/sweep collector. VM frames, registers, closures, globals, exceptions, and pending native operations expose explicit roots so collection can happen while a complex operation is in progress. Collection is also exposed as an idle public session method. The session cap covers persistent runtime, emitted-code allocations, and retained frame storage. Parser, scope, and compiler scratch use separate short-lived allocation; `maxMemoryBytes` is therefore not a cap on total WASM linear memory. The host packet limit and VFS file-content limits are additional, distinct bounds.
+Each runtime has a `SessionAllocator` that counts live and peak bytes and applies its configured cap. The heap is a nonmoving mark/sweep collector. VM frames, registers, closures, globals, exceptions, and pending native operations expose explicit roots so collection can happen while a complex operation is in progress. Collection is also exposed as an idle public session method. The session cap covers persistent runtime, emitted-code allocations, and retained frame storage. Parser, scope, and compiler scratch use separate short-lived allocation. Browser file storage has its own total and per-file byte caps in the Worker host.
 
 The runtime has no Python finalizer guarantee. Worker `session.cancel()` is a hard stop and discards execution state without running Python `finally` or context-manager exits. Ordinary Python exceptions do run their documented unwind path. A work limit is another terminal run outcome rather than a catchable Python exception. The native CLI has no asynchronous cancellation command; process termination remains an operating-system action.
 
@@ -79,13 +79,13 @@ The library implementations use data structures chosen for the admitted workload
 
 `re` compiles its supported grammar to an ordered Pike-style VM; frontier threads preserve leftmost-first and greedy/lazy priority while generation marks avoid repeatedly adding the same state. Its Unicode subject representation keeps code-point-to-byte offsets so scanning does not rescan UTF-8 prefixes for each match position. A Python-visible `Match` snapshots the byte offsets of its captures while that decoded subject is available, making later `group()` and item access constant time even for matches near the end of a long Unicode string. `json` uses a native event cursor that constructs Peony values directly and can resume long decode/encode work without materializing a second generic object graph. A single JSON string token has its own size bound. For `random.sample`, the uncounted case uses a sparse partial shuffle map; the counted case uses a Fenwick tree for selection and updates. These are concrete Zig engine choices, not separate implementations in Python or JavaScript. They still pass through shared work accounting, cancellation, and Python error rules.
 
-## Virtual files and imports
+## Host files and imports
 
-The VFS in `src/runtime/vfs.zig` is a session-owned table of normalized paths, directory entries, and file nodes. It starts with `/course`, `/home`, and `/tmp`. `/course` is read-only host content; `/home` is writable; `/tmp` is writable and cleared for a new run. Paths are POSIX-like and case-sensitive on every host. File content has identity independent of its directory entry, so an already-open file remains coherent after rename or unlink. `src/runtime/file.zig` provides text and binary file operations, newline handling, positions, and context-manager behavior to Python `open()` and the native `pathlib`/`os` surfaces.
+`src/runtime/file.zig` implements Python text and binary file behavior: modes, cursors, newline handling, positions, and context management. `src/runtime/vfs.zig` exposes storage operations to that file layer, imports, `pathlib`, and `os`. The native backend in `src/native_fs.zig` uses OS files and directories. It retains actual file handles and follows operating system path and permission rules.
 
-Imports first consult the run's module cache. The fixed native registry takes precedence over a same-named user module on a cache miss. Other modules are searched in the VFS, under `/home`, `/course`, then `/tmp`, as `.py` files or packages with `__init__.py`. These `.py` paths are program inputs mounted at runtime; no Python implementation files for Peony's shipped libraries are tracked in the source tree. Import execution uses VM frames and the same exception path as top-level code.
+The browser backend is `web/fs-host.mjs`. It keeps directory entries and file bytes in Worker JavaScript. Synchronous WASM imports let the Zig engine read and mutate that store while executing Python file operations. Browser paths use `/assets`, `/home`, and `/tmp`; `/assets` holds page supplied content, `/home` holds writable session content, and `/tmp` holds scratch content cleared for each run. Open handles retain file node identity across rename and unlink.
 
-The browser API copies mounted and written bytes into the VFS and copies read results back to the caller. A site may persist those bytes in its own storage before closing a page. Peony does not automatically use IndexedDB. The public session's file persistence between runs is implemented at the Worker adapter boundary; the raw runtime's VFS and the JavaScript snapshot have distinct lifetimes. The native CLI reads only its script and explicit `--mount` sources from the host filesystem, copies mounts before execution, and does not write VFS mutations back to host paths.
+Imports first consult the run's module cache and registered Zig libraries. Native user modules are searched beside the entry script and in the working directory. Browser user modules are searched under `/home`, `/assets`, then `/tmp`. Both paths load `.py` modules and packages with `__init__.py`, compile their source in Zig, and execute them through VM frames. A page can copy Worker file bytes into its own persistent storage between visits.
 
 ## Source map and verification
 
@@ -93,7 +93,8 @@ The browser API copies mounted and written bytes into the VFS and copies read re
 |---|---|---|
 | Front end | `src/frontend/` | Tokens, AST, scope analysis, bytecode, compile diagnostics |
 | VM | `src/vm/`, `src/engine.zig` | Frames, dispatcher, control flow, calls, scheduling, native tasks |
-| Object substrate | `src/runtime/` | Values, numbers, containers, GC, exceptions, VFS and files |
+| Object substrate | `src/runtime/` | Values, numbers, containers, GC, exceptions, and file semantics |
+| Filesystem hosts | `src/native_fs.zig`, `src/wasm_fs.zig`, `web/fs-host.mjs` | OS and Worker file storage |
 | Native utilities | `src/stdlib/`, `src/regex/` | Python-visible libraries, binder metadata, algorithms |
 | Host protocol | `src/runtime/host.zig`, `src/vm/native_tasks.zig` | Versioned packets and suspended continuations |
 | Native adapter | `src/native.zig` | CLI, stdio, native clocks/timers/HTTP, diagnostics and metrics |
@@ -101,6 +102,6 @@ The browser API copies mounted and written bytes into the VFS and copies read re
 | Worker boundary | `web/peony.mjs`, `web/peony.worker.mjs`, `web/peony-core.mjs` | Worker messages, host callbacks and session lifecycle |
 | UI example | `web/index.html`, `web/showcase.*` | Browser editor and result presentation |
 | Checks | `tests/unit/`, `tests/*.test.mjs`, `tests/showcase-browser.mjs` | Engine semantics, native CLI, WASM, Worker and browser flows |
-| CPython corpus | `compare/` | Three-engine exact differential and performance measurements |
+| CPython corpus | `compare/` | Paired native CLI and started-interpreter output, latency, and peak RSS measurements |
 
 The [language](language.md), [libraries](libraries.md), [native CLI](native-cli.md), and [browser embedding](embedding.md) pages specify what each layer promises. This page explains the ownership and execution path that make those promises possible.

@@ -25,7 +25,7 @@ test('Peony ESM pumps real WASM input and flush output in source order', async (
     },
   });
 
-  const result = await session.run('name = input("Name: ")\nprint("Hello", name)\n', { filename: 'lesson.py' });
+  const result = await session.run('name = input("Name: ")\nprint("Hello", name)\n', { filename: 'sample.py' });
   assert.equal(result.status, 'completed');
   assert.deepEqual(events, [
     ['stdout', 'Name: '],
