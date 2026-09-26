@@ -1232,21 +1232,32 @@ const Compiler = struct {
     }
 
     fn compileLoadName(self: *Compiler, destination: u16, name: []const u8, binding: Binding, span: Span) CompileError!void {
-        const name_index = try self.internName(name);
         switch (binding) {
-            .local, .cell, .free => try self.emitIndex(.load_local, destination, name_index, localBindingFlag(binding), span),
-            .global_explicit, .global_implicit => try self.emitIndex(.load_global, destination, name_index, 0, span),
-            .class_local => try self.emitIndex(.load_local, destination, name_index, localBindingFlag(.local), span),
+            .local, .cell, .free => try self.emitIndex(.load_local, destination, self.bindingSlot(name, binding), localBindingFlag(binding), span),
+            .global_explicit, .global_implicit => try self.emitIndex(.load_global, destination, try self.internName(name), 0, span),
+            .class_local => try self.emitIndex(.load_local, destination, self.bindingSlot(name, .local), localBindingFlag(.local), span),
         }
     }
 
     fn compileStoreName(self: *Compiler, source: u16, name: []const u8, binding: Binding, span: Span) CompileError!void {
-        const name_index = try self.internName(name);
         switch (binding) {
-            .local, .cell, .free => try self.emitIndex(.store_local, source, name_index, localBindingFlag(binding), span),
-            .global_explicit, .global_implicit => try self.emitIndex(.store_global, source, name_index, 0, span),
-            .class_local => try self.emitIndex(.store_local, source, name_index, localBindingFlag(.local), span),
+            .local, .cell, .free => try self.emitIndex(.store_local, source, self.bindingSlot(name, binding), localBindingFlag(binding), span),
+            .global_explicit, .global_implicit => try self.emitIndex(.store_global, source, try self.internName(name), 0, span),
+            .class_local => try self.emitIndex(.store_local, source, self.bindingSlot(name, .local), localBindingFlag(.local), span),
         }
+    }
+
+    fn bindingSlot(self: *const Compiler, name: []const u8, binding: Binding) u32 {
+        const names = switch (binding) {
+            .local => self.local_names.items,
+            .cell => self.cell_names.items,
+            .free => self.free_names.items,
+            .global_explicit, .global_implicit, .class_local => unreachable,
+        };
+        for (names, 0..) |candidate, index| {
+            if (std.mem.eql(u8, candidate, name)) return @intCast(index);
+        }
+        unreachable;
     }
 
     fn compileExpression(self: *Compiler, node_id: NodeId) CompileError!u16 {
@@ -1690,8 +1701,7 @@ const Compiler = struct {
         if (clause.len < 2) return self.failUnsupported(self.ast.node(clause_id).span, "comprehension clause shape is unsupported");
         const iterator_register = try self.acquire(self.ast.node(clause_id).span);
         if (clause_index == 0) {
-            const local_index = try self.internName(outer_name);
-            try self.emitIndex(.load_local, iterator_register, local_index, @intFromEnum(bytecode.LocalBinding.local), self.ast.node(clause_id).span);
+            try self.emitIndex(.load_local, iterator_register, self.bindingSlot(outer_name, .local), @intFromEnum(bytecode.LocalBinding.local), self.ast.node(clause_id).span);
         } else {
             const source = try self.compileExpression(clause[1]);
             try self.emit(.get_iterator, iterator_register, source, 0, 0, self.ast.node(clause[1]).span);

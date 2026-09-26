@@ -1200,13 +1200,11 @@ pub const Runtime = struct {
             .import_star => return self.executeImportStar(instruction.a(), instruction.b(), line, column),
             .load_local => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
-                const name = self.codeName(instruction.index32()) orelse return self.engineFault();
-                if (!self.loadLocal(instruction.a(), name, instruction.flags(), line, column)) return false;
+                if (!self.loadLocal(instruction.a(), instruction.index32(), instruction.flags(), line, column)) return false;
             },
             .store_local => {
                 if (!self.validRegister(instruction.a())) return self.engineFault();
-                const name = self.codeName(instruction.index32()) orelse return self.engineFault();
-                if (!self.storeLocal(instruction.a(), name, instruction.flags(), line, column)) return false;
+                if (!self.storeLocal(instruction.a(), instruction.index32(), instruction.flags(), line, column)) return false;
             },
             .move => {
                 if (!self.validRegister(instruction.a()) or !self.validRegister(instruction.b())) return self.engineFault();

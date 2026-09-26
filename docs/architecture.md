@@ -39,6 +39,8 @@ The front end lives in `src/frontend/`. `lexer.zig` validates UTF-8, handles ind
 
 `compiler.zig` emits register bytecode defined in `bytecode.zig`. An instruction is a fixed 64-bit word with an opcode, register operands, and flags. The code object retains instructions, constants, names, and filename/source positions needed for execution and diagnostics. The AST and scope analysis are transient; their temporary allocations are released after compilation. The resulting code is session-owned. Python source is not transpiled to JavaScript or secretly compiled into Python helper modules for the builtins.
 
+Scope resolution also fixes the storage slot for every local, cell, and free variable. Their load and store instructions carry that slot directly, so the dispatcher indexes the frame or closure cell without repeating a name lookup. Names remain in the code object for diagnostics, argument binding, class namespaces, globals, and other operations whose Python semantics are name based.
+
 The compiled language includes ordinary expressions and control flow, functions and generators, class creation, imports, exceptions, context managers, comprehensions, and the documented `match` subset. The front end is a subset compiler: syntax outside the [language surface](language.md) is rejected rather than passed through to an unavailable CPython runtime.
 
 ## The VM and Python control flow

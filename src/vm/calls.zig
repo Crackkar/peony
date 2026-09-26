@@ -1123,8 +1123,9 @@ pub fn findCell(self: *Runtime, name: []const u8) ?*functions.Cell {
     return null;
 }
 
-pub fn loadLocal(self: *Runtime, destination: u16, name: []const u8, binding: u8, line: u32, column: u32) bool {
+pub fn loadLocal(self: *Runtime, destination: u16, slot: u32, binding: u8, line: u32, column: u32) bool {
     const frame = self.top_frame orelse return self.engineFault();
+    const index: usize = @intCast(slot);
     const kind: bytecode.LocalBinding = switch (binding) {
         0 => .local,
         1 => .cell,
@@ -1133,22 +1134,27 @@ pub fn loadLocal(self: *Runtime, destination: u16, name: []const u8, binding: u8
     };
     const value = switch (kind) {
         .local => blk: {
-            const index = indexOfName(frame.code.local_names, name) orelse return self.engineFault();
+            if (index >= frame.locals.len) return self.engineFault();
             break :blk frame.locals[index];
         },
         .cell => blk: {
-            const index = indexOfName(frame.code.cell_names, name) orelse return self.engineFault();
+            if (index >= frame.local_cells.len) return self.engineFault();
             const cell = frame.local_cells[index] orelse return self.engineFault();
             break :blk cell.value;
         },
         .free => blk: {
-            const index = indexOfName(frame.code.free_names, name) orelse return self.engineFault();
+            if (index >= frame.free_cells.len) return self.engineFault();
             const cell = frame.free_cells[index] orelse return self.engineFault();
             break :blk cell.value;
         },
     };
     if (value.tag() == .unbound or value.tag() == .deleted) {
         if (frame.class_namespace) |class| {
+            const name = switch (kind) {
+                .local => frame.code.local_names[index],
+                .cell => frame.code.cell_names[index],
+                .free => frame.code.free_names[index],
+            };
             if (class_module.ownClassAttribute(class, name)) |class_value| {
                 self.setRegister(destination, class_value);
                 return true;
@@ -1199,8 +1205,9 @@ pub fn loadLocal(self: *Runtime, destination: u16, name: []const u8, binding: u8
     return true;
 }
 
-pub fn storeLocal(self: *Runtime, source: u16, name: []const u8, binding: u8, line: u32, column: u32) bool {
+pub fn storeLocal(self: *Runtime, source: u16, slot: u32, binding: u8, line: u32, column: u32) bool {
     const frame = self.top_frame orelse return self.engineFault();
+    const index: usize = @intCast(slot);
     const kind: bytecode.LocalBinding = switch (binding) {
         0 => .local,
         1 => .cell,
@@ -1210,8 +1217,9 @@ pub fn storeLocal(self: *Runtime, source: u16, name: []const u8, binding: u8, li
     const value = self.registers[source];
     switch (kind) {
         .local => {
-            const index = indexOfName(frame.code.local_names, name) orelse return self.engineFault();
+            if (index >= frame.locals.len) return self.engineFault();
             if (frame.class_namespace) |class| {
+                const name = frame.code.local_names[index];
                 class_module.setClassAttribute(&self.heap, class, name, value) catch {
                     self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
                     return false;
@@ -1221,12 +1229,12 @@ pub fn storeLocal(self: *Runtime, source: u16, name: []const u8, binding: u8, li
             frame.roots[frame.localRootStart() + index].object = value.asObject();
         },
         .cell => {
-            const index = indexOfName(frame.code.cell_names, name) orelse return self.engineFault();
+            if (index >= frame.local_cells.len) return self.engineFault();
             const cell = frame.local_cells[index] orelse return self.engineFault();
             cell.value = value;
         },
         .free => {
-            const index = indexOfName(frame.code.free_names, name) orelse return self.engineFault();
+            if (index >= frame.free_cells.len) return self.engineFault();
             const cell = frame.free_cells[index] orelse return self.engineFault();
             cell.value = value;
         },
