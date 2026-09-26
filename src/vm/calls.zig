@@ -371,7 +371,8 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
     }
 
     const function_code = function.code orelse return self.engineFault();
-    const binding = binder.bindFunction(
+    var bound_stack: [16]Value = undefined;
+    const binding = binder.bindFunctionInto(
         &self.heap,
         allocator,
         function_code.parameter_names,
@@ -379,12 +380,13 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
         function.defaults,
         positional,
         keywords[0..keyword_count],
+        &bound_stack,
     ) catch |err| {
         self.setBinderException(err, line, column);
         return false;
     };
     const bound = binding.values;
-    defer allocator.free(bound);
+    defer if (binding.values_owned) allocator.free(bound);
     defer if (binding.extra_keywords.len != 0) allocator.free(binding.extra_keywords);
     for (function_code.parameter_flags, 0..) |flags, index| {
         if (flags & binder.parameter_flags_module.var_positional != 0) {
@@ -415,11 +417,18 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
             bound[index] = Value.object(&mapping.header);
         }
     }
-    const bound_roots = allocator.alloc(gc.Root, bound.len) catch {
-        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
-        return false;
+    var root_stack: [16]gc.Root = undefined;
+    var owned_roots: []gc.Root = &.{};
+    defer if (owned_roots.len != 0) allocator.free(owned_roots);
+    const bound_roots = if (bound.len <= root_stack.len)
+        root_stack[0..bound.len]
+    else blk: {
+        owned_roots = allocator.alloc(gc.Root, bound.len) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        break :blk owned_roots;
     };
-    defer allocator.free(bound_roots);
     for (bound, 0..) |value, index| bound_roots[index] = .{ .object = value.asObject() };
     var bound_root_frame = gc.RootFrame{};
     bound_root_frame.push(&self.heap.roots);
@@ -815,17 +824,25 @@ pub fn invokePythonSync(self: *Runtime, callable: Value, args: []const Value, de
         return null;
     };
     const allocator = self.heap.allocator;
-    const binding = binder.bindFunction(&self.heap, allocator, function_code.parameter_names, function_code.parameter_flags, function.defaults, args, &.{}) catch |err| {
+    var bound_stack: [16]Value = undefined;
+    const binding = binder.bindFunctionInto(&self.heap, allocator, function_code.parameter_names, function_code.parameter_flags, function.defaults, args, &.{}, &bound_stack) catch |err| {
         self.setBinderException(err, line, column);
         return null;
     };
-    defer allocator.free(binding.values);
+    defer if (binding.values_owned) allocator.free(binding.values);
     if (binding.extra_keywords.len != 0) allocator.free(binding.extra_keywords);
-    const bound_roots = allocator.alloc(gc.Root, binding.values.len) catch {
-        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
-        return null;
+    var root_stack: [16]gc.Root = undefined;
+    var owned_roots: []gc.Root = &.{};
+    defer if (owned_roots.len != 0) allocator.free(owned_roots);
+    const bound_roots = if (binding.values.len <= root_stack.len)
+        root_stack[0..binding.values.len]
+    else blk: {
+        owned_roots = allocator.alloc(gc.Root, binding.values.len) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return null;
+        };
+        break :blk owned_roots;
     };
-    defer allocator.free(bound_roots);
     for (binding.values, 0..) |value, index| bound_roots[index] = .{ .object = value.asObject() };
     var bound_frame = gc.RootFrame{};
     bound_frame.push(&self.heap.roots);

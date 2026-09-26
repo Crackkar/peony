@@ -21,6 +21,7 @@ pub const BindError = std.mem.Allocator.Error || error{
 pub const BoundArguments = struct {
     values: []Value,
     extra_keywords: []Keyword,
+    values_owned: bool = true,
 };
 
 pub const PrintArguments = struct {
@@ -40,10 +41,24 @@ pub fn bindFunction(
     positional: []const Value,
     keywords: []const Keyword,
 ) BindError!BoundArguments {
+    return bindFunctionInto(heap, allocator, parameter_names, parameter_flags, defaults, positional, keywords, &.{});
+}
+
+pub fn bindFunctionInto(
+    heap: *gc.Heap,
+    allocator: std.mem.Allocator,
+    parameter_names: []const []const u8,
+    parameter_flags: []const u32,
+    defaults: []const Value,
+    positional: []const Value,
+    keywords: []const Keyword,
+    storage: []Value,
+) BindError!BoundArguments {
     std.debug.assert(parameter_names.len == parameter_flags.len and parameter_names.len == defaults.len);
-    const bound = try allocator.alloc(Value, parameter_names.len);
+    const values_owned = parameter_names.len > storage.len;
+    const bound = if (values_owned) try allocator.alloc(Value, parameter_names.len) else storage[0..parameter_names.len];
     @memset(bound, Value.unboundValue());
-    errdefer allocator.free(bound);
+    errdefer if (values_owned) allocator.free(bound);
     var created_root = gc.Root{ .object = null };
     var root_frame = gc.RootFrame{};
     root_frame.push(&heap.roots);
@@ -113,7 +128,7 @@ pub fn bindFunction(
             value.* = defaults[index];
         } else return error.MissingArgument;
     }
-    return .{ .values = bound, .extra_keywords = try extra_keywords.toOwnedSlice(allocator) };
+    return .{ .values = bound, .extra_keywords = try extra_keywords.toOwnedSlice(allocator), .values_owned = values_owned };
 }
 
 pub fn bindRange(positional: []const Value, keywords: []const Keyword) error{TooManyPositional, MissingArgument, UnexpectedKeyword}! [3]Value {
