@@ -110,7 +110,8 @@ fn probe(dict: *Dict, key: Value, key_hash: u64, context: *anyopaque, equal: Equ
     var perturb: usize = @truncate(key_hash);
     var first_deleted: ?usize = null;
     var visited: usize = 0;
-    while (visited < dict.buckets.len) : (visited += 1) {
+    const perturb_probes = (@bitSizeOf(usize) + 4) / 5;
+    while (visited < dict.buckets.len + perturb_probes) : (visited += 1) {
         const bucket = dict.buckets[index];
         if (bucket == empty_bucket) return .{ .missing = first_deleted orelse index };
         if (bucket == deleted_bucket) {
@@ -287,7 +288,8 @@ fn insertionBucket(buckets: []const usize, key_hash: u64) ?usize {
     var index = @as(usize, @truncate(key_hash)) & mask;
     var perturb: usize = @truncate(key_hash);
     var first_deleted: ?usize = null;
-    for (0..buckets.len) |_| {
+    const perturb_probes = (@bitSizeOf(usize) + 4) / 5;
+    for (0..buckets.len + perturb_probes) |_| {
         const bucket = buckets[index];
         if (bucket == empty_bucket) return first_deleted orelse index;
         if (bucket == deleted_bucket and first_deleted == null) first_deleted = index;

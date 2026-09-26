@@ -897,6 +897,10 @@ test "dict resize allocation failure releases partial buffers" {
     try mapping_tests.testDictResizeAllocationFailureReleasesBuckets();
 }
 
+test "dictionary perturbation probes survive repeated early indices" {
+    try mapping_tests.testPerturbationProbeReachesEmptyBucketAfterRepeatedIndices();
+}
+
 test "clearing an empty dictionary keeps its iterator valid" {
     try mapping_tests.testEmptyDictClearDoesNotInvalidateIterator();
 }

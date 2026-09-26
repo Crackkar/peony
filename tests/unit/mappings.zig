@@ -257,6 +257,36 @@ pub fn testDictResizeAllocationFailureReleasesBuckets() !void {
     try std.testing.expectEqual(@as(usize, 6), mapping.size);
 }
 
+pub fn testPerturbationProbeReachesEmptyBucketAfterRepeatedIndices() !void {
+    var runtime: runtime_vm.Runtime = undefined;
+    try runtime.init(std.testing.allocator, 2 * 1024 * 1024);
+    defer runtime.deinit();
+    const created = dict_module.create(&runtime.heap, false);
+    const mapping = switch (created) {
+        .value => |dict| dict,
+        else => return error.ExpectedMapping,
+    };
+    var mapping_root = gc.Root{ .object = &mapping.header };
+    var root_frame = gc.RootFrame{};
+    root_frame.push(&runtime.heap.roots);
+    root_frame.add(&mapping_root);
+    defer root_frame.pop();
+
+    for ([_]u64{ 0, 1, 6, 7, 4 }, 0..) |hash, index| {
+        const key = Value.fromSmallInt(@intCast(index)).?;
+        const inserted = dict_module.set(&runtime.heap, mapping, key, key, hash, undefined, identityEqual);
+        try std.testing.expect(inserted == .value);
+    }
+    const final_key = Value.fromSmallInt(99).?;
+    const inserted = dict_module.set(&runtime.heap, mapping, final_key, final_key, 32_768, undefined, identityEqual);
+    try std.testing.expect(inserted == .value);
+    try std.testing.expectEqual(@as(usize, 6), mapping.size);
+    switch (dict_module.get(mapping, final_key, 32_768, undefined, identityEqual)) {
+        .value => |value| try std.testing.expect(value.identical(final_key)),
+        else => return error.ExpectedStoredValue,
+    }
+}
+
 pub fn testEmptyDictClearDoesNotInvalidateIterator() !void {
     var runtime: runtime_vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 2 * 1024 * 1024);
