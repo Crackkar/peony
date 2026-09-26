@@ -66,6 +66,7 @@ const PatternState = struct {
 const MatchState = struct {
     allocator: std.mem.Allocator,
     result: regex_vm.Match,
+    byte_captures: []i64,
     pattern: Value,
     subject: Value,
     pos: usize,
@@ -719,7 +720,7 @@ fn handleSubMatch(
         advanceSub(payload, whole.start, whole.end);
         return .yield;
     }
-    const match_value = createMatchValue(Runtime, self, task.inputs[0], task.inputs[1], payload.next_position, payload.endpos, owned_match, task.line, task.column) orelse return .propagate;
+    const match_value = createMatchValue(Runtime, self, task.inputs[0], task.inputs[1], payload.next_position, payload.endpos, owned_match, &payload.decoded.?, task.line, task.column) orelse return .propagate;
     payload.pending_match = match_value;
     payload.callback_args[0] = match_value;
     payload.pending_start = whole.start;
@@ -788,6 +789,17 @@ fn decodedByteOffset(subject: PatternBytes, decoded: ?*const regex_vm.DecodedSub
     return regex_objects.codepointByteOffset(subject.bytes, subject.mode, position);
 }
 
+fn copyByteCaptures(allocator: std.mem.Allocator, result: *const regex_vm.Match, decoded: *const regex_vm.DecodedSubject) error{OutOfMemory}![]i64 {
+    const captures = allocator.alloc(i64, result.captures.len) catch return error.OutOfMemory;
+    for (result.captures, captures) |position, *byte_position| {
+        byte_position.* = if (position < 0)
+            -1
+        else
+            @intCast(decoded.byteOffset(@intCast(position)) orelse unreachable);
+    }
+    return captures;
+}
+
 fn createMatchValue(
     comptime Runtime: type,
     self: *Runtime,
@@ -796,23 +808,33 @@ fn createMatchValue(
     pos: usize,
     endpos: usize,
     result: regex_vm.Match,
+    decoded: *const regex_vm.DecodedSubject,
     line: u32,
     column: u32,
 ) ?Value {
-    const state = self.heap.allocator.create(MatchState) catch {
+    const byte_captures = copyByteCaptures(self.heap.allocator, &result, decoded) catch {
         var owned = result;
         owned.deinit();
         self.setException(exceptions.memoryError(), line, column, null);
         return null;
     };
-    state.* = .{ .allocator = self.heap.allocator, .result = result, .pattern = pattern, .subject = subject, .pos = pos, .endpos = endpos };
+    const state = self.heap.allocator.create(MatchState) catch {
+        var owned = result;
+        owned.deinit();
+        self.heap.allocator.free(byte_captures);
+        self.setException(exceptions.memoryError(), line, column, null);
+        return null;
+    };
+    state.* = .{ .allocator = self.heap.allocator, .result = result, .byte_captures = byte_captures, .pattern = pattern, .subject = subject, .pos = pos, .endpos = endpos };
     const class = self.ensureNativeClass(.regex_match, "Match", line, column) orelse {
         state.result.deinit();
+        state.allocator.free(state.byte_captures);
         self.heap.allocator.destroy(state);
         return null;
     };
     const object = types.createObject(&self.heap, class, .regex_match) catch {
         state.result.deinit();
+        state.allocator.free(state.byte_captures);
         self.heap.allocator.destroy(state);
         self.setException(exceptions.memoryError(), line, column, null);
         return null;
@@ -1129,7 +1151,7 @@ fn findIteratorTaskStep(comptime Runtime: type, self: *Runtime, task: *types.Tas
             }
             state.engine.?.deinit();
             state.engine = null;
-            const value = createMatchValue(Runtime, self, state.pattern, state.subject, state.pos, state.endpos, match_result, task.line, task.column) orelse break :blk .propagate;
+            const value = createMatchValue(Runtime, self, state.pattern, state.subject, state.pos, state.endpos, match_result, &state.decoded.?, task.line, task.column) orelse break :blk .propagate;
             break :blk .{ .complete = value };
         },
     };
@@ -1252,19 +1274,27 @@ fn matchTaskStep(comptime Runtime: type, self: *Runtime, task: *types.Task) type
 }
 
 fn createMatchResult(comptime Runtime: type, self: *Runtime, task: *types.Task, payload: *MatchTaskPayload, result: regex_vm.Match) types.TaskStep {
-    const state = self.heap.allocator.create(MatchState) catch {
+    const byte_captures = copyByteCaptures(self.heap.allocator, &result, payload.engine.?.input) catch {
         var owned = result;
         owned.deinit();
         return .{ .raise = exceptions.memoryError() };
     };
-    state.* = .{ .allocator = self.heap.allocator, .result = result, .pattern = task.inputs[0], .subject = task.inputs[1], .pos = payload.pos, .endpos = payload.endpos };
+    const state = self.heap.allocator.create(MatchState) catch {
+        var owned = result;
+        owned.deinit();
+        self.heap.allocator.free(byte_captures);
+        return .{ .raise = exceptions.memoryError() };
+    };
+    state.* = .{ .allocator = self.heap.allocator, .result = result, .byte_captures = byte_captures, .pattern = task.inputs[0], .subject = task.inputs[1], .pos = payload.pos, .endpos = payload.endpos };
     const class = self.ensureNativeClass(.regex_match, "Match", task.line, task.column) orelse {
         state.result.deinit();
+        state.allocator.free(state.byte_captures);
         self.heap.allocator.destroy(state);
         return .{ .raise = .{ .kind = .runtime_error, .message = "regex Match class is unavailable" } };
     };
     const object = types.createObject(&self.heap, class, .regex_match) catch {
         state.result.deinit();
+        state.allocator.free(state.byte_captures);
         self.heap.allocator.destroy(state);
         return .{ .raise = exceptions.memoryError() };
     };
@@ -1357,15 +1387,50 @@ fn executeMatchMethod(comptime Runtime: type, self: *Runtime, destination: u16, 
     };
 }
 
+pub fn executeDirectMatchMethod(
+    comptime Runtime: type,
+    self: *Runtime,
+    destination: u16,
+    function_id: u16,
+    receiver: Value,
+    positional: []const Value,
+    keywords: []const binder.Keyword,
+    line: u32,
+    column: u32,
+) ?bool {
+    if (function_id < 201 or function_id > 206) return null;
+    const object = types.fromHeader(receiver.asObject() orelse return self.engineFault()) orelse return self.engineFault();
+    const state = matchFromObject(object) orelse return self.engineFault();
+    if (keywords.len != 0) return self.nativeTypeError(line, column, "match methods do not accept keyword arguments");
+    if (function_id == 201) return groupItemsMethod(Runtime, self, destination, state, positional, line, column);
+    if (positional.len > 1) return self.nativeArity(line, column);
+    const argument = if (positional.len == 1)
+        positional[0]
+    else if (function_id == 202 or function_id == 203)
+        Value.noneValue()
+    else
+        Value.fromSmallInt(0).?;
+    return switch (function_id) {
+        202 => groupsMethod(Runtime, self, destination, state, argument, line, column),
+        203 => groupdictMethod(Runtime, self, destination, state, argument, line, column),
+        204, 205, 206 => spanMethod(Runtime, self, destination, state, argument, function_id, line, column),
+        else => unreachable,
+    };
+}
+
 fn groupMethod(comptime Runtime: type, self: *Runtime, destination: u16, state: *MatchState, groups_value: Value, line: u32, column: u32) bool {
     const header = groups_value.asObject() orelse return self.engineFault();
     const groups = sequence.tupleFromHeader(header) orelse return self.engineFault();
-    if (groups.items.len == 0) return storeGroup(Runtime, self, destination, state, 0, line, column);
-    if (groups.items.len == 1) {
-        const index = groupIndex(Runtime, self, state, groups.items[0], line, column) orelse return false;
+    return groupItemsMethod(Runtime, self, destination, state, groups.items, line, column);
+}
+
+fn groupItemsMethod(comptime Runtime: type, self: *Runtime, destination: u16, state: *MatchState, groups: []const Value, line: u32, column: u32) bool {
+    if (groups.len == 0) return storeGroup(Runtime, self, destination, state, 0, line, column);
+    if (groups.len == 1) {
+        const index = groupIndex(Runtime, self, state, groups[0], line, column) orelse return false;
         return storeGroup(Runtime, self, destination, state, index, line, column);
     }
-    var values = self.heap.allocator.alloc(Value, groups.items.len) catch {
+    var values = self.heap.allocator.alloc(Value, groups.len) catch {
         self.setException(exceptions.memoryError(), line, column, null);
         return false;
     };
@@ -1380,7 +1445,7 @@ fn groupMethod(comptime Runtime: type, self: *Runtime, destination: u16, state: 
     roots.push(&self.heap.roots);
     for (value_roots) |*root| roots.add(root);
     defer roots.pop();
-    for (groups.items, 0..) |group, index| {
+    for (groups, 0..) |group, index| {
         const selected = groupIndex(Runtime, self, state, group, line, column) orelse return false;
         values[index] = groupValue(Runtime, self, state, selected, line, column) orelse return false;
         value_roots[index].object = values[index].asObject();
@@ -1462,11 +1527,16 @@ fn storeGroup(comptime Runtime: type, self: *Runtime, destination: u16, state: *
 }
 
 fn groupValue(comptime Runtime: type, self: *Runtime, state: *MatchState, index: usize, line: u32, column: u32) ?Value {
-    const span = state.result.span(index) orelse return Value.noneValue();
-    const pattern_state = patternFromValue(state.pattern) orelse return null;
+    const slot = std.math.mul(usize, index, 2) catch return null;
+    if (slot + 1 >= state.byte_captures.len) return Value.noneValue();
+    const start = state.byte_captures[slot];
+    const end = state.byte_captures[slot + 1];
+    if (start < 0 or end < 0) return Value.noneValue();
     const subject = patternBytes(Runtime, self, state.subject) orelse return null;
-    const slice = regex_objects.captureSlice(subject.bytes, pattern_state.pattern.program.mode, &state.result, index) orelse return Value.noneValue();
-    _ = span;
+    const byte_start: usize = @intCast(start);
+    const byte_end: usize = @intCast(end);
+    if (byte_start > byte_end or byte_end > subject.bytes.len) return null;
+    const slice = subject.bytes[byte_start..byte_end];
     if (subject.mode == .unicode) return self.createStringValue(slice, line, column);
     return switch (byte_module.create(&self.heap, slice)) {
         .value => |bytes| Value.object(&bytes.header),
@@ -1617,6 +1687,7 @@ fn destroyPattern(raw: ?*anyopaque, allocator: std.mem.Allocator) void {
 fn destroyMatch(raw: ?*anyopaque, allocator: std.mem.Allocator) void {
     const state: *MatchState = @ptrCast(@alignCast(raw orelse return));
     state.result.deinit();
+    allocator.free(state.byte_captures);
     allocator.destroy(state);
 }
 

@@ -21,10 +21,28 @@ const indexOfName = @import("runtime.zig").indexOfName;
 
 pub fn allocateFrame(self: *Runtime, code: *Code, return_destination: ?u16) error{OutOfMemory}!*Frame {
     const allocator = self.heap.allocator;
-    const frame = allocator.create(Frame) catch return error.OutOfMemory;
     const environment = self.currentEnvironment();
+    if (takeCachedFrame(self, code)) |frame| {
+        frame.environment = environment;
+        frame.previous = self.top_frame;
+        frame.return_destination = return_destination;
+        @memset(frame.registers, Value.unboundValue());
+        @memset(frame.locals, Value.unboundValue());
+        @memset(frame.local_cells, null);
+        @memset(frame.free_cells, null);
+        frame.try_blocks.clearRetainingCapacity();
+        @memset(frame.pending_values, Value.noneValue());
+        @memset(frame.roots, .{ .object = null });
+        frame.roots[frame.environmentRootIndex()].object = environment;
+        frame.root_frame.push(&self.heap.roots);
+        for (frame.roots) |*root| frame.root_frame.add(root);
+        self.top_frame = frame;
+        self.activateFrame(frame);
+        return frame;
+    }
+    const frame = allocator.create(Frame) catch return error.OutOfMemory;
     frame.* = .{ .code = code, .return_destination = return_destination, .environment = environment };
-    errdefer self.freeFrameStorage(frame);
+    errdefer destroyFrameStorage(self, frame);
     frame.registers = try allocator.alloc(Value, @intCast(code.register_count));
     @memset(frame.registers, Value.unboundValue());
     frame.locals = try allocator.alloc(Value, code.local_names.len);
@@ -54,6 +72,65 @@ pub fn allocateFrame(self: *Runtime, code: *Code, return_destination: ?u16) erro
 }
 
 pub fn freeFrameStorage(self: *Runtime, frame: *Frame) void {
+    if (frame.generator_owner == null and self.frame_cache_count < 32 and frameStorageBytes(frame) <= 64 * 1024) {
+        frame.module_initializing = null;
+        frame.return_destination = null;
+        frame.return_override = null;
+        frame.return_to_task = null;
+        frame.override_requires_none = false;
+        frame.ip = 0;
+        frame.class_namespace = null;
+        @memset(frame.registers, Value.unboundValue());
+        @memset(frame.locals, Value.unboundValue());
+        @memset(frame.local_cells, null);
+        @memset(frame.free_cells, null);
+        frame.try_blocks.clearRetainingCapacity();
+        @memset(frame.pending_values, Value.noneValue());
+        @memset(frame.roots, .{ .object = null });
+        frame.root_frame = .{};
+        frame.previous = self.frame_cache;
+        self.frame_cache = frame;
+        self.frame_cache_count += 1;
+        return;
+    }
+    destroyFrameStorage(self, frame);
+}
+
+pub fn clearFrameCache(self: *Runtime) void {
+    while (self.frame_cache) |frame| {
+        self.frame_cache = frame.previous;
+        destroyFrameStorage(self, frame);
+    }
+    self.frame_cache_count = 0;
+}
+
+fn takeCachedFrame(self: *Runtime, code: *Code) ?*Frame {
+    var link = &self.frame_cache;
+    while (link.*) |frame| {
+        if (frame.code == code) {
+            link.* = frame.previous;
+            self.frame_cache_count -= 1;
+            frame.previous = null;
+            return frame;
+        }
+        link = &frame.previous;
+    }
+    return null;
+}
+
+fn frameStorageBytes(frame: *const Frame) usize {
+    var total: usize = @sizeOf(Frame);
+    total +|= frame.registers.len *| @sizeOf(Value);
+    total +|= frame.locals.len *| @sizeOf(Value);
+    total +|= frame.local_cells.len *| @sizeOf(?*functions.Cell);
+    total +|= frame.free_cells.len *| @sizeOf(?*functions.Cell);
+    total +|= frame.pending_values.len *| @sizeOf(Value);
+    total +|= frame.roots.len *| @sizeOf(gc.Root);
+    total +|= frame.try_blocks.capacity *| @sizeOf(TryBlock);
+    return total;
+}
+
+fn destroyFrameStorage(self: *Runtime, frame: *Frame) void {
     const allocator = self.heap.allocator;
     if (frame.roots.len != 0) allocator.free(frame.roots);
     frame.try_blocks.deinit(allocator);

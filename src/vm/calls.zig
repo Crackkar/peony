@@ -90,16 +90,44 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
     if (start > code.call_arguments.len or count > code.call_arguments.len - start) return self.engineFault();
 
     const allocator = self.heap.allocator;
-    const positional_object = switch (sequence.createList(&self.heap, &.{})) {
-        .value => |list| list,
-        .python_exception => |exception| {
-            self.setException(exception, line, column, null);
-            return false;
-        },
-        .engine_error => return self.engineFault(),
-    };
+    const arguments = code.call_arguments[start..][0..count];
+    var needs_positional_expansion = false;
+    var direct_positional_count: usize = 0;
+    var keyword_capacity: usize = 0;
+    for (arguments) |argument| {
+        if (!self.validRegister(argument.register)) return self.engineFault();
+        if (argument.double_starred) {
+            const mapping_header = self.registers[argument.register].asObject() orelse return self.engineFault();
+            const mapping = dict_module.dictFromHeader(mapping_header) orelse return self.engineFault();
+            keyword_capacity = std.math.add(usize, keyword_capacity, mapping.size) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            };
+        } else if (argument.keyword_name != std.math.maxInt(u32)) {
+            keyword_capacity = std.math.add(usize, keyword_capacity, 1) catch {
+                self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+                return false;
+            };
+        } else if (argument.starred) {
+            needs_positional_expansion = true;
+        } else {
+            direct_positional_count += 1;
+        }
+    }
+
+    var positional_object: ?*sequence.List = null;
+    if (needs_positional_expansion) {
+        positional_object = switch (sequence.createList(&self.heap, &.{})) {
+            .value => |list| list,
+            .python_exception => |exception| {
+                self.setException(exception, line, column, null);
+                return false;
+            },
+            .engine_error => return self.engineFault(),
+        };
+    }
     var call_roots = [_]gc.Root{
-        .{ .object = &positional_object.header },
+        .{ .object = if (positional_object) |list| &list.header else null },
         .{ .object = null },
         .{ .object = null },
     };
@@ -109,25 +137,36 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
     var call_roots_active = true;
     defer if (call_roots_active) call_root_frame.detach();
 
-    var keyword_capacity = count;
-    for (code.call_arguments[start..][0..count]) |argument| {
-        if (!argument.double_starred) continue;
-        if (!self.validRegister(argument.register)) return self.engineFault();
-        const mapping_header = self.registers[argument.register].asObject() orelse return self.engineFault();
-        const mapping = dict_module.dictFromHeader(mapping_header) orelse return self.engineFault();
-        keyword_capacity = std.math.add(usize, keyword_capacity, mapping.size) catch {
+    var positional_stack: [9]Value = undefined;
+    var owned_positional: []Value = &.{};
+    defer if (owned_positional.len != 0) allocator.free(owned_positional);
+    const direct_storage = if (needs_positional_expansion)
+        positional_stack[0..0]
+    else if (direct_positional_count + 1 <= positional_stack.len)
+        positional_stack[0 .. direct_positional_count + 1]
+    else blk: {
+        owned_positional = allocator.alloc(Value, direct_positional_count + 1) catch {
             self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
             return false;
         };
-    }
-    const keywords = allocator.alloc(binder.Keyword, keyword_capacity) catch {
-        self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
-        return false;
+        break :blk owned_positional;
     };
-    defer allocator.free(keywords);
+
+    var keyword_stack: [8]binder.Keyword = undefined;
+    var owned_keywords: []binder.Keyword = &.{};
+    defer if (owned_keywords.len != 0) allocator.free(owned_keywords);
+    const keywords = if (keyword_capacity <= keyword_stack.len)
+        keyword_stack[0..keyword_capacity]
+    else blk: {
+        owned_keywords = allocator.alloc(binder.Keyword, keyword_capacity) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        break :blk owned_keywords;
+    };
     var keyword_count: usize = 0;
-    for (code.call_arguments[start..][0..count]) |argument| {
-        if (!self.validRegister(argument.register)) return self.engineFault();
+    var direct_positional_index: usize = 1;
+    for (arguments) |argument| {
         const value = self.registers[argument.register];
         if (argument.double_starred) {
             const mapping_header = value.asObject() orelse return self.engineFault();
@@ -153,7 +192,7 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
                     switch (iterator.next(&self.heap, expanded)) {
                         .item => |item| {
                             call_roots[1].object = item.asObject();
-                            switch (sequence.append(&self.heap, positional_object, item)) {
+                            switch (sequence.append(&self.heap, positional_object.?, item)) {
                                 .value => {},
                                 .python_exception => |exception| {
                                     self.setException(exception, line, column, null);
@@ -173,14 +212,19 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
                 }
                 call_roots[2].object = null;
             } else {
-                call_roots[1].object = value.asObject();
-                switch (sequence.append(&self.heap, positional_object, value)) {
-                    .value => {},
-                    .python_exception => |exception| {
-                        self.setException(exception, line, column, null);
-                        return false;
-                    },
-                    .engine_error => return self.engineFault(),
+                if (positional_object) |list| {
+                    call_roots[1].object = value.asObject();
+                    switch (sequence.append(&self.heap, list, value)) {
+                        .value => {},
+                        .python_exception => |exception| {
+                            self.setException(exception, line, column, null);
+                            return false;
+                        },
+                        .engine_error => return self.engineFault(),
+                    }
+                } else {
+                    direct_storage[direct_positional_index] = value;
+                    direct_positional_index += 1;
                 }
             }
         } else {
@@ -188,7 +232,7 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
             if (!self.appendCallKeyword(keywords, &keyword_count, name, value, line, column)) return false;
         }
     }
-    var positional = positional_object.items.items;
+    var positional = if (positional_object) |list| list.items.items else direct_storage[1..direct_positional_index];
     var callee = self.registers[instruction.a()];
     if (callee.asExceptionClass()) |class_index| {
         if (class_index == std.math.maxInt(u8)) return self.nativeTypeError(line, column, "'NotImplementedType' object is not callable");
@@ -278,11 +322,7 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
         return true;
     }
     if (class_module.boundMethodFromHeader(header)) |bound_method| {
-        positional_object.items.insert(allocator, 0, bound_method.receiver) catch {
-            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
-            return false;
-        };
-        positional = positional_object.items.items;
+        if (!prependCallReceiver(self, positional_object, direct_storage, &positional, bound_method.receiver, line, column)) return false;
         header = bound_method.callable.asObject() orelse return self.engineFault();
     }
     if (class_module.instanceFromHeader(header)) |instance| {
@@ -301,11 +341,7 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
         }
     }
     if (class_module.boundMethodFromHeader(header)) |bound_method| {
-        positional_object.items.insert(allocator, 0, bound_method.receiver) catch {
-            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
-            return false;
-        };
-        positional = positional_object.items.items;
+        if (!prependCallReceiver(self, positional_object, direct_storage, &positional, bound_method.receiver, line, column)) return false;
         header = bound_method.callable.asObject() orelse return self.engineFault();
     }
     const function = functions.functionFromHeader(header) orelse {
@@ -456,6 +492,21 @@ pub fn executeCall(self: *Runtime, instruction: bytecode.Instruction, line: u32,
     }
     bound_root_frame.pop();
     bound_roots_active = false;
+    return true;
+}
+
+fn prependCallReceiver(self: *Runtime, positional_object: ?*sequence.List, direct_storage: []Value, positional: *[]Value, receiver: Value, line: u32, column: u32) bool {
+    if (positional_object) |list| {
+        list.items.insert(self.heap.allocator, 0, receiver) catch {
+            self.setException(.{ .kind = .memory_error, .message = "session memory limit exceeded" }, line, column, null);
+            return false;
+        };
+        positional.* = list.items.items;
+        return true;
+    }
+    if (positional.*.len >= direct_storage.len) return self.engineFault();
+    direct_storage[0] = receiver;
+    positional.* = direct_storage[0 .. positional.*.len + 1];
     return true;
 }
 

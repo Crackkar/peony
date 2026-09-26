@@ -40,6 +40,7 @@ pub fn call(
     column: u32,
 ) bool {
     const module_id = std.enums.fromInt(types.ModuleId, module_id_raw) orelse return self.engineFault();
+    if (module_id == .re) if (re.executeDirectMatchMethod(Runtime, self, destination, function_id, receiver, positional, keywords, line, column)) |result| return result;
     const spec = registry.functionSpec(module_id, function_id) orelse return self.engineFault();
     if (spec.params.len > max_native_parameters) return self.engineFault();
 

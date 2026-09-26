@@ -102,6 +102,8 @@ pub const Runtime = struct {
     code: ?*Code = null,
     imported_codes: std.ArrayList(*Code) = .empty,
     top_frame: ?*Frame = null,
+    frame_cache: ?*Frame = null,
+    frame_cache_count: usize = 0,
     registers: []Value = &.{},
     register_roots: []gc.Root = &.{},
     register_frame: gc.RootFrame = .{},
@@ -145,6 +147,7 @@ pub const Runtime = struct {
     // Frame roots, control transfer, and exception handling.
     pub const allocateFrame = control.allocateFrame;
     pub const freeFrameStorage = control.freeFrameStorage;
+    pub const clearFrameCache = control.clearFrameCache;
     pub const activateFrame = control.activateFrame;
     pub const popFrame = control.popFrame;
     pub const unwindFrames = control.unwindFrames;
@@ -946,6 +949,7 @@ pub const Runtime = struct {
         }
         if (self.sync_task != null) self.clearSyncTask();
         self.unwindFrames();
+        self.clearFrameCache();
 
         self.pending_input = null;
         self.native_task_root.object = null;
