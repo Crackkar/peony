@@ -19,18 +19,13 @@ pub const CharacterSemantics = struct {
 };
 
 pub const WorkBudget = struct {
-    remaining: ?u64 = null,
+    remaining: u64 = std.math.maxInt(u64),
     used: u64 = 0,
-    context: ?*anyopaque = null,
-    charge_fn: ?*const fn (?*anyopaque, u64) bool = null,
 
     pub fn charge(self: *WorkBudget, amount: u64) Error!void {
-        if (self.remaining) |remaining| {
-            if (amount > remaining) return error.WorkLimit;
-        }
-        if (self.charge_fn) |charge_fn| if (!charge_fn(self.context, amount)) return error.WorkLimit;
-        if (self.remaining) |remaining| self.remaining = remaining - amount;
-        self.used = std.math.add(u64, self.used, amount) catch std.math.maxInt(u64);
+        if (amount > self.remaining) return error.WorkLimit;
+        self.remaining -= amount;
+        self.used +|= amount;
     }
 };
 

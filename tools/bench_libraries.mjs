@@ -22,6 +22,9 @@ const csv = Array.from({ length: 4000 }, (_, index) => `${index},${index % 17}\n
 const json = JSON.stringify({ rows: Array.from({ length: 4000 }, (_, index) => ({ id: index, value: index % 17, text: 'é' })) });
 const jsonStrings = JSON.stringify(Array.from({ length: 2000 }, (_, index) => `row-${index}-${'abcdefghij'.repeat(20)}é`));
 const pathText = 'abcdefghij\n'.repeat(1500);
+const regexAscii = 'alpha_1 beta2 # comment_3\n'.repeat(1000);
+const regexUnicode = 'Αλφα βήτα ١٢٣ 中文\n'.repeat(1000);
+const regexNoMatch = 'a'.repeat(32 * 1024);
 
 const workloads = [
   {
@@ -83,6 +86,24 @@ const workloads = [
     files: { '/course/text.txt': pathText },
     source: 'total = 0\nfor unused in range(100):\n    with open("/course/text.txt") as source:\n        total += len(source.read())\nchunk = "abcdefghij\\n" * 10\nwith open("/home/output.txt", "w") as output:\n    for unused in range(200): output.write(chunk)\nwith open("/home/output.txt") as output:\n    written = len(output.read())\nprint(total, written)\n',
     expected: `${pathText.length * 100} 22000\n`,
+  },
+  {
+    name: 'regex-ascii-findall',
+    files: { '/course/regex.txt': regexAscii },
+    source: 'import re\nwith open("/course/regex.txt") as source: text = source.read()\nprint(len(re.findall(r"\\b[A-Za-z_]\\w*\\b", text)))\n',
+    expected: '3000\n',
+  },
+  {
+    name: 'regex-unicode-classes',
+    files: { '/course/regex.txt': regexUnicode },
+    source: 'import re\nwith open("/course/regex.txt") as source: text = source.read()\nprint(len(re.findall(r"\\w+", text, re.I)))\n',
+    expected: '4000\n',
+  },
+  {
+    name: 'regex-long-no-match',
+    files: { '/course/regex.txt': regexNoMatch },
+    source: 'import re\nwith open("/course/regex.txt") as source: text = source.read()\nprint(re.search(r"(?:a|aa)*b", text) is None)\n',
+    expected: 'True\n',
   },
   {
     name: 'deepcopy-alias-cycle',
