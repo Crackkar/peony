@@ -404,61 +404,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run native Peony unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    const library_bridge_root = b.createModule(.{
-        .root_source_file = b.path("tests/unit/library_bridge_root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = true,
-    });
-    library_bridge_root.addImport("library_bridge_tests", library_bridge_module);
-    library_bridge_root.addImport("runtime_vm", runtime_vm_module);
-    const library_bridge_tests = b.addTest(.{ .root_module = library_bridge_root });
-    const run_library_bridge_tests = b.addRunArtifact(library_bridge_tests);
-    const bridge_step = b.step("test-bridge", "Run focused native library bridge tests");
-    bridge_step.dependOn(&run_library_bridge_tests.step);
-    const library_b_root = b.createModule(.{
-        .root_source_file = b.path("tests/unit/library_b_root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = true,
-    });
-    library_b_root.addImport("library_regex_tests", library_regex_module);
-    library_b_root.addImport("library_http_tests", library_http_module);
-    const library_b_tests = b.addTest(.{ .root_module = library_b_root });
-    const run_library_b_tests = b.addRunArtifact(library_b_tests);
-    const library_b_step = b.step("test-library-b", "Run focused native regex/HTTP library tests");
-    library_b_step.dependOn(&run_library_b_tests.step);
-    const library_a_root = b.createModule(.{
-        .root_source_file = b.path("tests/unit/library_a_root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = true,
-    });
-    library_a_root.addImport("library_numeric_tests", library_numeric_module);
-    library_a_root.addImport("library_data_tests", library_data_module);
-    library_a_root.addImport("library_vfs_tests", library_vfs_module);
-    library_a_root.addImport("library_collections_tests", library_collections_module);
-    const library_a_tests = b.addTest(.{ .root_module = library_a_root });
-    const run_library_a_tests = b.addRunArtifact(library_a_tests);
-    const library_a_step = b.step("test-library-a", "Run focused native numeric/data/VFS/collections library tests");
-    library_a_step.dependOn(&run_library_a_tests.step);
-
-    const json_choice_root = b.createModule(.{
-        .root_source_file = b.path("tests/bench/json_choice.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = true,
-    });
-    json_choice_root.addImport("runtime_vm", runtime_vm_module);
-    json_choice_root.addImport("runtime_gc", native_runtime.gc);
-    json_choice_root.addImport("runtime_dict", native_runtime.dict);
-    json_choice_root.addImport("runtime_number", native_runtime.number);
-    json_choice_root.addImport("runtime_sequence", native_runtime.sequence);
-    const json_choice_exe = b.addExecutable(.{ .name = "peony-json-choice", .root_module = json_choice_root });
-    const json_choice_run = b.addRunArtifact(json_choice_exe);
-    const json_choice_step = b.step("bench-json-choice", "Compare native Value JSON paths with std.json DOM conversion");
-    json_choice_step.dependOn(&json_choice_run.step);
-
     const wasm_debug = b.option(bool, "wasm-debug", "Build stripped Debug WASM for local integration") orelse false;
     const wasm_optimize: std.builtin.OptimizeMode = if (wasm_debug) .Debug else .ReleaseFast;
     const wasm_target = b.resolveTargetQuery(.{
@@ -493,9 +438,6 @@ pub fn build(b: *std.Build) void {
     const wasm_step = b.step("wasm", "Build the stripped ReleaseFast browser WASM artifact");
     wasm_step.dependOn(&install_wasm.step);
 
-    addProbe(b, wasm_target, "bigint", "peony_probe_bigint");
-    addProbe(b, wasm_target, "json", "peony_probe_json");
-    addProbe(b, wasm_target, "unicode15", "peony_probe_unicode15");
 }
 
 const FrontendModules = struct {
@@ -542,37 +484,6 @@ fn createFrontendModules(
     });
     scope_module.addImport("frontend_ast", ast_module);
     return .{ .token = token_module, .lexer = lexer_module, .ast = ast_module, .parser = parser_module, .scope = scope_module };
-}
-
-fn addProbe(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, probe_symbol: []const u8) void {
-    const exports = b.allocator.alloc([]const u8, abi_exports.len + 1) catch @panic("out of memory");
-    @memcpy(exports[0..abi_exports.len], abi_exports[0..]);
-    exports[abi_exports.len] = probe_symbol;
-
-    const module = b.createModule(.{
-        .root_source_file = b.path(b.fmt(".zig-cache/size-probes/{s}-root.zig", .{name})),
-        .target = target,
-        .optimize = .ReleaseSmall,
-        .single_threaded = true,
-        .strip = true,
-    });
-    const runtime = createRuntimeModules(b, target, .ReleaseSmall);
-    const frontend = createFrontendModules(b, target, .ReleaseSmall);
-    module.addImport("runtime_vm", createExecutionVmModule(b, target, .ReleaseSmall, runtime, frontend));
-    addRuntimeImports(module, runtime);
-    module.export_symbol_names = exports;
-
-    const exe = b.addExecutable(.{
-        .name = b.fmt("peony-probe-{s}", .{name}),
-        .root_module = module,
-        .use_llvm = true,
-    });
-    exe.entry = .disabled;
-    exe.export_memory = true;
-
-    const install = b.addInstallFile(exe.getEmittedBin(), b.fmt("peony-probe-{s}.wasm", .{name}));
-    const step = b.step(b.fmt("probe-{s}", .{name}), b.fmt("Build the {s} feature-size probe", .{name}));
-    step.dependOn(&install.step);
 }
 
 fn createExecutionVmModule(

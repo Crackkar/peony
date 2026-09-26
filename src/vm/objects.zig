@@ -1006,8 +1006,8 @@ pub fn executeUnpack(self: *Runtime, instruction: bytecode.Instruction, line: u3
         }
     }
     // Exact-size sources get exact temporary storage for starred unpacking.
-    // Unknown iterators retain a temporary 65,536-item bound pending the
-    // dynamically growing, session-accounted buffer work in Commit 23.
+    // Unknown iterators grow session-accounted storage up to the documented
+    // 65,536-item bound.
     const capacity: usize = if (!has_star)
         destination_count + 1
     else

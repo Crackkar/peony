@@ -10,7 +10,7 @@ pub fn testNativeJsonValueAdapter() !void {
     runtime.heap.threshold_growth_floor = 1;
 
     const source = "{\"text\":\"\\u96ea\",\"big\":123456789012345678901234567890,\"a\":1,\"a\":2}";
-    const parsed = vm.JsonValuesDraft.parseUtf8Detailed(vm.Runtime, &runtime, source, 1, 1);
+    const parsed = vm.JsonValues.parseUtf8Detailed(vm.Runtime, &runtime, source, 1, 1);
     const value = switch (parsed) {
         .value => |selected| selected,
         .decode_error => |diagnostic| {
@@ -23,7 +23,7 @@ pub fn testNativeJsonValueAdapter() !void {
         },
         .engine_error => return error.ExpectedNativeJsonValue,
     };
-    const encoded_result = vm.JsonValuesDraft.serializeUtf8(vm.Runtime, &runtime, value, .{
+    const encoded_result = vm.JsonValues.serializeUtf8(vm.Runtime, &runtime, value, .{
         .sort_keys = true,
         .ensure_ascii = true,
         .item_separator = ",",
@@ -41,7 +41,7 @@ pub fn testNativeJsonValueAdapter() !void {
     try std.testing.expectEqualStrings("{\"a\":2,\"big\":123456789012345678901234567890,\"text\":\"\\u96ea\"}", encoded);
     try std.testing.expect(runtime.heap.collection_count > 0);
 
-    const malformed = vm.JsonValuesDraft.parseUtf8Detailed(vm.Runtime, &runtime, "{\n\"x\":}", 1, 1);
+    const malformed = vm.JsonValues.parseUtf8Detailed(vm.Runtime, &runtime, "{\n\"x\":}", 1, 1);
     switch (malformed) {
         .decode_error => |diagnostic| {
             try std.testing.expectEqual(@as(usize, 2), diagnostic.line);
@@ -53,7 +53,7 @@ pub fn testNativeJsonValueAdapter() !void {
 
     const baseline = runtime.session_allocator.live_bytes;
     runtime.session_allocator.max_bytes = baseline + 8;
-    const capped = vm.JsonValuesDraft.parseUtf8Detailed(vm.Runtime, &runtime, "\"a string longer than the remaining session budget\"", 1, 1);
+    const capped = vm.JsonValues.parseUtf8Detailed(vm.Runtime, &runtime, "\"a string longer than the remaining session budget\"", 1, 1);
     switch (capped) {
         .python_exception => |exception| try std.testing.expectEqual(vm.PythonExceptionKind.memory_error, exception.kind),
         else => return error.ExpectedNativeJsonMemoryError,

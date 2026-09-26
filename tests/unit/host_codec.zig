@@ -153,15 +153,15 @@ pub fn testHostConfigRoundTripAndValidation() !void {
 
     // A pre-extension PCFG packet keeps the original 28-byte header and
     // receives the documented default VFS budgets.
-    var legacy: [host.config_header_size]u8 = @splat(0);
-    @memcpy(legacy[0..4], "PCFG");
-    std.mem.writeInt(u16, legacy[4..6], 1, .little);
-    std.mem.writeInt(u32, legacy[8..12], 8 * 1024 * 1024, .little);
-    std.mem.writeInt(u64, legacy[12..20], 123_456, .little);
-    std.mem.writeInt(u32, legacy[20..24], 17, .little);
-    const legacy_decoded = try host.decodeConfig(&legacy);
-    try std.testing.expectEqual(host.Config.defaults().max_vfs_bytes, legacy_decoded.max_vfs_bytes);
-    try std.testing.expectEqual(host.Config.defaults().max_file_bytes, legacy_decoded.max_file_bytes);
+    var base_config: [host.config_header_size]u8 = @splat(0);
+    @memcpy(base_config[0..4], "PCFG");
+    std.mem.writeInt(u16, base_config[4..6], 1, .little);
+    std.mem.writeInt(u32, base_config[8..12], 8 * 1024 * 1024, .little);
+    std.mem.writeInt(u64, base_config[12..20], 123_456, .little);
+    std.mem.writeInt(u32, base_config[20..24], 17, .little);
+    const decoded_base = try host.decodeConfig(&base_config);
+    try std.testing.expectEqual(host.Config.defaults().max_vfs_bytes, decoded_base.max_vfs_bytes);
+    try std.testing.expectEqual(host.Config.defaults().max_file_bytes, decoded_base.max_file_bytes);
 
     var invalid_limits = config;
     invalid_limits.max_file_bytes = invalid_limits.max_vfs_bytes + 1;

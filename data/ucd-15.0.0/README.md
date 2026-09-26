@@ -10,4 +10,4 @@ These files are pinned inputs for [`tools/gen_unicode.mjs`](../../tools/gen_unic
 | `CaseFolding.txt` | `cdd49e55eae3bbf1f0a3f6580c974a0263cb86a6a08daa10fbf705b4808a56f7` |
 | `Unihan_NumericValues.txt` | `42289ff99564cf17c3c95938744c2f690452b704a6d076d5372c4571c3cb14f6` |
 
-Run `node tools/gen_unicode.mjs --check` to regenerate in memory and compare with `data/unicode-15.0.bin`. Its expected output SHA-256 is `10a4fd50df393d992424d2102e48e39c58dc6449a7a9cae0dcc5708683848019` (237,028 bytes). `node tools/generate_unicode15_probe.mjs` derives the size probe from that verified table. Both tracked tools are Node programs; no Python generator is required.
+Run `node tools/gen_unicode.mjs --check` to regenerate in memory and compare with `data/unicode-15.0.bin`. Its expected output SHA-256 is `10a4fd50df393d992424d2102e48e39c58dc6449a7a9cae0dcc5708683848019` (237,028 bytes). The tracked generator is a Node program; no Python generator is required.

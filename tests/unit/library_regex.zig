@@ -2,10 +2,10 @@ const std = @import("std");
 const vm = @import("runtime_vm");
 const host = @import("runtime_host");
 
-fn compileRegexDraftGeneric(runtime: *vm.Runtime) bool {
+fn compileRegexModule(runtime: *vm.Runtime) bool {
     const Value = vm.NativeTypes.Value;
     const args = [_]Value{Value.noneValue()};
-    return vm.RegexDraft.execute(vm.Runtime, runtime, 0, 10, Value.noneValue(), &args, &.{}, 1, 1);
+    return vm.Regex.execute(vm.Runtime, runtime, 0, 10, Value.noneValue(), &args, &.{}, 1, 1);
 }
 
 fn ready(runtime: *vm.Runtime, source: []const u8) !void {
@@ -47,8 +47,8 @@ fn expectOutput(source: []const u8, expected: []const u8) !void {
 }
 
 pub fn testRegexSyntaxFlagsUnicodeAndBytes() !void {
-    _ = &compileRegexDraftGeneric;
-    const semantics = vm.RegexDraft.character_semantics;
+    _ = &compileRegexModule;
+    const semantics = vm.Regex.character_semantics;
     try std.testing.expect(semantics.has('9', .decimal));
     try std.testing.expect(!semantics.has('A', .decimal));
     try std.testing.expect(semantics.has('A', .alnum));

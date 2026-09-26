@@ -67,16 +67,6 @@ pub fn testSysArgvCopiedAndReset() !void {
     try std.testing.expectEqualStrings("['<string>']\n", runtime.stdout());
 }
 
-fn compileStatisticsDraftGeneric(runtime: *vm.Runtime) bool {
-    const args = [_]types.Value{types.Value.noneValue()};
-    return vm.StatisticsDraft.execute(vm.Runtime, runtime, 0, 1, types.Value.noneValue(), &args, &.{}, 1, 1);
-}
-
-pub fn testStatisticsDraftCompile() !void {
-    _ = &compileStatisticsDraftGeneric;
-    try std.testing.expect(vm.StatisticsDraft.functions.len > 0);
-}
-
 pub fn testNativeExceptionClassIdentity() !void {
     var runtime: vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 8 * 1024 * 1024);

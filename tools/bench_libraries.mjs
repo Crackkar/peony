@@ -1,10 +1,9 @@
 #!/usr/bin/env node
-// Opt-in ReleaseSmall end-to-end measurements. Python below is learner workload,
+// Opt-in shipping-artifact measurements. Python below is learner workload,
 // while this host code only supplies fixed files, runs sessions, and records data.
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
-import { brotliCompressSync, constants as zlibConstants } from 'node:zlib';
 import { Peony } from '../web/peony.mjs';
 
 const wasmPath = process.env.PEONY_BENCH_WASM ?? new URL('../zig-out/peony.wasm', import.meta.url);
@@ -155,8 +154,7 @@ for (const workload of workloads.filter(item => !filter || item.name === filter)
     peakSessionBytes,
   });
 }
-const compressed = brotliCompressSync(wasm, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11 } });
-process.stdout.write(`${JSON.stringify({ node: process.version, artifactSha256: sha(wasm), rawBytes: wasm.length, brotliQ11Bytes: compressed.length, instantiateMs, workloads: records })}\n`);
+process.stdout.write(`${JSON.stringify({ node: process.version, artifactSha256: sha(wasm), rawBytes: wasm.length, instantiateMs, workloads: records })}\n`);
 
 function percentile(values, fraction) {
   const sorted = values.slice().sort((left, right) => left - right);

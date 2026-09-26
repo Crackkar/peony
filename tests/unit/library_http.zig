@@ -2,16 +2,16 @@ const std = @import("std");
 const vm = @import("runtime_vm");
 const host = @import("runtime_host");
 
-fn compileUrllibDraftGeneric(runtime: *vm.Runtime) bool {
+fn compileUrllibModule(runtime: *vm.Runtime) bool {
     const Value = vm.NativeTypes.Value;
     const args = [_]Value{ Value.noneValue(), Value.noneValue(), Value.noneValue(), Value.noneValue() };
-    return vm.HttpDraft.executeUrllib(vm.Runtime, runtime, 0, 1, Value.noneValue(), &args, &.{}, 1, 1);
+    return vm.HttpNative.executeUrllib(vm.Runtime, runtime, 0, 1, Value.noneValue(), &args, &.{}, 1, 1);
 }
 
-fn compileRequestsDraftGeneric(runtime: *vm.Runtime) bool {
+fn compileRequestsModule(runtime: *vm.Runtime) bool {
     const Value = vm.NativeTypes.Value;
     const args = [_]Value{ Value.noneValue(), Value.noneValue(), Value.noneValue(), Value.noneValue(), Value.noneValue(), Value.noneValue() };
-    return vm.HttpDraft.executeRequests(vm.Runtime, runtime, 0, 2, Value.noneValue(), &args, &.{}, 1, 1);
+    return vm.HttpNative.executeRequests(vm.Runtime, runtime, 0, 2, Value.noneValue(), &args, &.{}, 1, 1);
 }
 
 fn ready(runtime: *vm.Runtime, source: []const u8) !void {
@@ -100,8 +100,8 @@ fn httpOk(runtime: *vm.Runtime, request_id: u32, status_code: u16, headers: []co
 }
 
 pub fn testUrlopenResponseCursorContextSslAndValidation() !void {
-    _ = &compileUrllibDraftGeneric;
-    _ = &compileRequestsDraftGeneric;
+    _ = &compileUrllibModule;
+    _ = &compileRequestsModule;
     var runtime: vm.Runtime = undefined;
     try runtime.init(std.testing.allocator, 16 * 1024 * 1024);
     defer runtime.deinit();
