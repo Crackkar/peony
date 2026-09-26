@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "version": "1.0.0",
+  "profiles": {
+    "smoke": { "scale": 1, "warmups": 0, "samples": 1, "timeoutMs": 30000 },
+    "standard": { "scale": 4, "warmups": 1, "samples": 3, "timeoutMs": 120000 },
+    "stress": { "scale": 12, "warmups": 1, "samples": 5, "timeoutMs": 300000 }
+  },
+  "cases": [
+    { "id": "core/integer-arithmetic", "file": "cases/core/integer-arithmetic.py", "tags": ["core", "int", "operators", "loop"] },
+    { "id": "core/big-integers", "file": "cases/core/big-integers.py", "tags": ["core", "bigint", "pow", "conversion"] },
+    { "id": "core/floating-point", "file": "cases/core/floating-point.py", "tags": ["core", "float", "format", "loop"] },
+    { "id": "core/control-flow", "file": "cases/core/control-flow.py", "tags": ["core", "branch", "loop", "short-circuit"] },
+    { "id": "core/functions-closures", "file": "cases/core/functions-closures.py", "tags": ["core", "function", "closure", "recursion"] },
+    { "id": "core/call-binding", "file": "cases/core/call-binding.py", "tags": ["core", "function", "arguments", "exception"] },
+    { "id": "core/comprehensions", "file": "cases/core/comprehensions.py", "tags": ["core", "comprehension", "generator", "containers"] },
+    { "id": "core/generators", "file": "cases/core/generators.py", "tags": ["core", "generator", "send", "close"] },
+    { "id": "core/classes", "file": "cases/core/classes.py", "tags": ["core", "class", "inheritance", "descriptor"] },
+    { "id": "core/exceptions-context", "file": "cases/core/exceptions-context.py", "tags": ["core", "exception", "with", "finally"] },
+    { "id": "core/pattern-matching", "file": "cases/core/pattern-matching.py", "tags": ["core", "match", "guard", "branch"] },
+    { "id": "core/decorators-annotations", "file": "cases/core/decorators-annotations.py", "tags": ["core", "decorator", "annotation", "function"] },
+    { "id": "core/iterator-builtins", "file": "cases/core/iterator-builtins.py", "tags": ["core", "iterator", "builtins", "generator"] },
+    { "id": "core/unicode-strings", "file": "cases/core/unicode-strings.py", "tags": ["core", "unicode", "string", "text"] },
+    { "id": "core/bytes-codecs", "file": "cases/core/bytes-codecs.py", "tags": ["core", "bytes", "codec", "slice"] },
+    { "id": "core/formatting", "file": "cases/core/formatting.py", "tags": ["core", "format", "f-string", "text"] },
+    { "id": "core/list-algorithms", "file": "cases/core/list-algorithms.py", "tags": ["core", "list", "sort", "slice"] },
+    { "id": "core/dict-churn", "file": "cases/core/dict-churn.py", "tags": ["core", "dict", "mutation", "iteration"] },
+    { "id": "core/set-algebra", "file": "cases/core/set-algebra.py", "tags": ["core", "set", "operators", "mutation"] },
+    { "id": "core/numeric-key-equality", "file": "cases/core/numeric-key-equality.py", "tags": ["core", "hash", "equality", "numeric"] },
+
+    { "id": "libraries/math-numeric", "file": "cases/libraries/math-numeric.py", "tags": ["library", "math", "numeric", "float"] },
+    { "id": "libraries/statistics-data", "file": "cases/libraries/statistics-data.py", "tags": ["library", "statistics", "numeric", "iterator"] },
+    { "id": "libraries/json-tree", "file": "cases/libraries/json-tree.py", "tags": ["library", "json", "data", "bigint"] },
+    { "id": "libraries/json-strings", "file": "cases/libraries/json-strings.py", "tags": ["library", "json", "unicode", "error"] },
+    { "id": "libraries/csv-reader", "file": "cases/libraries/csv-reader.py", "tags": ["library", "csv", "parser", "iterator"] },
+    { "id": "libraries/csv-dictionaries", "file": "cases/libraries/csv-dictionaries.py", "tags": ["library", "csv", "mapping", "callback"] },
+    { "id": "libraries/regex-ascii", "file": "cases/libraries/regex-ascii.py", "tags": ["library", "regex", "ascii", "iterator"] },
+    { "id": "libraries/regex-unicode", "file": "cases/libraries/regex-unicode.py", "tags": ["library", "regex", "unicode", "text"] },
+    { "id": "libraries/regex-replacement", "file": "cases/libraries/regex-replacement.py", "tags": ["library", "regex", "callback", "substitution"] },
+    { "id": "libraries/counter", "file": "cases/libraries/counter.py", "tags": ["library", "collections", "counter", "dict"] },
+    { "id": "libraries/defaultdict", "file": "cases/libraries/defaultdict.py", "tags": ["library", "collections", "defaultdict", "dict"] },
+    { "id": "libraries/deepcopy-graphs", "file": "cases/libraries/deepcopy-graphs.py", "tags": ["library", "copy", "graph", "class"] },
+    { "id": "libraries/pathlib-files", "file": "cases/libraries/pathlib-files.py", "tags": ["library", "pathlib", "vfs", "file"] },
+    { "id": "libraries/os-files", "file": "cases/libraries/os-files.py", "tags": ["library", "os", "vfs", "file"] },
+    { "id": "libraries/random-invariants", "file": "cases/libraries/random-invariants.py", "tags": ["library", "random", "sampling", "invariant"] },
+    {
+      "id": "libraries/import-packages",
+      "file": "cases/libraries/import-packages.py",
+      "tags": ["library", "import", "package", "vfs"],
+      "fixtures": [
+        { "source": "fixtures/imports/training/__init__.py", "path": "training/__init__.py" },
+        { "source": "fixtures/imports/training/constants.py", "path": "training/constants.py" },
+        { "source": "fixtures/imports/training/metrics.py", "path": "training/metrics.py" }
+      ]
+    },
+
+    { "id": "workloads/word-frequency", "file": "cases/workloads/word-frequency.py", "tags": ["workload", "text", "regex", "counter"] },
+    { "id": "workloads/csv-pipeline", "file": "cases/workloads/csv-pipeline.py", "tags": ["workload", "csv", "statistics", "mapping"] },
+    { "id": "workloads/json-pipeline", "file": "cases/workloads/json-pipeline.py", "tags": ["workload", "json", "counter", "comprehension"] },
+    { "id": "workloads/log-analysis", "file": "cases/workloads/log-analysis.py", "tags": ["workload", "regex", "counter", "text"] },
+    { "id": "workloads/graph-search", "file": "cases/workloads/graph-search.py", "tags": ["workload", "graph", "defaultdict", "dict"] },
+    { "id": "workloads/prime-sieve", "file": "cases/workloads/prime-sieve.py", "tags": ["workload", "numeric", "list", "math"] },
+    { "id": "workloads/text-index", "file": "cases/workloads/text-index.py", "tags": ["workload", "unicode", "dict", "index"] },
+    { "id": "workloads/object-dispatch", "file": "cases/workloads/object-dispatch.py", "tags": ["workload", "class", "dispatch", "float"] },
+    { "id": "workloads/file-throughput", "file": "cases/workloads/file-throughput.py", "tags": ["workload", "vfs", "file", "unicode"] },
+    { "id": "workloads/sort-records", "file": "cases/workloads/sort-records.py", "tags": ["workload", "sort", "dict", "comprehension"] }
+  ]
+}

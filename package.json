@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "compare": "node compare/run.mjs --profile standard",
+    "compare:smoke": "node compare/run.mjs --profile smoke",
+    "compare:stress": "node compare/run.mjs --profile stress",
     "test:showcase": "node tests/showcase-browser.mjs"
   },
   "devDependencies": {

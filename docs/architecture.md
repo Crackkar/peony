@@ -89,5 +89,6 @@ The public API copies mounted and written bytes into the VFS and copies read res
 | Public boundary | `web/peony.mjs`, `web/peony.worker.mjs`, `web/peony-core.mjs` | Worker messages, host callbacks, session lifecycle |
 | UI example | `web/index.html`, `web/showcase.*` | Learner-facing editor and result presentation |
 | Checks | `tests/unit/`, `tests/*.test.mjs`, `tests/showcase-browser.mjs` | Native semantics, shipping WASM, Worker, browser flows |
+| CPython corpus | `compare/` | Exact differential results and paired performance measurements on scalable learner programs |
 
 The [language](language.md), [libraries](libraries.md), and [embedding](embedding.md) pages specify what each layer promises. This page explains the ownership and execution path that make those promises possible.

@@ -100,4 +100,6 @@ Zig engine: compiler, VM, values, GC, libraries, VFS
 
 This division lets a course change the editor, layout, input widget, or storage choice without rewriting interpreter semantics. It also lets Peony change an internal algorithm while keeping the learner's Python code and the host session API stable within the documented subset. The [embedding guide](docs/embedding.md) shows a small integration; the [architecture guide](docs/architecture.md) explains the engine; the [WASM ABI](docs/wasm-abi.md) records the lower-level Worker-to-engine contract. [Development checks](docs/development.md) describe the local verification paths.
 
+The [`compare/`](compare/) corpus runs the same 46 scalable learner programs on Peony and CPython 3.12. Every measured repetition first requires exact output agreement, then records compile-plus-run timing and Peony's instruction, work, and peak-memory counters. It covers isolated language behavior, native libraries, VFS imports and files, and composed data-processing workloads; its smoke, standard, and stress profiles provide one maintained input set for conformance comparison and performance work.
+
 Peony is licensed under the [GNU Affero General Public License v3](LICENSE). We are not currently seeking contributions.

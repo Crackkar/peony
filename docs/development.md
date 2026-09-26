@@ -27,9 +27,9 @@ node --test --test-concurrency=1 tests/*.test.mjs
 | Raw WASM/ABI | `tests/wasm-*.test.mjs` | Does the shipping artifact export the right ABI and preserve semantics, limits, errors, and memory lifetimes? |
 | Public Worker | `tests/web-*.test.mjs`, `tests/course-library.test.mjs` | Do message routing, callbacks, copied files, cancellation, and full learner workloads work through the actual facade? |
 | Browser showcase | `tests/showcase-browser.mjs` | Does the editor, input, stop, error location, Worker path, and narrow-screen UI work in a browser? |
-| Differential/bench tools | `tools/diff_libraries.mjs`, `tools/bench_libraries.mjs` | How do selected pure-library outputs and representative workload costs compare with an explicit reference? |
+| CPython comparison corpus | `compare/` | Do deterministic programs agree with CPython 3.12, and what do the same executions cost on both engines? |
 
-Test programs are embedded as strings in Zig or JavaScript tests, or mounted into the VFS at runtime. There are no tracked `.py` implementation files or physical Python fixtures. This distinction is intentional: library behavior belongs in Zig, while Python text is the learner program being interpreted.
+Unit and integration test programs are embedded as strings in Zig or JavaScript tests, or mounted into the VFS at runtime. The tracked `.py` files under `compare/` are executable corpus inputs shared with CPython; they are not implementation modules. Library behavior belongs in Zig, while Python text is the learner program being interpreted.
 
 The suite includes tests for unsupported forms and error paths as well as successful output. Such tests matter for Peony's subset contract: an excluded syntax form must fail clearly, a bad host packet must not consume a valid pending request, and a cancelled native callback must not replay earlier effects. Tests also cover execution under small quanta and memory/work caps, where state-lifetime bugs become visible.
 
@@ -50,11 +50,12 @@ The local server serves `web/` and `zig-out/peony.wasm`. The page itself does no
 
 | Command | Purpose and interpretation |
 |---|---|
-| `node tools/diff_libraries.mjs` | Run selected pure-library programs against an available CPython 3.12 executable. Set `PEONY_CPYTHON` to choose the oracle. This is focused differential evidence, not a claim of full Python conformance. |
+| `npm run compare:smoke` | Run all comparison cases once against CPython 3.12 and require exact output agreement. |
+| `npm run compare` | Run the standard scaled corpus with warmups and three measured samples on both engines. |
+| `npm run compare:stress` | Run the largest corpus profile with sustained data and five measured samples. This is intentionally long. |
 | `node tools/gen_unicode.mjs --check` | Verify the checked-in Unicode 15 data against pinned source inputs; no Python installation is needed for this generator. |
-| `node tools/bench_libraries.mjs` | Measure representative native-library workloads against a freshly built WASM artifact. Interpret these as measured workloads, not universal performance claims. |
 | `node tools/cache_report.mjs --check --json` | Read-only report of repository-local `.zig-cache/` size; it exits nonzero above the 512 MiB maintenance threshold. |
 
-The Unicode generator verifies the data used by string classification, casing, and native regex classes. Benchmarks are useful when a concrete change raises a speed question; they should not replace semantic checks.
+Every comparison sample is also a semantic check: a timing is rejected unless both engines complete with identical output. The corpus, methodology, filters, and report fields are documented in [`compare/README.md`](../compare/README.md). The Unicode generator separately verifies the data used by string classification, casing, and native regex classes.
 
 Zig's content-addressed cache can grow as source changes. `.zig-cache/` is the one repository-local cache, and the shared Zig global cache is outside the repository. The 512 MiB report threshold is a maintenance signal, not a hard per-build allocation limit. Inspect the cache after a build finishes; do not remove it while Zig is using it. `zig-out/`, `.zig-cache/`, and generated probes are ignored.
