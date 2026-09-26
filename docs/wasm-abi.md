@@ -1,6 +1,6 @@
 # Peony WASM ABI v1
 
-The ABI targets `wasm32-freestanding`. Pointers and lengths are unsigned 32-bit byte offsets into the exported `memory`. A zero pointer represents an empty slice or a failed pointer lookup/allocation. Status values `0` through `9` retain their ABI v1 meanings; new statuses are appended.
+This is the internal interface between the Worker pump and the Zig engine. Embedding applications use the [Worker API](embedding.md). The ABI targets `wasm32-freestanding`; pointers and lengths are unsigned 32-bit byte offsets into exported `memory`. A zero pointer represents an empty slice or a failed pointer lookup/allocation.
 
 ## Exported functions
 
@@ -13,7 +13,7 @@ The ABI targets `wasm32-freestanding`. Pointers and lengths are unsigned 32-bit 
 | `peony_session_destroy` | `(handle: u32) -> status: u32` | Destroys a live session and advances its slot generation. |
 | `peony_reset` | `(handle: u32) -> status: u32` | Cancels pending work without Python finalizers and resets the session program, output, pending host request, and diagnostics. |
 | `peony_compile_and_start` | `(handle, src_ptr, src_len, filename_ptr, filename_len: u32) -> status: u32` | Compiles source from live transfer slices and starts it. |
-| `peony_compile_and_start_argv` | `(handle, src_ptr, src_len, filename_ptr, filename_len, argv_ptr, argv_len: u32) -> status: u32` | Starts a program with validated, copied UTF-8 command arguments. The original export remains valid for an empty argument list. |
+| `peony_compile_and_start_argv` | `(handle, src_ptr, src_len, filename_ptr, filename_len, argv_ptr, argv_len: u32) -> status: u32` | Starts a program with validated, copied UTF-8 command arguments. Use `peony_compile_and_start` when argv is empty. |
 | `peony_run` | `(handle, quantum: u32) -> status: u32` | Runs at most `quantum` bytecode steps and bounded native work. Zero uses the configured quantum. |
 | `peony_resume` | `(handle, packet_ptr, packet_len: u32) -> status: u32` | Validates and applies a matching host response packet. Invalid or stale responses leave the pending request intact. |
 | `peony_cancel` | `(handle: u32) -> status: u32` | Requests hard cancellation. The next `peony_run` returns `CANCELLED`; Python `finally`/exit code is skipped. |
@@ -69,7 +69,20 @@ For these kinds, host error has status `2` and two UTF-8 sections: a classificat
 
 `print(..., flush=True)` creates a kind `5` output event with zero sections. It marks a drain boundary; stdout bytes remain available through `peony_stdout_ptr/len` and the host consumes them in the ordinary way without sending a response packet. Keeping output in the borrowed stdout buffer means a large flush is not constrained by the 1 MiB packet limit.
 
-Session config is either empty, which selects defaults, or a `PCFG` version 1 record. The fixed 28-byte header stores flags, `max_memory_bytes` (`u32`), `max_instructions` (`u64`), `quantum` (`u32`), seed length (`u16`), and an extension length (`u16`); up to 1,024 seed bytes follow. Extension length `0` is the original format and selects default VFS limits. Extension length `8` adds `max_vfs_bytes` (`u32`) and `max_file_bytes` (`u32`) after the seed. Other extension lengths, zero limits, a per-file limit above the VFS limit, invalid lengths, or unknown flags are rejected. Old 28-byte configs remain valid. Defaults are a 64 MiB session heap, 50,000,000 combined work units, a 50,000 instruction quantum, an 8 MiB total VFS content limit, and a 2 MiB single-file content limit.
+Session config is either empty, which selects defaults, or a `PCFG` version 1 record. The fixed 28-byte header stores flags, `max_memory_bytes` (`u32`), `max_instructions` (`u64`), `quantum` (`u32`), seed length (`u16`), and an extension length (`u16`); up to 1,024 seed bytes follow. Extension length `0` selects default VFS limits. Extension length `8` adds `max_vfs_bytes` (`u32`) and `max_file_bytes` (`u32`) after the seed. Other extension lengths, zero limits, a per-file limit above the VFS limit, invalid lengths, or unknown flags are rejected. Defaults are a 64 MiB session heap, 50,000,000 combined work units, a 50,000 instruction quantum, an 8 MiB total VFS content limit, and a 2 MiB single-file content limit.
+
+| Config offset | Type | Field |
+|---:|---|---|
+| 0 | 4 bytes | ASCII `PCFG` |
+| 4 | `u16` | Version `1` |
+| 6 | `u16` | Flags: `0` for no seed, `1` for a nonempty seed |
+| 8 | `u32` | Maximum session-accounted memory bytes |
+| 12 | `u64` | Maximum combined work units |
+| 20 | `u32` | Default execution quantum |
+| 24 | `u16` | Seed byte length |
+| 26 | `u16` | Extension length (`0` or `8`) |
+
+The seed bytes start at offset 28; the optional VFS extension follows them. All numeric fields are little-endian. The entire record must have exactly the declared length.
 
 The optional argv transfer is at most 64 KiB: a little-endian `u16` count (`0..256`), followed by each argument's little-endian `u32` byte length and UTF-8 bytes. Values cannot contain NUL. The record must end exactly after the last argument. Validation happens before the program is reset; accepted bytes are copied into session-accounted memory before the transfer block can be freed. `sys.argv` is `[filename, ...arguments]` and is built lazily on `import sys`.
 
@@ -87,11 +100,11 @@ The optional argv transfer is at most 64 KiB: a little-endian `u16` count (`0..2
 | `7` | `TIMESLICE` | The requested bytecode quantum expired; call `peony_run` again to continue. |
 | `8` | `CANCELLED` | A hard cancellation stopped the program. |
 | `9` | `INTERNAL_ERROR` | A corrupt bytecode or engine invariant failure occurred; it is not a Python exception. |
-| `10` | `HOST_REQUEST` | Python `input()` is suspended; copy the event and resume it with a matching response. |
+| `10` | `HOST_REQUEST` | Input, HTTP, clock, or sleep is suspended; copy the event and resume it with a matching response. |
 | `11` | `OUTPUT_EVENT` | An explicit output flush boundary is ready. |
 | `12` | `LIMIT` | The configured per-run bytecode/native-work budget was reached. |
 
-`COMPILE_AND_START` returns `OK` for a compiled program, `UNSUPPORTED` for valid syntax outside the supported subset, and `PYTHON_EXCEPTION` for syntax or compilation-time Python errors. A runtime `LIMIT` is not a catchable Python exception.
+The compile-and-start exports return `OK` for a compiled program, `UNSUPPORTED` for recognized syntax outside the supported subset, and `PYTHON_EXCEPTION` for syntax or compilation-time Python errors. A runtime `LIMIT` is not a catchable Python exception.
 
 ## Ownership and handle lifetime
 
@@ -99,23 +112,7 @@ The optional argv transfer is at most 64 KiB: a little-endian `u16` count (`0..2
 - Empty slices use `(ptr, len) == (0, 0)`. At most 256 transfer blocks may be live at once.
 - A session handle packs a 24-bit generation in the upper bits and a slot token in the low 8 bits. The low byte is `1..64`; zero is never valid. Destroyed handles fail validation after their slot is reused.
 - Standard output is buffered per session. Copy borrowed output/event/error bytes before the next mutating call on that session or before destroying it. `peony_stdout_consume` removes a validated prefix. Starting a valid program resets prior program, output, event, and error state.
-- VFS writes and mounts copy input bytes. `peony_vfs_read`, `peony_vfs_list`, and `peony_vfs_dirs` expose borrowed session-owned bytes through `peony_vfs_data_ptr/len`; copy them before the next `peony_run`, another VFS operation, program start/reset, or destruction. A run invalidates the view before Python code can replace a file. Course files are read-only. `/home` and `/course` survive program reset; `/tmp` is cleared. The JS facade snapshots `/home` directory metadata as well as file bytes when replacing a session between runs, so empty directories survive.
+- VFS writes and mounts copy input bytes. `peony_vfs_read`, `peony_vfs_list`, and `peony_vfs_dirs` expose borrowed session-owned bytes through `peony_vfs_data_ptr/len`; copy them before the next `peony_run`, another VFS operation, program start/reset, or destruction. A run invalidates the view before Python code can replace a file. Course files are read-only. `/home` and `/course` survive raw `peony_reset` and program restart; `/tmp` is cleared. The public facade snapshots `/home` directories and file bytes when replacing a raw session between runs. Public `session.reset()` instead discards the VFS with the whole session; see [embedding](embedding.md).
 - Event packets are borrowed until the next same-session mutation, reset, or destruction. Traceback JSON follows the same lifetime. Copy any data needed after those operations.
 - `memory.grow()` detaches existing JavaScript typed-array views. Recreate every `Uint8Array`/`DataView` from the current `memory.buffer` after a call that may allocate or grow memory.
 - The fixed session and transfer tables are instance-local. Separate WASM instances have separate tables.
-
-## JavaScript facade
-
-`web/peony.mjs` is the public dependency-free Worker proxy. `Peony.load(url | Response | ArrayBuffer | Uint8Array)` starts `web/peony.worker.mjs`; the Worker alone imports the internal ABI pump, compiles and instantiates `peony.wasm`, and owns its memory. There is no public main-thread execution fallback. Internal raw-WASM tests exercise this documented ABI directly, but the showcase and embedding applications use the Worker proxy.
-
-`createSession()` accepts output/input callbacks and validated `maxMemoryBytes`, `maxInstructions`, `quantum`, `seed`, `maxVfsBytes`, and `maxFileBytes` options. The VFS options default to 8 MiB total content and 2 MiB per file; `maxFileBytes` cannot exceed `maxVfsBytes`. Browser services include injectable `fetch`, optional `allowUrl(url)`, `maxHttpResponseBytes`, `followRedirects` (default false), `wallClock()`, `monotonicClock()`, and `sleep(seconds, signal)`. Host callbacks cross versioned Worker messages, never raw WASM pointers or function objects. HTTP remains restricted to HTTP(S), sends `credentials: 'omit'`, defaults to `redirect: 'error'`, caps response bodies while streaming, and aborts fetch/body reading on timeout or cancellation. Browser CORS and TLS rules still apply; following redirects cannot expose browser-hidden cross-origin hops.
-
-`mount(files, { root })`, `readFile(path)`, `writeFile(path, bytes)`, `listFiles(path)`, `listDirectories(path)`, `vfsMkdir(path)`, `reset()`, `stats()`, `collectGarbage()`, and `destroy()` are asynchronous Worker calls. `run(source, { filename, argv })` returns a Promise with `completed`, `error`, `cancelled`, or `limit` status, structured runtime or compile-error frames and counters. Each run starts a fresh Python world while `/home` and `/course` files persist. `cancel()` immediately sends a cancellation request; stale host replies after cancel/reset are ignored. `peony.terminate()` closes the Worker. A Worker crash rejects pending calls and never triggers main-thread WASM execution.
-
-Generator, map/filter, and sort work at the VM level is resumable between configured quanta. A nested `list(...)` or `tuple(...)` materialization invoked inside an active Python callback remains synchronous until it completes or reaches the configured combined work limit; it does not yield to the host between items. The work limit still bounds that path and returns `LIMIT` rather than trapping.
-
-The language implementation is a Python 3.12-oriented subset. It supports scalar values, functions/closures, branches and loops, sequences, mappings and sets, comprehensions and generators, formatting, assertions, `try`/`except`/`else`/`finally`, context managers, and session-local text/binary file objects through `open()`. The VFS exposes `/course` (read-only), `/home`, and `/tmp`; it never accesses the host filesystem. The native Zig standard-library subset includes `sys`, `math`, `random`, `statistics`, `json`, `csv`, `re`, `pathlib`, `os`/`os.path`, `collections`, `copy`, `urllib.request`, `requests`, `time`, and `ssl`. The required support namespaces `urllib.error` and `requests.exceptions` hold real exception classes. Browser HTTP, sleep and clock requests suspend through the binary host protocol. Async syntax and unlisted library APIs remain outside this subset; recognized unsupported syntax returns `UNSUPPORTED` with a diagnostic. Unknown-length starred unpacking has a temporary 65,536-item bound and raises `MemoryError` beyond it. `readlines()` and `writelines()` charge each processed line against the shared work limit; the current native method call runs synchronously until completion or `LIMIT`, without a quantum yield between lines.
-
-`ssl.SSLContext.check_hostname` and `verify_mode` are teaching API state used for validation by native `urlopen`. Changing them does not alter the browser's TLS verification, certificate store, CORS policy or network stack.
-
-Native JSON parsing and serialization advance through charged, cancellable task chunks. A single decoded or encoded JSON string token is limited to 256 KiB so one token cannot monopolize a VM checkpoint; oversized input raises `JSONDecodeError`, and oversized output raises `ValueError`. This token limit is separate from the configured session heap and combined work limits.

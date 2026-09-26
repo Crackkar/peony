@@ -1,52 +1,41 @@
-# Development checks
+# Development and verification
 
-Peony v0.1 is pinned to Zig `0.16.0`. The shipping build targets `wasm32-freestanding`, uses `ReleaseSmall`, strips debug information, and selects LLVM.
+Peony uses Zig `0.16.0` and Node for WASM/Worker tests. The browser check uses `playwright-core` and an installed Chrome or Edge. The build graph is defined in `build.zig`; `zig build wasm` emits the stripped `wasm32-freestanding` `ReleaseSmall` artifact directly at `zig-out/peony.wasm`. The optional `-Dwasm-debug=true` builds a stripped Debug WASM for local integration work. Native unit tests use Zig's Debug mode with stripped test executables.
+
+## Core checks
+
+From the repository root:
 
 ```powershell
 zig version
-zig build test
-zig build wasm
+zig build test --summary all
+zig build wasm --summary all
 node --test --test-concurrency=1 --test-skip-pattern "size report" tests/*.test.mjs
 ```
 
-`zig build wasm` installs `zig-out/peony.wasm`. Build output and compiler caches stay ignored. Raw-WASM Node tests verify the internal ABI; public session tests exercise the Worker-only ESM facade. Browser execution always compiles and runs WASM in the Worker. The C22 showcase uses a local static server and Playwright headless to check real editor, input, error and cancellation flows.
+`tests/unit/` covers runtime and language semantics in native Zig. The Node suite covers the shipping WASM ABI, public Worker facade, VFS, libraries, and course programs. Raw-WASM tests deliberately exercise the internal ABI; applications use the Worker facade. The skipped `size report` test is an opt-in repeatability/build check, not a language-semantic test.
 
-To view and check the showcase after building WASM:
+## Showcase
+
+After `zig build wasm`, install the development-only browser test dependency and start the local static server:
 
 ```powershell
 npm ci
 node tools/serve_showcase.mjs
-npm run test:showcase
 ```
 
-The browser check uses an installed Chrome by default; set `PEONY_BROWSER_CHANNEL=msedge` to use Edge. `playwright-core` is a development dependency and does not ship in the static showcase.
+Open the URL printed by the server. In another terminal, `npm run test:showcase` runs the browser flow check. It uses installed Chrome by default; set `PEONY_BROWSER_CHANNEL=msedge` to use Edge. The check exercises the real Worker path, editor examples, input, cancellation, errors, and a narrow/mobile layout. `playwright-core` does not ship in the static showcase.
 
-For later release qualification, `node tools/size_report.mjs` uses Node's built-in Brotli encoder at quality 11. It builds the shipping artifact and separate bigint, JSON and Unicode probes. The Unicode generator reads pinned official Unicode 15 source inputs and verifies the checked-in table; it requires no Python file or local `unicodedata` version. Probe inputs stay under ignored `.zig-cache/size-probes/`, and artifacts install directly under `zig-out/`.
+## Focused tools
 
-The VM owner and opcode dispatcher live in `src/vm/runtime.zig`. Shared frame, environment, try-block, and synchronous-task state with its GC tracing lives in `src/vm/state.zig`. Execution helpers are grouped by ownership: `control.zig` for frame/control transfer and exceptions, `calls.zig` for binding and invocation, `builtins.zig` for native methods, `iteration.zig` for iterators and sorting, `text.zig` for formatting/output, `objects.zig` for attributes and collection access, `operations.zig` for operators and value semantics, and `modules.zig` for module environments and imports. `Runtime` remains the single stable session object; domain methods are linked through its typed alias table, while the bytecode dispatcher stays centralized.
+| Command | Purpose |
+|---|---|
+| `node tools/diff_libraries.mjs` | Compare selected pure-library snippets with an available CPython 3.12 executable. Set `PEONY_CPYTHON` to choose one. This is a targeted oracle, not proof of full conformance. |
+| `node tools/gen_unicode.mjs --check` | Verify the generated Unicode 15 data against pinned source inputs. |
+| `node tools/size_report.mjs` | Build/report raw and Brotli sizes and feature probes. Run when size qualification is wanted; it is more expensive than ordinary edit/test loops. |
+| `node tools/bench_libraries.mjs` | Measure representative library workloads against a built WASM artifact. |
+| `node tools/cache_report.mjs --check --json` | Read-only report of the local `.zig-cache/` size, with a 512 MiB maintenance threshold. |
 
-The native tests/unit/vfs.zig and tests/unit/files.zig suites cover session-owned path/file storage, text and binary file methods, newline handling, atomic VFS limits, and reset persistence. tests/wasm-vfs.test.mjs and tests/web-files.test.mjs exercise the shipping artifact and facade. The configurable maxVfsBytes and maxFileBytes options use an optional PCFG extension while original config packets retain their defaults. readlines() and writelines() charge per-line work against the shared configured budget, and a long native file-method loop returns LIMIT instead of exceeding it.
+Compiler caches, `zig-out/`, and generated probe files are ignored. `.zig-cache/` is the one repository-local Zig cache; avoid clearing it during a build. The project has no Python source implementation or `.py` fixtures: test programs are strings supplied to the interpreter.
 
-## String and bytes hash seeds
-
-Each Peony session mixes an optional copied host seed with a per-session counter and runtime address to seed string and bytes hashing. When a host seed is omitted, the local counter/address fallback still varies session table hashes in freestanding WASM without a system entropy source. This is a per-session variation mechanism, not a cryptographic or unpredictability guarantee.
-
-The repeatability check runs the size report twice:
-
-```powershell
-node --test tests/toolchain-size.test.mjs
-```
-
-The report includes exact build commands as well as raw and Brotli-q11 byte counts. WASM outputs and generated Unicode data are not tracked.
-
-## Local cache maintenance
-
-Native unit tests retain Debug optimization and runtime checks, but their test executable is stripped because native debugger symbols are not needed for this project. Generated probe inputs and Zig's local build cache share `.zig-cache/`; the separate `zig-cache/` directory is no longer used.
-
-After builds finish at a commit gate, check the repo-local cache with:
-
-```powershell
-node tools/cache_report.mjs --check --json
-```
-
-The read-only check exits with status 1 above 512 MiB. Zig's content-addressed cache can grow as source changes; the threshold is a maintenance signal, not a per-build allocation limit or a reason to interrupt an active sprint. Never remove the cache during an active build. The shared Zig global cache is outside this repository.
+See [architecture](architecture.md) for source ownership, [language](language.md) and [libraries](libraries.md) for the supported surface, and [embedding](embedding.md) for the public API.
