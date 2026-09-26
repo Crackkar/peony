@@ -44,6 +44,11 @@ pub fn bindFunction(
     const bound = try allocator.alloc(Value, parameter_names.len);
     @memset(bound, Value.unboundValue());
     errdefer allocator.free(bound);
+    var created_root = gc.Root{ .object = null };
+    var root_frame = gc.RootFrame{};
+    root_frame.push(&heap.roots);
+    root_frame.add(&created_root);
+    defer root_frame.pop();
     var extra_keywords: std.ArrayList(Keyword) = .empty;
     defer extra_keywords.deinit(allocator);
 
@@ -73,6 +78,7 @@ pub fn bindFunction(
             .python_exception, .engine_error => return error.OutOfMemory,
         };
         bound[index] = Value.object(&tuple.header);
+        created_root.object = &tuple.header;
     }
 
     for (keywords) |keyword| {
