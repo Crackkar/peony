@@ -22,6 +22,8 @@ test('public Peony loads and runs only inside a Worker', { concurrency: false },
     const stats = await session.stats();
     assert.ok(stats.work >= result.counters.work);
     assert.ok(stats.peakSessionBytes >= stats.liveSessionBytes);
+    assert.ok(stats.wasmLinearBytes >= 64 * 1024);
+    assert.equal(stats.wasmLinearBytes % (64 * 1024), 0);
     assert.ok(stats.gcObjects >= 0);
     const collected = await session.collectGarbage();
     assert.ok(collected.gcCollections > stats.gcCollections);

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
-import { mkdir, readFile, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, rmdir, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +22,7 @@ if (options.list) {
 if (selected.length === 0) throw new Error(`no corpus cases match ${JSON.stringify(options.filter)}`);
 
 async function main() {
+if (process.platform !== 'win32') throw new Error('the comparison harness currently requires Windows');
 const profile = manifest.profiles[options.profile];
 const warmups = options.warmups ?? profile.warmups;
 const samples = options.samples ?? profile.samples;
@@ -54,6 +55,9 @@ try {
     if (matches(item, options.filter)) prepared.push({ ...item, sourceBytes, source: sourceBytes.toString('utf8'), fixtures });
   }
 
+  progress('Measuring empty-program native launch floor');
+  const startup = await measureStartupFloor({ probePath, python, nativePath, root: runWorkspace,
+    warmups, samples, timeoutMs, pythonEnv });
   const records = [];
   for (let index = 0; index < prepared.length; index += 1) {
     const item = prepared[index];
@@ -62,50 +66,45 @@ try {
     const caseRoot = join(runWorkspace, item.id.replaceAll('/', '__'));
     await mkdir(caseRoot, { recursive: true });
     progress(`[${index + 1}/${prepared.length}] ${item.id} (scale ${scale})`);
-    const warmPython = new JsonProcess(python, ['-I', '-B', '-X', 'utf8', '-u', join(root, 'warm_python.py')], caseRoot, pythonEnv);
-    const warmWasm = new JsonProcess(process.execPath, [join(root, 'warm_wasm.mjs'), wasmPath], caseRoot, process.env);
     const runs = { cliPython: [], cliPeony: [], warmPython: [], warmWasm: [] };
     let expectedCli = null;
-    let expectedWarm = null;
-    try {
-      await warmPython.start(timeoutMs);
-      await warmWasm.start(timeoutMs);
-      await warmPython.request({ op: 'setup', source: item.source, filename: item.file }, timeoutMs);
-      await warmWasm.request({ op: 'setup', source: item.source, filename: item.file,
-        fixtures: item.fixtures.map(fixture => ({ path: fixture.path, base64: fixture.bytes.toString('base64') })) }, timeoutMs);
-
-      for (let repetition = 0; repetition < warmups + samples; repetition += 1) {
-        const repetitionRoot = join(caseRoot, String(repetition));
-        const directories = {
-          cliPython: join(repetitionRoot, 'cli-python'),
-          cliPeony: join(repetitionRoot, 'cli-peony'),
-          warmPython: join(repetitionRoot, 'warm-python'),
-        };
-        for (const directory of Object.values(directories)) await prepareCaseDirectory(directory, item);
-        const results = {};
-        const runners = [
-          async () => { results.cliPython = await runCli(probePath, python, directories.cliPython, argv, timeoutMs, pythonEnv); },
-          async () => { results.cliPeony = await runCli(probePath, nativePath, directories.cliPeony, argv, timeoutMs, process.env); },
-          async () => { results.warmPython = await warmPython.request({ op: 'run', cwd: directories.warmPython, argv }, timeoutMs); },
-          async () => { results.warmWasm = await warmWasm.request({ op: 'run', argv }, timeoutMs); },
-        ];
-        for (let offset = 0; offset < runners.length; offset += 1) await runners[(repetition + offset) % runners.length]();
-        for (const [engine, result] of Object.entries(results)) assertCompleted(item.id, engine, result);
-        assert.equal(normalizeCli(results.cliPeony.stdout), normalizeCli(results.cliPython.stdout), mismatchMessage(item.id, 'CLI stdout', results.cliPython.stdout, results.cliPeony.stdout));
-        assert.equal(normalizeCli(results.cliPeony.stderr), normalizeCli(results.cliPython.stderr), mismatchMessage(item.id, 'CLI stderr', results.cliPython.stderr, results.cliPeony.stderr));
-        assert.equal(results.warmWasm.stdout, results.warmPython.stdout, mismatchMessage(item.id, 'warm stdout', results.warmPython.stdout, results.warmWasm.stdout));
-        assert.equal(results.warmWasm.stderr, results.warmPython.stderr, mismatchMessage(item.id, 'warm stderr', results.warmPython.stderr, results.warmWasm.stderr));
-        const cliOutput = `${normalizeCli(results.cliPython.stdout)}\0${normalizeCli(results.cliPython.stderr)}`;
-        const warmOutput = `${results.warmPython.stdout}\0${results.warmPython.stderr}`;
-        if (expectedCli === null) expectedCli = cliOutput;
-        else assert.equal(cliOutput, expectedCli, `${item.id}: CLI output changed between repetitions`);
-        if (expectedWarm === null) expectedWarm = warmOutput;
-        else assert.equal(warmOutput, expectedWarm, `${item.id}: warm output changed between repetitions`);
-        if (repetition >= warmups) for (const key of Object.keys(runs)) runs[key].push(results[key]);
+    for (let repetition = 0; repetition < warmups + samples; repetition += 1) {
+      const repetitionRoot = join(caseRoot, 'cli', String(repetition));
+      const directories = {
+        cliPython: join(repetitionRoot, 'python'),
+        cliPeony: join(repetitionRoot, 'peony'),
+      };
+      for (const directory of Object.values(directories)) await prepareCaseDirectory(directory, item);
+      const results = {};
+      const runners = [
+        async () => { results.cliPython = await runCli(probePath, python, directories.cliPython, argv, timeoutMs, pythonEnv); },
+        async () => { results.cliPeony = await runCli(probePath, nativePath, directories.cliPeony, argv, timeoutMs, process.env); },
+      ];
+      for (let offset = 0; offset < runners.length; offset += 1) await runners[(repetition + offset) % runners.length]();
+      assertCompleted(item.id, 'cliPython', results.cliPython);
+      assertCompleted(item.id, 'cliPeony', results.cliPeony);
+      assert.equal(normalizeCli(results.cliPeony.stdout), normalizeCli(results.cliPython.stdout), mismatchMessage(item.id, 'CLI stdout', results.cliPython.stdout, results.cliPeony.stdout));
+      assert.equal(normalizeCli(results.cliPeony.stderr), normalizeCli(results.cliPython.stderr), mismatchMessage(item.id, 'CLI stderr', results.cliPython.stderr, results.cliPeony.stderr));
+      const output = `${normalizeCli(results.cliPython.stdout)}\0${normalizeCli(results.cliPython.stderr)}`;
+      if (expectedCli === null) expectedCli = output;
+      else assert.equal(output, expectedCli, `${item.id}: CLI output changed between repetitions`);
+      if (repetition >= warmups) {
+        runs.cliPython.push(results.cliPython);
+        runs.cliPeony.push(results.cliPeony);
       }
-    } finally {
-      await Promise.allSettled([warmPython.close(), warmWasm.close()]);
     }
+
+    const timed = await runStartedPhase({ phase: 'time', python, pythonEnv, wasmPath, caseRoot,
+      item, argv, warmups, samples, timeoutMs });
+    const rss = await runStartedPhase({ phase: 'rss', python, pythonEnv, wasmPath, caseRoot,
+      item, argv, warmups, samples, timeoutMs });
+    const runtime = await runStartedPhase({ phase: 'runtime', python, pythonEnv, wasmPath, caseRoot,
+      item, argv, warmups, samples, timeoutMs });
+    assert.equal(rss.output, timed.output, `${item.id}: timing and RSS passes produced different output`);
+    assert.equal(runtime.output, timed.output, `${item.id}: timing and runtime-memory passes produced different output`);
+    runs.warmPython = combinePasses(timed.python, rss.python, runtime.python);
+    runs.warmWasm = combinePasses(timed.wasm, rss.wasm, runtime.wasm);
+    const expectedWarm = timed.output;
 
     const inputHash = createHash('sha256').update(item.sourceBytes);
     for (const fixture of item.fixtures) inputHash.update('\0').update(fixture.path).update('\0').update(fixture.bytes);
@@ -119,15 +118,15 @@ try {
       inputSha256: inputHash.digest('hex'),
       cli: { outputSha256: sha(expectedCli), python: cliPython, peony: cliPeony,
         latencyRatio: cliPeony.medianMs / cliPython.medianMs,
-        rssRatio: cliPeony.peakRssBytes / cliPython.peakRssBytes },
+        rssRatio: cliPeony.peakRssBytes / cliPython.peakRssBytes,
+        privateRatio: cliPeony.peakPrivateBytes / cliPython.peakPrivateBytes },
       warm: { outputSha256: sha(expectedWarm), python: replPython, wasm: replWasm,
-        latencyRatio: replWasm.medianMs / replPython.medianMs,
-        rssRatio: replWasm.peakRssBytes / replPython.peakRssBytes },
+        latencyRatio: replWasm.medianMs / replPython.medianMs },
     });
   }
 
   const report = {
-    schema: 3,
+    schema: 4,
     corpus: { version: manifest.version, sha256: corpusHasher.digest('hex'), profile: options.profile,
       cases: records.length, warmups, samples },
     environment: { node: process.version, platform: `${process.platform}-${process.arch}`,
@@ -137,8 +136,8 @@ try {
       nativeVersion, probeSha256: sha(await readFile(join(root, 'process_probe.c'))) },
     summary: {
       compared: records.length, passed: records.length,
-      cli: summary(records.map(record => record.cli)),
-      warm: summary(records.map(record => record.warm)),
+      cli: cliSummary(records.map(record => record.cli), startup),
+      warm: warmSummary(records.map(record => record.warm)),
     },
     cases: records,
   };
@@ -157,17 +156,111 @@ try {
 }
 }
 
+async function measureStartupFloor({ probePath, python, nativePath, root: workspace, warmups, samples, timeoutMs, pythonEnv }) {
+  const item = { sourceBytes: Buffer.alloc(0), fixtures: [] };
+  const pythonRuns = [];
+  const peonyRuns = [];
+  for (let repetition = 0; repetition < warmups + samples; repetition += 1) {
+    const base = join(workspace, '__startup__', String(repetition));
+    const pythonDirectory = join(base, 'python');
+    const peonyDirectory = join(base, 'peony');
+    await prepareCaseDirectory(pythonDirectory, item);
+    await prepareCaseDirectory(peonyDirectory, item);
+    const results = {};
+    const runners = [
+      async () => { results.python = await runCli(probePath, python, pythonDirectory, [], timeoutMs, pythonEnv); },
+      async () => { results.peony = await runCli(probePath, nativePath, peonyDirectory, [], timeoutMs, process.env); },
+    ];
+    for (let offset = 0; offset < runners.length; offset += 1) await runners[(repetition + offset) % runners.length]();
+    assertCompleted('empty-program startup', 'CPython', results.python);
+    assertCompleted('empty-program startup', 'Peony', results.peony);
+    assert.equal(results.python.stdout, '');
+    assert.equal(results.python.stderr, '');
+    assert.equal(results.peony.stdout, '');
+    assert.equal(results.peony.stderr, '');
+    if (repetition >= warmups) {
+      pythonRuns.push(results.python);
+      peonyRuns.push(results.peony);
+    }
+  }
+  return { python: measurement(pythonRuns), peony: measurement(peonyRuns) };
+}
+
+async function runStartedPhase({ phase, python, pythonEnv, wasmPath, caseRoot, item, argv, warmups, samples, timeoutMs }) {
+  const pythonDriver = new JsonProcess(python, ['-I', '-B', '-X', 'utf8', '-u', join(root, 'warm_python.py')], caseRoot, pythonEnv);
+  const wasmDriver = new JsonProcess(process.execPath, [join(root, 'warm_wasm.mjs'), wasmPath], caseRoot, process.env);
+  const pythonRuns = [];
+  const wasmRuns = [];
+  let expected = null;
+  try {
+    await pythonDriver.start(timeoutMs);
+    await wasmDriver.start(timeoutMs);
+    await pythonDriver.request({ op: 'setup', source: item.source, filename: item.file }, timeoutMs);
+    await wasmDriver.request({ op: 'setup', source: item.source, filename: item.file,
+      fixtures: item.fixtures.map(fixture => ({ path: fixture.path, base64: fixture.bytes.toString('base64') })) }, timeoutMs);
+    for (let repetition = 0; repetition < warmups + samples; repetition += 1) {
+      const pythonDirectory = join(caseRoot, `started-${phase}`, String(repetition), 'python');
+      await prepareCaseDirectory(pythonDirectory, item);
+      const results = {};
+      const runners = [
+        async () => { results.python = await pythonDriver.request({ op: 'run', measure: phase, cwd: pythonDirectory, argv }, timeoutMs); },
+        async () => { results.wasm = await wasmDriver.request({ op: 'run', measure: phase, argv }, timeoutMs); },
+      ];
+      for (let offset = 0; offset < runners.length; offset += 1) await runners[(repetition + offset) % runners.length]();
+      assertCompleted(item.id, `started CPython ${phase}`, results.python);
+      assertCompleted(item.id, `started WASM ${phase}`, results.wasm);
+      assert.equal(results.wasm.stdout, results.python.stdout, mismatchMessage(item.id, `${phase} stdout`, results.python.stdout, results.wasm.stdout));
+      assert.equal(results.wasm.stderr, results.python.stderr, mismatchMessage(item.id, `${phase} stderr`, results.python.stderr, results.wasm.stderr));
+      const output = `${results.python.stdout}\0${results.python.stderr}`;
+      if (expected === null) expected = output;
+      else assert.equal(output, expected, `${item.id}: started ${phase} output changed between repetitions`);
+      if (repetition >= warmups) {
+        pythonRuns.push(results.python);
+        wasmRuns.push(results.wasm);
+      }
+    }
+  } finally {
+    await Promise.allSettled([pythonDriver.close(), wasmDriver.close()]);
+  }
+  return { python: pythonRuns, wasm: wasmRuns, output: expected };
+}
+
+function combinePasses(timingRuns, rssRuns, runtimeRuns) {
+  assert.equal(timingRuns.length, rssRuns.length, 'timing and RSS sample counts differ');
+  assert.equal(timingRuns.length, runtimeRuns.length, 'timing and runtime-memory sample counts differ');
+  return timingRuns.map((timed, index) => {
+    const rss = rssRuns[index];
+    const runtime = runtimeRuns[index];
+    return {
+      ...timed,
+      baseline_rss_bytes: rss.baseline_rss_bytes,
+      peak_rss_bytes: rss.peak_rss_bytes,
+      runtime_live_bytes: runtime.runtime_live_bytes,
+      runtime_peak_bytes: runtime.runtime_peak_bytes,
+      runtime_job_bytes: runtime.runtime_job_bytes,
+      vfs_bytes: runtime.vfs_bytes,
+      wasm_linear_bytes: runtime.wasm_linear_bytes,
+    };
+  });
+}
+
 async function ensureProbe() {
   const source = join(root, 'process_probe.c');
-  const binary = join(repositoryRoot, 'zig-out', process.platform === 'win32' ? 'compare-probe.exe' : 'compare-probe');
-  let stale = true;
-  try { stale = (await stat(binary)).mtimeMs < (await stat(source)).mtimeMs; }
+  const binary = join(repositoryRoot, 'zig-out', 'compare-probe.exe');
+  const fingerprintPath = join(repositoryRoot, 'zig-out', 'compare-probe.sha256');
+  const buildSignature = 'zig-0.16.0 cc -O2 -s -lpsapi -lshell32';
+  const fingerprint = sha(Buffer.concat([await readFile(source), Buffer.from(`\0${buildSignature}`)]));
+  let currentFingerprint = '';
+  let binaryExists = true;
+  try { currentFingerprint = (await readFile(fingerprintPath, 'utf8')).trim(); }
   catch (error) { if (error?.code !== 'ENOENT') throw error; }
-  if (stale) {
+  try { await readFile(binary); }
+  catch (error) { if (error?.code === 'ENOENT') binaryExists = false; else throw error; }
+  if (!binaryExists || currentFingerprint !== fingerprint) {
     progress('Building the process RSS probe');
-    await execFileAsync('zig', ['cc', '-O2', source, '-o', binary,
-      ...(process.platform === 'win32' ? ['-lpsapi', '-lshell32'] : [])],
-    { cwd: repositoryRoot, windowsHide: true, maxBuffer: 2 * 1024 * 1024 });
+    await execFileAsync('zig', ['cc', '-O2', '-s', source, '-o', binary, '-lpsapi', '-lshell32'],
+      { cwd: repositoryRoot, windowsHide: true, maxBuffer: 2 * 1024 * 1024 });
+    await writeFile(fingerprintPath, `${fingerprint}\n`);
   }
   return binary;
 }
@@ -191,7 +284,8 @@ async function runCli(probe, executable, directory, argv, timeoutMs, env) {
   const metrics = JSON.parse(await readFile(metricsPath, 'utf8'));
   return { status: metrics.exit_code === 0 && !metrics.timed_out ? 'completed' : 'error',
     error: metrics.timed_out ? 'timed out' : `exit ${metrics.exit_code}`,
-    stdout, stderr, elapsed_ns: metrics.elapsed_ns, peak_rss_bytes: metrics.peak_rss_bytes };
+    stdout, stderr, elapsed_ns: metrics.elapsed_ns, peak_rss_bytes: metrics.peak_rss_bytes,
+    peak_private_bytes: metrics.peak_private_bytes };
 }
 
 class JsonProcess {
@@ -282,6 +376,9 @@ class JsonProcess {
 function measurement(runs) {
   const result = timing(runs.map(run => run.elapsed_ns / 1e6));
   result.peakRssBytes = Math.max(...runs.map(run => run.peak_rss_bytes));
+  if (runs[0].peak_private_bytes !== undefined) {
+    result.peakPrivateBytes = Math.max(...runs.map(run => run.peak_private_bytes));
+  }
   if (runs[0].baseline_rss_bytes !== undefined) {
     result.baselineRssBytes = percentile(runs.map(run => run.baseline_rss_bytes), 0.5);
     result.peakGrowthBytes = Math.max(...runs.map(run => Math.max(0, run.peak_rss_bytes - run.baseline_rss_bytes)));
@@ -289,16 +386,48 @@ function measurement(runs) {
   if (runs[0].instructions !== undefined) {
     result.medianInstructions = percentile(runs.map(run => run.instructions), 0.5);
     result.medianWork = percentile(runs.map(run => run.work), 0.5);
-    result.peakSessionBytes = Math.max(...runs.map(run => run.peak_session_bytes));
   }
+  if (runs[0].runtime_peak_bytes !== undefined) result.runtimePeakBytes = Math.max(...runs.map(run => run.runtime_peak_bytes));
+  if (runs[0].runtime_job_bytes !== undefined) result.runtimeJobBytes = Math.max(...runs.map(run => run.runtime_job_bytes));
+  if (runs[0].runtime_live_bytes !== undefined) result.runtimeLiveBytes = Math.max(...runs.map(run => run.runtime_live_bytes));
+  if (runs[0].vfs_bytes !== undefined) result.vfsBytes = Math.max(...runs.map(run => run.vfs_bytes));
+  if (runs[0].wasm_linear_bytes !== undefined) result.wasmLinearBytes = Math.max(...runs.map(run => run.wasm_linear_bytes));
   return result;
 }
 
-function summary(pairs) {
+function latencySummary(pairs) {
   return { totalMedianMs: { python: sum(pairs.map(pair => pair.python.medianMs)),
     peony: sum(pairs.map(pair => (pair.peony ?? pair.wasm).medianMs)) },
-    geometricMeanLatencyRatio: geometricMean(pairs.map(pair => pair.latencyRatio)),
-    geometricMeanRssRatio: geometricMean(pairs.map(pair => pair.rssRatio)) };
+    geometricMeanLatencyRatio: geometricMean(pairs.map(pair => pair.latencyRatio)) };
+}
+
+function cliSummary(pairs, startup) {
+  return { ...latencySummary(pairs), startup,
+    geometricMeanRssRatio: geometricMean(pairs.map(pair => pair.rssRatio)),
+    geometricMeanPrivateRatio: geometricMean(pairs.map(pair => pair.privateRatio)) };
+}
+
+function warmSummary(pairs) {
+  return { ...latencySummary(pairs), memory: {
+    medianBaselineRss: {
+      python: percentile(pairs.map(pair => pair.python.baselineRssBytes), 0.5),
+      peony: percentile(pairs.map(pair => pair.wasm.baselineRssBytes), 0.5),
+    },
+    maximumPeakRss: {
+      python: Math.max(...pairs.map(pair => pair.python.peakRssBytes)),
+      peony: Math.max(...pairs.map(pair => pair.wasm.peakRssBytes)),
+    },
+    maximumGrowth: {
+      python: Math.max(...pairs.map(pair => pair.python.peakGrowthBytes)),
+      peony: Math.max(...pairs.map(pair => pair.wasm.peakGrowthBytes)),
+    },
+    maximumRuntimeJob: {
+      python: Math.max(...pairs.map(pair => pair.python.runtimeJobBytes)),
+      peony: Math.max(...pairs.map(pair => pair.wasm.runtimeJobBytes)),
+    },
+    maximumWasmLinearBytes: Math.max(...pairs.map(pair => pair.wasm.wasmLinearBytes)),
+    maximumVfsBytes: Math.max(...pairs.map(pair => pair.wasm.vfsBytes)),
+  } };
 }
 
 function renderMarkdown(report) {
@@ -314,37 +443,46 @@ function renderMarkdown(report) {
     `| Host | ${report.environment.platform}; ${report.environment.node} |`,
     '',
     '## One-shot command-line processes', '',
-    'A fresh `python __corpus_case__.py ARG...` or `peony __corpus_case__.py ARG...` process runs for every repetition. The timer spans process creation through exit, including startup, source loading, compilation, execution, and output. Peak RSS belongs to that child process.',
+    'A fresh `python __corpus_case__.py ARG...` or `peony __corpus_case__.py ARG...` process runs for every repetition. The timer spans process creation through exit, including startup, source loading, compilation, execution, and output. The external Windows probe samples peak working set (RSS) and private committed bytes for that child. An empty script measured through the identical path gives the launch floor; case times are not baseline-subtracted.',
     '', '| Measure | CPython | Peony native |', '|---|---:|---:|',
     `| Sum of case median wall times | ${formatMs(report.summary.cli.totalMedianMs.python)} ms | ${formatMs(report.summary.cli.totalMedianMs.peony)} ms |`,
     `| Geometric mean Peony/CPython wall ratio | 1.00x | ${report.summary.cli.geometricMeanLatencyRatio.toFixed(2)}x |`,
     `| Geometric mean Peony/CPython peak RSS ratio | 1.00x | ${report.summary.cli.geometricMeanRssRatio.toFixed(2)}x |`,
+    `| Geometric mean Peony/CPython peak private ratio | 1.00x | ${report.summary.cli.geometricMeanPrivateRatio.toFixed(2)}x |`,
+    `| Empty-script wall median/p95 | ${formatPair(report.summary.cli.startup.python)} | ${formatPair(report.summary.cli.startup.peony)} |`,
+    `| Empty-script peak RSS | ${formatMiB(report.summary.cli.startup.python.peakRssBytes)} MiB | ${formatMiB(report.summary.cli.startup.peony.peakRssBytes)} MiB |`,
+    `| Empty-script peak private bytes | ${formatMiB(report.summary.cli.startup.python.peakPrivateBytes)} MiB | ${formatMiB(report.summary.cli.startup.peony.peakPrivateBytes)} MiB |`,
     '',
     '## Started interpreters', '',
     'A persistent CPython process and a loaded Peony Worker process start before timing each case. Each job receives the same source, arguments, and fixture bytes in fresh program state. CPython times `compile` plus `exec`; Peony times the public `session.run` call, including Worker messaging. Process startup and fixture setup are outside both intervals.',
     '',
-    'Peak RSS is the full host process resident set during the job. The Peony process includes Node and its Worker; CPython includes its driver. The growth column is peak RSS above the process baseline immediately before the job. Both drivers sample current RSS and check for new OS high-water marks; brief spikes below an earlier high-water mark can fall between samples.',
+    'Timing, host RSS, and runtime allocation are separate executions so sampling and CPython `tracemalloc` cannot perturb the reported latency or host footprint. Host RSS includes each complete deployment process: CPython and its driver on one side, Node, V8, the Worker, and WASM on the other. Absolute host RSS is therefore reported without a cross-runtime ratio. Baseline/peak and growth show job pressure within each loaded host. Runtime job memory is CPython traced allocation versus Peony session-accounted growth above its prepared session; WASM linear memory is reported separately.',
     '', '| Measure | CPython | Peony WASM |', '|---|---:|---:|',
     `| Sum of case median job times | ${formatMs(report.summary.warm.totalMedianMs.python)} ms | ${formatMs(report.summary.warm.totalMedianMs.peony)} ms |`,
     `| Geometric mean Peony/CPython wall ratio | 1.00x | ${report.summary.warm.geometricMeanLatencyRatio.toFixed(2)}x |`,
-    `| Geometric mean Peony/CPython peak RSS ratio | 1.00x | ${report.summary.warm.geometricMeanRssRatio.toFixed(2)}x |`,
+    `| Median loaded-host baseline RSS | ${formatMiB(report.summary.warm.memory.medianBaselineRss.python)} MiB | ${formatMiB(report.summary.warm.memory.medianBaselineRss.peony)} MiB |`,
+    `| Maximum observed host RSS | ${formatMiB(report.summary.warm.memory.maximumPeakRss.python)} MiB | ${formatMiB(report.summary.warm.memory.maximumPeakRss.peony)} MiB |`,
+    `| Largest measured job RSS growth | ${formatMiB(report.summary.warm.memory.maximumGrowth.python)} MiB | ${formatMiB(report.summary.warm.memory.maximumGrowth.peony)} MiB |`,
+    `| Largest runtime-tracked job memory | ${formatMiB(report.summary.warm.memory.maximumRuntimeJob.python)} MiB | ${formatMiB(report.summary.warm.memory.maximumRuntimeJob.peony)} MiB |`,
+    `| Largest WASM linear memory | — | ${formatMiB(report.summary.warm.memory.maximumWasmLinearBytes)} MiB |`,
+    `| Largest Worker VFS content | — | ${formatMiB(report.summary.warm.memory.maximumVfsBytes)} MiB |`,
     '', '## Case measurements', '',
-    'Wall time is median/p95 milliseconds. RSS is the maximum measured peak across samples. Ratios use median wall time. All memory values are MiB.',
+    'Wall time is median/p95 milliseconds from the timing pass. Host and runtime memory fields come from their separate passes; maxima are reported except baseline RSS, which is the sample median. Ratios use median wall time. All memory values are MiB.',
     '',
   ];
   const groups = [['Core language and objects', 'core/'], ['Native libraries', 'libraries/'], ['Integrated workloads', 'workloads/']];
   for (const [heading, prefix] of groups) {
     lines.push(`### ${heading}: one-shot CLI`, '',
-      '| Case | CP ms | Peony ms | P/CP | CP RSS | Peony RSS |',
-      '|---|---:|---:|---:|---:|---:|');
+      '| Case | CP ms | Peony ms | P/CP | CP RSS | Peony RSS | CP private | Peony private |',
+      '|---|---:|---:|---:|---:|---:|---:|---:|');
     for (const record of report.cases.filter(item => item.id.startsWith(prefix))) {
-      lines.push(`| \`${record.id.slice(prefix.length)}\` | ${formatPair(record.cli.python)} | ${formatPair(record.cli.peony)} | ${record.cli.latencyRatio.toFixed(2)}x | ${formatMiB(record.cli.python.peakRssBytes)} | ${formatMiB(record.cli.peony.peakRssBytes)} |`);
+      lines.push(`| \`${record.id.slice(prefix.length)}\` | ${formatPair(record.cli.python)} | ${formatPair(record.cli.peony)} | ${record.cli.latencyRatio.toFixed(2)}x | ${formatMiB(record.cli.python.peakRssBytes)} | ${formatMiB(record.cli.peony.peakRssBytes)} | ${formatMiB(record.cli.python.peakPrivateBytes)} | ${formatMiB(record.cli.peony.peakPrivateBytes)} |`);
     }
     lines.push('', `### ${heading}: started interpreters`, '',
-      '| Case | CP ms | WASM ms | W/CP | CP RSS | WASM RSS | RSS growth CP/W |',
-      '|---|---:|---:|---:|---:|---:|---:|');
+      '| Case | CP ms | WASM ms | W/CP | CP RSS base/peak | WASM RSS base/peak | RSS growth CP/W | Runtime job CP/W | WASM linear/VFS |',
+      '|---|---:|---:|---:|---:|---:|---:|---:|---:|');
     for (const record of report.cases.filter(item => item.id.startsWith(prefix))) {
-      lines.push(`| \`${record.id.slice(prefix.length)}\` | ${formatPair(record.warm.python)} | ${formatPair(record.warm.wasm)} | ${record.warm.latencyRatio.toFixed(2)}x | ${formatMiB(record.warm.python.peakRssBytes)} | ${formatMiB(record.warm.wasm.peakRssBytes)} | ${formatMiB(record.warm.python.peakGrowthBytes)}/${formatMiB(record.warm.wasm.peakGrowthBytes)} |`);
+      lines.push(`| \`${record.id.slice(prefix.length)}\` | ${formatPair(record.warm.python)} | ${formatPair(record.warm.wasm)} | ${record.warm.latencyRatio.toFixed(2)}x | ${formatMemoryPair(record.warm.python.baselineRssBytes, record.warm.python.peakRssBytes)} | ${formatMemoryPair(record.warm.wasm.baselineRssBytes, record.warm.wasm.peakRssBytes)} | ${formatMemoryPair(record.warm.python.peakGrowthBytes, record.warm.wasm.peakGrowthBytes)} | ${formatMemoryPair(record.warm.python.runtimeJobBytes, record.warm.wasm.runtimeJobBytes)} | ${formatMemoryPair(record.warm.wasm.wasmLinearBytes, record.warm.wasm.vfsBytes)} |`);
     }
     lines.push('');
   }
@@ -355,6 +493,7 @@ function renderMarkdown(report) {
 function formatMs(value) { return value < 10 ? value.toFixed(3) : value < 100 ? value.toFixed(2) : value.toFixed(1); }
 function formatPair(value) { return `${formatMs(value.medianMs)}/${formatMs(value.p95Ms)}`; }
 function formatMiB(value) { return (value / (1024 * 1024)).toFixed(1); }
+function formatMemoryPair(left, right) { return `${formatMiB(left)}/${formatMiB(right)}`; }
 function formatInteger(value) { return Math.round(value).toLocaleString('en-US'); }
 function percentile(values, fraction) { const sorted = values.slice().sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)]; }
 function timing(values) { return { medianMs: percentile(values, 0.5), p95Ms: percentile(values, 0.95), minMs: Math.min(...values), maxMs: Math.max(...values) }; }

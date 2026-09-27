@@ -31,7 +31,7 @@ node --test --test-concurrency=1 tests/*.test.mjs
 | Raw WASM/ABI | `tests/wasm-*.test.mjs` | Does the shipping artifact export the right ABI and preserve semantics, limits, errors, and memory lifetimes? |
 | Public Worker | `tests/web-*.test.mjs` | Message routing, callbacks, copied files, cancellation, and complete programs through the public facade |
 | Browser showcase | `tests/showcase-browser.mjs` | Does the editor, input, stop, error location, Worker path, and narrow-screen UI work in a browser? |
-| CPython comparison corpus | `compare/` | Do native CLI launches and started Worker jobs each agree with their matching CPython shape, and what are their latency and peak RSS? |
+| CPython comparison corpus | `compare/` | Do native CLI launches and started Worker jobs agree with their matching CPython shape, and what do separate latency, host-memory, and runtime-memory passes show? |
 
 Unit and integration programs are embedded as strings in Zig or JavaScript tests, or mounted into the VFS at runtime. The tracked `.py` files under `compare/` are executable corpus inputs shared with CPython; they are not implementation modules. Library behavior belongs in Zig, while Python text is program input.
 
@@ -66,8 +66,8 @@ Run `tests/native-cli.test.mjs` and the comparison corpus on the host to verify 
 | Command | Purpose and interpretation |
 |---|---|
 | `npm run compare:smoke` | Run every case once in the native CLI pair and started-interpreter pair, requiring matching output within each pair. |
-| `npm run compare` | Run the standard scaled corpus in one-shot native and started-interpreter pairs, with warmups and three measured samples. |
-| `npm run compare:stress` | Run the largest corpus profile with sustained data and five measured samples. This is intentionally long. |
+| `npm run compare` | Run the standard scaled corpus in one-shot native and started-interpreter pairs, with two warmups and five measured samples per pass. |
+| `npm run compare:stress` | Run the largest corpus profile with two warmups and seven measured samples per pass. This is intentionally long. |
 | `node tools/gen_unicode.mjs --check` | Verify the checked-in Unicode 15 data against pinned source inputs; no Python installation is needed for this generator. |
 | `node tools/cache_report.mjs --check --json` | Read-only report of repository-local `.zig-cache/` size; it exits nonzero above the 512 MiB maintenance threshold. |
 

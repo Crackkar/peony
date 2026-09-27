@@ -1041,6 +1041,7 @@ class PeonySession {
       gcObjects: Number(this.api.peony_gc_object_count(this.handle)),
       gcCollections: Number(this.api.peony_gc_collection_count(this.handle)),
       vfsBytes: Number(this.api.peony_vfs_total_bytes(this.handle)),
+      wasmLinearBytes: this.api.memory.buffer.byteLength,
     };
   }
 

@@ -23,6 +23,7 @@ try {
         continue;
       }
       if (request.op !== 'run' || source === undefined) throw new Error('expected a configured run');
+      if (!['time', 'rss', 'runtime'].includes(request.measure)) throw new Error('run requires time, rss, or runtime measurement mode');
       const stdout = [];
       const stderr = [];
       const session = peony.createSession({
@@ -43,12 +44,12 @@ try {
         }
         for (const directory of [...directories].sort()) await session.vfsMkdir(directory);
         for (const fixture of fixtures) await session.writeFile(`/home/${fixture.path}`, fixture.bytes);
-        await session.stats();
+        const beforeStats = await session.stats();
         const baseline = process.memoryUsage().rss;
         const highWaterBefore = process.resourceUsage().maxRSS * 1024;
         let peak = baseline;
         const sample = () => { peak = Math.max(peak, process.memoryUsage().rss); };
-        const poll = setInterval(sample, 1);
+        const poll = request.measure === 'rss' ? setInterval(sample, 1) : null;
         let result;
         let elapsedMs;
         try {
@@ -56,7 +57,7 @@ try {
           result = await session.run(source, { filename, argv: request.argv });
           elapsedMs = performance.now() - started;
         } finally {
-          clearInterval(poll);
+          if (poll !== null) clearInterval(poll);
           sample();
           const highWaterAfter = process.resourceUsage().maxRSS * 1024;
           if (highWaterAfter > highWaterBefore) peak = Math.max(peak, highWaterAfter);
@@ -66,7 +67,11 @@ try {
           stdout: stdout.join(''), stderr: stderr.join(''), elapsed_ns: Math.round(elapsedMs * 1e6),
           baseline_rss_bytes: baseline, peak_rss_bytes: peak,
           instructions: result.counters.instructions, work: result.counters.work,
-          peak_session_bytes: stats.peakSessionBytes });
+          runtime_live_bytes: stats.liveSessionBytes,
+          runtime_peak_bytes: stats.peakSessionBytes,
+          runtime_job_bytes: Math.max(0, stats.peakSessionBytes - beforeStats.liveSessionBytes),
+          vfs_bytes: stats.vfsBytes,
+          wasm_linear_bytes: stats.wasmLinearBytes });
       } finally {
         await session.destroy();
       }

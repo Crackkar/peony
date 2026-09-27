@@ -6,51 +6,43 @@ import os
 import sys
 import threading
 import time
+import tracemalloc
+
+if sys.platform != "win32":
+    raise RuntimeError("the comparison harness currently requires Windows")
+
+import ctypes
+from ctypes import wintypes
 
 
-if sys.platform == "win32":
-    import ctypes
-    from ctypes import wintypes
+class MemoryCounters(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
 
-    class MemoryCounters(ctypes.Structure):
-        _fields_ = [
-            ("cb", wintypes.DWORD),
-            ("PageFaultCount", wintypes.DWORD),
-            ("PeakWorkingSetSize", ctypes.c_size_t),
-            ("WorkingSetSize", ctypes.c_size_t),
-            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-            ("PagefileUsage", ctypes.c_size_t),
-            ("PeakPagefileUsage", ctypes.c_size_t),
-        ]
 
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    memory_api = ctypes.WinDLL("psapi", use_last_error=True)
-    kernel.GetCurrentProcess.restype = wintypes.HANDLE
-    memory_api.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
-    memory_api.GetProcessMemoryInfo.restype = wintypes.BOOL
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+memory_api = ctypes.WinDLL("psapi", use_last_error=True)
+kernel.GetCurrentProcess.restype = wintypes.HANDLE
+memory_api.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
+memory_api.GetProcessMemoryInfo.restype = wintypes.BOOL
 
-    def memory_bytes():
-        counters = MemoryCounters()
-        counters.cb = ctypes.sizeof(counters)
-        if not memory_api.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
-            raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo failed")
-        return int(counters.WorkingSetSize), int(counters.PeakWorkingSetSize)
 
-else:
-    import resource
-
-    def memory_bytes():
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        if sys.platform != "darwin":
-            peak *= 1024
-            with open("/proc/self/statm", "r", encoding="ascii") as statm:
-                current = int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-        else:
-            current = peak
-        return current, peak
+def memory_bytes():
+    counters = MemoryCounters()
+    counters.cb = ctypes.sizeof(counters)
+    if not memory_api.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+        raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo failed")
+    return int(counters.WorkingSetSize), int(counters.PeakWorkingSetSize)
 
 
 def respond(value):
@@ -104,6 +96,8 @@ for line in sys.stdin:
             continue
         if request["op"] != "run" or source is None:
             raise ValueError("expected a configured run")
+        if request.get("measure") not in ("time", "rss", "runtime"):
+            raise ValueError("run requires time, rss, or runtime measurement mode")
         for name in tuple(sys.modules):
             if name not in baseline_modules:
                 del sys.modules[name]
@@ -112,7 +106,14 @@ for line in sys.stdin:
         captured_stdout = io.StringIO()
         captured_stderr = io.StringIO()
         real_stdout, real_stderr = sys.stdout, sys.stderr
-        baseline_rss = sampler.start()
+        rss_pass = request["measure"] == "rss"
+        runtime_pass = request["measure"] == "runtime"
+        if rss_pass:
+            baseline_rss = sampler.start()
+        else:
+            baseline_rss = memory_bytes()[0]
+        if runtime_pass:
+            tracemalloc.start()
         status = "completed"
         error = ""
         started = time.perf_counter_ns()
@@ -127,10 +128,21 @@ for line in sys.stdin:
         finally:
             elapsed_ns = time.perf_counter_ns() - started
             sys.stdout, sys.stderr = real_stdout, real_stderr
-        current, peak = sampler.finish()
+        if rss_pass:
+            current, peak = sampler.finish()
+        else:
+            current, _ = memory_bytes()
+            peak = max(baseline_rss, current)
+        if runtime_pass:
+            _, runtime_peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+        else:
+            runtime_peak = 0
         respond({"ok": True, "status": status, "error": error,
                  "stdout": captured_stdout.getvalue(), "stderr": captured_stderr.getvalue(),
                  "elapsed_ns": elapsed_ns, "rss_bytes": current,
-                 "baseline_rss_bytes": baseline_rss, "peak_rss_bytes": peak})
+                 "baseline_rss_bytes": baseline_rss, "peak_rss_bytes": peak,
+                 "runtime_peak_bytes": runtime_peak,
+                 "runtime_job_bytes": runtime_peak})
     except BaseException as exception:
         respond({"ok": False, "error": type(exception).__name__ + ": " + str(exception)})

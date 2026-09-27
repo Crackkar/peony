@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "profiles": {
     "smoke": { "scale": 1, "warmups": 0, "samples": 1, "timeoutMs": 30000 },
-    "standard": { "scale": 4, "warmups": 1, "samples": 3, "timeoutMs": 120000 },
-    "stress": { "scale": 12, "warmups": 1, "samples": 5, "timeoutMs": 300000 }
+    "standard": { "scale": 4, "warmups": 2, "samples": 5, "timeoutMs": 120000 },
+    "stress": { "scale": 12, "warmups": 2, "samples": 7, "timeoutMs": 300000 }
   },
   "cases": [
     { "id": "core/integer-arithmetic", "file": "cases/core/integer-arithmetic.py", "tags": ["core", "int", "operators", "loop"] },

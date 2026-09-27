@@ -98,7 +98,7 @@ The constructor validates numeric limits rather than coercing arbitrary values. 
 | `seed` | empty | Optional copied string or bytes mixed into the session hash seed; no cryptographic unpredictability guarantee. |
 | `maxHttpResponseBytes` | 1 MiB minus 16 KiB | Host response-body cap; the entire binary packet also has a 1 MiB bound. |
 
-`maxMemoryBytes`, `quantum`, and VFS byte limits are positive unsigned 32-bit integers. `maxInstructions` must be an exact positive value within unsigned 64-bit range. The hash seed is at most 1,024 encoded bytes. The memory counter measures session allocations, not the total capacity of WebAssembly linear memory. `stats()` returns `{ instructions, work, liveSessionBytes, peakSessionBytes, gcObjects, gcCollections, vfsBytes }`; `collectGarbage()` is allowed only while idle and returns updated stats. These counters can inform an embedding UI, but they are not a wall-clock time guarantee.
+`maxMemoryBytes`, `quantum`, and VFS byte limits are positive unsigned 32-bit integers. `maxInstructions` must be an exact positive value within unsigned 64-bit range. The hash seed is at most 1,024 encoded bytes. Session counters and WebAssembly capacity are distinct: `stats()` returns `{ instructions, work, liveSessionBytes, peakSessionBytes, gcObjects, gcCollections, vfsBytes, wasmLinearBytes }`. `collectGarbage()` is allowed only while idle and returns updated stats. These counters can inform an embedding UI, but they do not measure the browser's complete process footprint or guarantee wall-clock time.
 
 ## Host callbacks and browser policy
 

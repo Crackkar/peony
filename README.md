@@ -114,7 +114,7 @@ Peony's `requests` module provides `get`, `post`, response objects, and request 
 
 The [`compare/`](compare/) corpus is one maintained set of 46 scalable Python programs covering core semantics, native libraries, files and imports, and composed workloads. It runs two paired comparisons with the same source, arguments, and fixtures. Direct `python script.py ...` and `peony script.py ...` launches measure full process latency and peak resident memory. Started CPython and Peony WASM Worker processes measure program jobs after interpreter startup. Each pair must agree on program output before its timing enters the report.
 
-The durable [comparison report](compare/report.md) records artifact hashes, platform identity, median and p95 latency, peak RSS, and target-specific ratios in separate native and Worker tables. Smoke, standard, and stress profiles change scale and repetition count while preserving paired output checks. The [comparison guide](compare/README.md) defines each timer and memory boundary.
+The durable [comparison report](compare/report.md) records artifact hashes, platform identity, median and p95 latency, native RSS and private commitment, loaded-host RSS, runtime-accounted allocation, WASM capacity, and Worker VFS content. Started-interpreter timing, host-memory sampling, and runtime allocation tracing run as separate equivalent jobs, each with paired output checks. The [comparison guide](compare/README.md) defines every boundary.
 
 The [architecture guide](docs/architecture.md) maps the source tree and internal ownership. [Development and verification](docs/development.md) records native, WASM, Worker, browser, Unicode, and comparison checks. The [WASM ABI](docs/wasm-abi.md) specifies the lower-level Worker-to-engine contract.
 
