@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "showcase": "node showcase/serve.mjs",
     "compare": "node compare/run.mjs --profile standard",
     "compare:smoke": "node compare/run.mjs --profile smoke",
     "compare:stress": "node compare/run.mjs --profile stress",

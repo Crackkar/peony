@@ -6,7 +6,7 @@ This page records repeatable commands and the ownership of each check. The [arch
 
 ## Toolchain and outputs
 
-Use Zig `0.16.0`. The normal unit-test build uses Debug optimization and a stripped test executable. `zig build native` builds a stripped LLVM `ReleaseFast` executable for the selected native target. It installs directly as `zig-out/peony.exe` on Windows or `zig-out/peony` elsewhere. `-Dnative-debug=true` selects a stripped Debug executable for a faster edit loop.
+Use Zig `0.16.0`. The normal unit-test build uses Debug optimization and a stripped test executable. `zig build native` builds a stripped LLVM `ReleaseFast` executable for the current host. It installs directly as `zig-out/peony.exe` on Windows or `zig-out/peony` elsewhere. `-Dnative-debug=true` selects a stripped Debug executable for a faster edit loop.
 
 `zig build wasm` builds the shipping `wasm32-freestanding` binary with LLVM, `ReleaseFast`, WebAssembly SIMD enabled, a single-threaded runtime, and stripped debug information. It installs directly at `zig-out/peony.wasm`. `-Dwasm-debug=true` selects a stripped Debug WASM with the same SIMD target. The default `zig build` install step produces both shipping artifacts without `bin/` nesting. Build output and the repository-local `.zig-cache/` are ignored by Git.
 
@@ -43,14 +43,14 @@ After a WASM build, install the development-only browser dependency and start th
 
 ```powershell
 npm ci
-node tools/serve_showcase.mjs
+npm run showcase
 ```
 
-Open the URL printed by the server. In another terminal, run `npm run test:showcase` to drive the browser flow. The check uses an installed Chrome by default; set `PEONY_BROWSER_CHANNEL=msedge` to use Edge. `playwright-core` is a development dependency and does not ship with the static showcase. The showcase code lives in `web/index.html`, `web/showcase.mjs`, and `web/showcase.css`; it imports the same public Worker facade described in [embedding](embedding.md).
+Open the URL printed by the server. In another terminal, run `npm run test:showcase` to drive the browser flow. The check uses an installed Chrome by default; set `PEONY_BROWSER_CHANNEL=msedge` to use Edge. `playwright-core` is a development dependency and does not ship with the static showcase. The UI and local server live in `showcase/`; the page imports the public Worker facade described in [embedding](embedding.md).
 
-The local server serves `web/` and `zig-out/peony.wasm`. The page itself does not run WASM on the main thread. A browser test of only the raw WASM exports would miss the Worker routing and input UI path, so the showcase check is a separate layer.
+The local server creates or refreshes `web/peony.wasm.br` from `zig-out/peony.wasm` at Brotli level 6, then serves the two files in `web/` with the required WASM and content-encoding headers. The page does not run WASM on the main thread. The browser check verifies compressed delivery as well as Worker routing and the UI path.
 
-## Native target checks
+## Native host check
 
 The current host executable can be exercised directly:
 
@@ -59,13 +59,7 @@ zig-out\peony.exe --version
 zig-out\peony.exe path\to\program.py argument
 ```
 
-Compile another target into a separate prefix so the current host artifact remains available:
-
-```powershell
-zig build native -Dtarget=x86_64-linux -p zig-out/linux-x86_64 --summary all
-```
-
-Cross compilation checks source and link portability. Run `tests/native-cli.test.mjs` and the comparison corpus on the target machine to verify its stdio, certificate bundle, clocks, timers, and networking. The [native CLI reference](native-cli.md) records the process contract.
+Run `tests/native-cli.test.mjs` and the comparison corpus on the host to verify its stdio, certificate bundle, clocks, timers, and networking. The [native CLI reference](native-cli.md) records the process contract.
 
 ## Focused checks and measurements
 

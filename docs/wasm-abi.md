@@ -1,6 +1,6 @@
 # Peony WASM ABI v1
 
-This is the internal interface between `web/peony-core.mjs` in the Worker and the Zig engine. Embedding applications use the [public Worker API](embedding.md). The ABI targets `wasm32-freestanding`; pointers and lengths are unsigned 32-bit byte offsets into exported `memory`. A zero pointer represents an empty slice or a failed pointer lookup/allocation. WASM exports return numeric statuses. Worker JavaScript supplies the `env.peony_fs_call` import for filesystem storage.
+This is the internal interface between the Worker side of `web/peony.mjs` and the Zig engine. Embedding applications use the [public Worker API](embedding.md). The ABI targets `wasm32-freestanding`; pointers and lengths are unsigned 32-bit byte offsets into exported `memory`. A zero pointer represents an empty slice or a failed pointer lookup/allocation. WASM exports return numeric statuses. Worker JavaScript supplies the `env.peony_fs_call` import for filesystem storage.
 
 One WASM instance has a fixed table of up to 64 live session handles and 256 live transfer blocks. Sessions have independent Python runtime state, heaps, Worker file trees, output, diagnostics, and pending host requests. Transfer blocks are instance-owned temporary input storage; they are separate from a session's accounted heap. The JavaScript adapter checks `peony_abi_version() == 1` before creating sessions.
 
@@ -15,7 +15,7 @@ The loop must serialize calls that mutate one session. In particular, a collecto
 
 ## Filesystem host import
 
-`web/fs-host.mjs` provides synchronous filesystem storage inside the Worker. The WASM module imports one function from `env`:
+`web/peony.mjs` provides synchronous filesystem storage inside the Worker. The WASM module imports one function from `env`:
 
 ```text
 peony_fs_call(session: u32, operation: u32,

@@ -1,15 +1,15 @@
 # Embedding Peony in a page
 
-`web/peony.mjs` is the public JavaScript API. It is an ES module that starts `web/peony.worker.mjs` and keeps the Zig WebAssembly instance inside that Worker. An embedding page supplies source text, files, output/input callbacks, and browser services. The page receives structured results and copied file bytes. Worker JavaScript owns the browser file tree in `web/fs-host.mjs`; the Zig engine calls it through synchronous WASM imports.
+`web/peony.mjs` is the complete JavaScript integration. Its public side starts the same module as a Worker, where it instantiates the Zig WebAssembly engine, drives the ABI, and owns the browser file tree. An embedding page supplies source text, files, output/input callbacks, and browser services. The page receives structured results and copied file bytes; the Zig engine reaches Worker storage through synchronous WASM imports.
 
-The Worker and public module are resolved relative to `web/peony.mjs`; the WASM URL is supplied explicitly to `Peony.load(...)`. A static host must serve all three assets over HTTP(S) for browser use. The [showcase](../web/index.html) uses this same public API, so it is an executable example of the integration path. Node tests use the same facade with `worker_threads`.
+The browser distribution has two files: `web/peony.mjs` and `web/peony.wasm.br`. The WASM URL is supplied explicitly to `Peony.load(...)`. Serve the compressed artifact with `Content-Type: application/wasm` and `Content-Encoding: br`; `fetch` then exposes the decoded WASM bytes to the Worker. The [showcase](../showcase/index.html) uses this exact distribution path. Node tests use the same facade with `worker_threads`.
 
 ## A complete small session
 
 ```js
 import { Peony } from './web/peony.mjs';
 
-const peony = await Peony.load(new URL('./zig-out/peony.wasm', import.meta.url));
+const peony = await Peony.load(new URL('./web/peony.wasm.br', import.meta.url));
 const output = [];
 const session = peony.createSession({
   stdout: text => output.push(text),

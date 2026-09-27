@@ -1,4 +1,4 @@
-import { Peony } from './peony.mjs';
+import { Peony } from '../web/peony.mjs';
 
 const examples = {
   hello: `print("Hello, Peony!")\nfor number in range(1, 4):\n    print(f"Try {number}")\n`,
@@ -148,7 +148,11 @@ function goToLine(line) {
   updateLines();
 }
 
-editor.addEventListener('input', () => { updateLines(); saveEditor(); });
+editor.addEventListener('input', () => {
+  exampleSelect.value = '';
+  updateLines();
+  saveEditor();
+});
 editor.addEventListener('scroll', () => { lineNumbers.scrollTop = editor.scrollTop; });
 editor.addEventListener('keydown', event => {
   if (event.key !== 'Tab') return;
@@ -174,7 +178,6 @@ exampleSelect.addEventListener('change', () => {
     saveEditor();
     editor.focus();
   }
-  exampleSelect.value = '';
 });
 runButton.addEventListener('click', () => { void runCurrent(); });
 stopButton.addEventListener('click', stopCurrent);
@@ -191,7 +194,7 @@ catch { editor.value = examples.hello; }
 updateLines();
 
 try {
-  peony = await Peony.load(new URL('../zig-out/peony.wasm', import.meta.url));
+  peony = await Peony.load(new URL('../web/peony.wasm.br', import.meta.url));
   session = peony.createSession({
     stdout: appendOutput,
     stderr: appendOutput,

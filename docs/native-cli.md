@@ -79,6 +79,6 @@ The adapter sends GET and POST requests, applies the specified timeout, decodes 
 
 `elapsed_ns` spans compilation and program execution. Source loading, process startup, and metrics output occur around that interval. `instructions` counts bytecode dispatches; `work` also includes charged native algorithms. The comparison corpus measures full CLI process lifetime and peak RSS with its separate process probe; the CLI metrics option remains available for engine-level inspection.
 
-## Portability
+## Host integration
 
-The adapter uses Zig 0.16 `std.process.Init`, `std.Io`, `std.Io.Dir`, `std.Io.File`, clocks, timers, and `std.http.Client`. `zig build native` produces a stripped ReleaseFast executable for the selected target. A native build targeting `x86_64-linux` also compiles from this tree. Run the CLI integration checks on each host OS to measure its file, terminal, timer, and network behavior.
+The adapter uses Zig 0.16 `std.process.Init`, `std.Io`, `std.Io.Dir`, `std.Io.File`, clocks, timers, and `std.http.Client`. `zig build native` produces a stripped ReleaseFast executable for the current host. Run the CLI integration checks on that host to measure its file, terminal, timer, and network behavior.

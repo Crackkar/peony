@@ -43,7 +43,7 @@ const abi_exports = [_][]const u8{
 };
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.graph.host;
     const optimize = b.standardOptimizeOption(.{});
 
     const abi_module = b.createModule(.{

@@ -56,7 +56,7 @@ Native Python file operations use real OS paths. Relative paths start at the pro
 
 The browser distribution exposes a dependency-free JavaScript session API. `Peony.load(...)` creates a module Worker, and the Worker alone instantiates `peony.wasm`. Parsing, compilation, bytecode dispatch, native libraries, and garbage collection never fall back to the page's main thread. The page receives structured results and output callbacks while it remains responsive enough to render, accept input, or request a hard stop. The [browser embedding guide](docs/embedding.md) defines this API.
 
-The [showcase](web/index.html) is a compact demonstration of the Worker distribution: editor, examples, input, output, cancellation, and source-located errors. It uses the public facade and has no private execution path.
+The [showcase](showcase/index.html) is a compact demonstration of the Worker distribution: editor, examples, input, output, cancellation, and source-located errors. It uses the public facade and has no private execution path. The deployable `web/` directory contains only the complete integration module and its Brotli-compressed WASM artifact.
 
 ## From source to a terminal result
 
@@ -116,6 +116,6 @@ The [`compare/`](compare/) corpus is one maintained set of 46 scalable Python pr
 
 The durable [comparison report](compare/report.md) records artifact hashes, platform identity, median and p95 latency, peak RSS, and target-specific ratios in separate native and Worker tables. Smoke, standard, and stress profiles change scale and repetition count while preserving paired output checks. The [comparison guide](compare/README.md) defines each timer and memory boundary.
 
-The [architecture guide](docs/architecture.md) maps the source tree and internal ownership. [Development and verification](docs/development.md) records native, WASM, Worker, browser, cross-target, Unicode, and comparison checks. The [WASM ABI](docs/wasm-abi.md) specifies the lower-level Worker-to-engine contract.
+The [architecture guide](docs/architecture.md) maps the source tree and internal ownership. [Development and verification](docs/development.md) records native, WASM, Worker, browser, Unicode, and comparison checks. The [WASM ABI](docs/wasm-abi.md) specifies the lower-level Worker-to-engine contract.
 
 Peony is licensed under the [GNU Affero General Public License v3](LICENSE).

@@ -11,19 +11,16 @@ Peony is one Zig runtime with two shipping adapters: a native process executable
              src/native.zig                 src/wasm.zig
              process adapter                versioned raw ABI
           OS files, stdio, clocks, HTTP             |
-                    |                         web/peony-core.mjs
-             peony executable                packet/event pump
+                    |                         web/peony.mjs
+             peony executable          Worker engine + file host
+                                              public proxy
                                                    |
-                                 web/fs-host.mjs + peony.worker.mjs
-                                            Worker owner
-                                                   |
-                                           web/peony.mjs
-                                            public proxy
+                                          peony.wasm.br
 ```
 
 `src/native.zig` owns CLI parsing, source-file loading, terminal diagnostics, process exit codes, and process host requests. `src/native_fs.zig` connects the file interface to Zig's operating system file APIs. The adapter constructs the shared `Runtime` type and drives `compileAndStartArgs`, `run`, and `resumeHost` directly. The [native CLI reference](native-cli.md) defines its process contract.
 
-`Peony.load(...)` in `web/peony.mjs` always creates a module Worker. The Worker loads `web/peony-core.mjs`, which compiles or instantiates WASM and drives the raw exports. The public facade does not instantiate WASM on the calling thread. Browser and Node integrations use the same facade; Node supplies `worker_threads` in place of a browser Worker. The raw ABI is documented separately because it is a Worker-to-engine contract rather than the recommended application API.
+`Peony.load(...)` in `web/peony.mjs` always creates a module Worker from that same module. On the calling thread the module exposes the public proxy; in Worker context it instantiates WASM, drives the raw exports, stores browser files, and routes host requests. The calling thread never instantiates WASM. Browser and Node integrations use the same file; Node supplies `worker_threads` in place of a browser Worker. The raw ABI is documented separately because it is a Worker-to-engine contract rather than the recommended application API.
 
 ## Runs through either adapter
 
@@ -31,7 +28,7 @@ A native invocation reads one source file and passes the remaining command argum
 
 A browser application creates a session, optionally mounts files, and calls `session.run(source, { filename, argv })`. The Worker validates the request and sends source and metadata through transfer blocks to the Zig exports. It may regain control several times before the program finishes. At each return it continues after a quantum, drains output, awaits a host operation, or produces a terminal result. The page receives an eventual `completed`, `error`, `cancelled`, or `limit` result and may already have received output chunks while the program ran.
 
-One loaded WASM instance can hold multiple raw sessions, each identified by a generation-checked handle. Each runtime owns its Python heap, interpreter frames, module cache, streams, limits, and native operation state. `web/fs-host.mjs` owns a file tree for each handle. The public facade replaces a raw runtime between consecutive `run()` calls so Python globals and imports start fresh; the Worker transfers the existing file tree to the new handle without copying its bytes and clears `/tmp`. Public `session.reset()` follows the same file persistence rule. The lower-level `peony_reset` export keeps its current host file tree and clears `/tmp`.
+One loaded WASM instance can hold multiple raw sessions, each identified by a generation-checked handle. Each runtime owns its Python heap, interpreter frames, module cache, streams, limits, and native operation state. The Worker side of `web/peony.mjs` owns a file tree for each handle. The public facade replaces a raw runtime between consecutive `run()` calls so Python globals and imports start fresh; the Worker transfers the existing file tree to the new handle without copying its bytes and clears `/tmp`. Public `session.reset()` follows the same file persistence rule. The lower-level `peony_reset` export keeps its current host file tree and clears `/tmp`.
 
 ## From text to bytecode
 
@@ -83,7 +80,7 @@ The library implementations use data structures chosen for the admitted workload
 
 `src/runtime/file.zig` implements Python text and binary file behavior: modes, cursors, newline handling, positions, and context management. `src/runtime/vfs.zig` exposes storage operations to that file layer, imports, `pathlib`, and `os`. The native backend in `src/native_fs.zig` uses OS files and directories. It retains actual file handles and follows operating system path and permission rules.
 
-The browser backend is `web/fs-host.mjs`. It keeps directory entries and file bytes in Worker JavaScript. Synchronous WASM imports let the Zig engine read and mutate that store while executing Python file operations. Browser paths use `/assets`, `/home`, and `/tmp`; `/assets` holds page supplied content, `/home` holds writable session content, and `/tmp` holds scratch content cleared for each run. Open handles retain file node identity across rename and unlink.
+The browser backend is the Worker side of `web/peony.mjs`. It keeps directory entries and file bytes in Worker JavaScript. Synchronous WASM imports let the Zig engine read and mutate that store while executing Python file operations. Browser paths use `/assets`, `/home`, and `/tmp`; `/assets` holds page supplied content, `/home` holds writable session content, and `/tmp` holds scratch content cleared for each run. Open handles retain file node identity across rename and unlink.
 
 Imports first consult the run's module cache and registered Zig libraries. Native user modules are searched beside the entry script and in the working directory. Browser user modules are searched under `/home`, `/assets`, then `/tmp`. Both paths load `.py` modules and packages with `__init__.py`, compile their source in Zig, and execute them through VM frames. A page can copy Worker file bytes into its own persistent storage between visits.
 
@@ -94,13 +91,13 @@ Imports first consult the run's module cache and registered Zig libraries. Nativ
 | Front end | `src/frontend/` | Tokens, AST, scope analysis, bytecode, compile diagnostics |
 | VM | `src/vm/`, `src/engine.zig` | Frames, dispatcher, control flow, calls, scheduling, native tasks |
 | Object substrate | `src/runtime/` | Values, numbers, containers, GC, exceptions, and file semantics |
-| Filesystem hosts | `src/native_fs.zig`, `src/wasm_fs.zig`, `web/fs-host.mjs` | OS and Worker file storage |
+| Filesystem hosts | `src/native_fs.zig`, `src/wasm_fs.zig`, `web/peony.mjs` | OS and Worker file storage |
 | Native utilities | `src/stdlib/`, `src/regex/` | Python-visible libraries, binder metadata, algorithms |
 | Host protocol | `src/runtime/host.zig`, `src/vm/native_tasks.zig` | Versioned packets and suspended continuations |
 | Native adapter | `src/native.zig` | CLI, stdio, native clocks/timers/HTTP, diagnostics and metrics |
 | WASM boundary | `src/wasm.zig`, `src/abi.zig` | Export statuses, handles and transfer buffers |
-| Worker boundary | `web/peony.mjs`, `web/peony.worker.mjs`, `web/peony-core.mjs` | Worker messages, host callbacks and session lifecycle |
-| UI example | `web/index.html`, `web/showcase.*` | Browser editor and result presentation |
+| Web distribution | `web/peony.mjs`, `web/peony.wasm.br` | Worker messages, host callbacks, files, session lifecycle, and compressed engine |
+| UI example | `showcase/` | Browser editor, result presentation, and local static server |
 | Checks | `tests/unit/`, `tests/*.test.mjs`, `tests/showcase-browser.mjs` | Engine semantics, native CLI, WASM, Worker and browser flows |
 | CPython corpus | `compare/` | Paired native CLI and started-interpreter output, latency, and peak RSS measurements |
 

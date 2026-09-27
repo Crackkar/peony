@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
-import { startShowcaseServer } from '../tools/serve_showcase.mjs';
+import { startShowcaseServer } from '../showcase/serve.mjs';
 
 const { server, url } = await startShowcaseServer();
 let browser;
@@ -23,9 +23,24 @@ try {
     WebAssembly.instantiate = () => { throw new Error('WASM instantiated on page main thread'); };
     WebAssembly.compile = () => { throw new Error('WASM compiled on page main thread'); };
   });
+  const wasmResponse = page.waitForResponse(response => response.url().endsWith('/web/peony.wasm.br'));
   await page.goto(url);
+  assert.equal((await wasmResponse).headers()['content-encoding'], 'br');
   await page.waitForFunction(() => document.querySelector('#runtime-status')?.textContent === 'Ready', null, { timeout: 15_000 });
   assert.equal(await page.evaluate(() => window.__peonyWorkerCount), 1);
+  assert.deepEqual(await page.evaluate(() => {
+    const editor = document.querySelector('#editor');
+    const terminal = document.querySelector('.output-body');
+    editor.value = Array.from({ length: 200 }, (_, index) => `print(${index})`).join('\n');
+    document.querySelector('#output').textContent = Array.from({ length: 200 }, (_, index) => `line ${index}`).join('\n');
+    editor.scrollTop = editor.scrollHeight;
+    terminal.scrollTop = terminal.scrollHeight;
+    return {
+      pageFits: document.documentElement.scrollHeight <= innerHeight,
+      editorScrolls: editor.scrollHeight > editor.clientHeight && editor.scrollTop > 0,
+      terminalScrolls: terminal.scrollHeight > terminal.clientHeight && terminal.scrollTop > 0,
+    };
+  }), { pageFits: true, editorScrolls: true, terminalScrolls: true });
 
   await page.locator('#editor').fill('print("Hello from Peony")\n');
   await page.locator('#run-button').click();
@@ -39,6 +54,7 @@ try {
     ['patterns', 'hello@example.com'],
   ]) {
     await page.locator('#example-select').selectOption(example);
+    assert.equal(await page.locator('#example-select').inputValue(), example);
     await page.locator('#run-button').click();
     await page.waitForFunction(() => ['Completed', 'Check the error below'].includes(document.querySelector('#run-detail')?.textContent));
     assert.equal(await page.locator('#run-detail').textContent(), 'Completed', `${example} example should run`);
@@ -93,7 +109,16 @@ try {
   await mkdir(new URL('../.zig-cache/showcase/', import.meta.url), { recursive: true });
   await page.screenshot({ path: fileURLToPath(new URL('../.zig-cache/showcase/desktop.png', import.meta.url)), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
-  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await page.evaluate(() => {
+    document.querySelector('#editor').value = Array.from({ length: 200 }, (_, index) => `print(${index})`).join('\n');
+    document.querySelector('#output').textContent = Array.from({ length: 200 }, (_, index) => `line ${index}`).join('\n');
+  });
+  assert.deepEqual(await page.evaluate(() => ({
+    widthFits: document.documentElement.scrollWidth <= innerWidth,
+    heightFits: document.documentElement.scrollHeight <= innerHeight,
+    editorScrolls: document.querySelector('#editor').scrollHeight > document.querySelector('#editor').clientHeight,
+    terminalScrolls: document.querySelector('.output-body').scrollHeight > document.querySelector('.output-body').clientHeight,
+  })), { widthFits: true, heightFits: true, editorScrolls: true, terminalScrolls: true });
   const editorBox = await page.locator('.editor-panel').boundingBox();
   const outputBox = await page.locator('.output-panel').boundingBox();
   assert.ok(editorBox && outputBox && outputBox.y >= editorBox.y + editorBox.height - 1);

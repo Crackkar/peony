@@ -1,4 +1,4 @@
-import { createFsHost } from '../web/fs-host.mjs';
+import { createFsHost } from '../web/peony.mjs';
 
 export async function instantiatePeony(bytes) {
   const filesystem = createFsHost();
